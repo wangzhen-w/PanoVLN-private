@@ -1,11 +1,8 @@
 import json
-import math
 import os
 import random
-from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import Dataset
@@ -17,13 +14,21 @@ except ModuleNotFoundError:
 
 
 DEFAULT_IMAGE_SIZE = (640, 320)
-DEFAULT_VLN_MEMORY_IMAGE_SIZE = (256, 256)
-DEFAULT_VLN_MEMORY_HORIZONTAL_FOV_DEGREES = 90.0
-DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (640, 320)
-DEFAULT_IDM_IMAGE_SIZE = (640, 320)
+DEFAULT_VLN_MEMORY_IMAGE_SIZE = (448, 224)
+DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (960, 480)
+DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
+DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
-SUPPORTED_TASK_TYPES = {"vln", "idm"}
+VLN_ACTIONS = {"move_forward", "turn_left", "turn_right", "stop"}
+VLN_SYSTEM_PROMPT = (
+    "You are a visual language navigation agent. "
+    "Given a navigation instruction, your recent memory observations, and your current observation, "
+    "predict the next action. "
+    "Action space: move_forward (0.25 meters), turn_left (15 degrees), turn_right (15 degrees), stop. "
+    "Use stop only when you think the goal has been reached. "
+    "Reply with exactly one action."
+)
 LONGITUDE_PROMPT_STEP_DEG = 15
 LONGITUDE_PROMPT_LABEL_STEP_DEG = 15
 LONGITUDE_PROMPT_LINE_WIDTH_PX = 1
@@ -70,95 +75,9 @@ def crop_erp_latitude(
     return image.crop((0, top_crop_pixels, width, crop_bottom))
 
 
-@lru_cache(maxsize=8)
-def _build_perspective_sampling_grid(
-    source_width: int,
-    source_height: int,
-    output_width: int,
-    output_height: int,
-    horizontal_fov_degrees: float,
-):
-    horizontal_fov_radians = math.radians(float(horizontal_fov_degrees))
-    vertical_fov_radians = 2.0 * math.atan(
-        math.tan(horizontal_fov_radians / 2.0) * (float(output_height) / float(output_width))
-    )
-
-    x_coordinates = np.linspace(
-        -math.tan(horizontal_fov_radians / 2.0),
-        math.tan(horizontal_fov_radians / 2.0),
-        output_width,
-        dtype=np.float32,
-    )
-    y_coordinates = np.linspace(
-        math.tan(vertical_fov_radians / 2.0),
-        -math.tan(vertical_fov_radians / 2.0),
-        output_height,
-        dtype=np.float32,
-    )
-    grid_x, grid_y = np.meshgrid(x_coordinates, y_coordinates)
-    grid_z = np.ones_like(grid_x, dtype=np.float32)
-
-    norm = np.sqrt(grid_x ** 2 + grid_y ** 2 + grid_z ** 2)
-    dir_x = grid_x / norm
-    dir_y = grid_y / norm
-    dir_z = grid_z / norm
-
-    longitude = np.arctan2(dir_x, dir_z)
-    latitude = np.arcsin(np.clip(dir_y, -1.0, 1.0))
-
-    sample_x = (longitude / (2.0 * math.pi) + 0.5) * float(source_width)
-    sample_y = (0.5 - latitude / math.pi) * float(source_height)
-    return sample_x.astype(np.float32), sample_y.astype(np.float32)
-
-
-def project_erp_to_perspective(
-    image: Image.Image,
-    output_size=DEFAULT_VLN_MEMORY_IMAGE_SIZE,
-    horizontal_fov_degrees: float = DEFAULT_VLN_MEMORY_HORIZONTAL_FOV_DEGREES,
-) -> Image.Image:
-    source = np.asarray(image.convert("RGB"), dtype=np.float32)
-    source_height, source_width = source.shape[:2]
-    output_width, output_height = int(output_size[0]), int(output_size[1])
-
-    sample_x, sample_y = _build_perspective_sampling_grid(
-        source_width=source_width,
-        source_height=source_height,
-        output_width=output_width,
-        output_height=output_height,
-        horizontal_fov_degrees=horizontal_fov_degrees,
-    )
-
-    base_x = np.floor(sample_x).astype(np.int32)
-    base_y = np.floor(sample_y).astype(np.int32)
-    next_x = base_x + 1
-    next_y = base_y + 1
-
-    base_x_wrapped = np.mod(base_x, source_width)
-    next_x_wrapped = np.mod(next_x, source_width)
-    base_y_clipped = np.clip(base_y, 0, source_height - 1)
-    next_y_clipped = np.clip(next_y, 0, source_height - 1)
-
-    weight_x = (sample_x - np.floor(sample_x)).astype(np.float32)[..., None]
-    weight_y = (sample_y - np.floor(sample_y)).astype(np.float32)[..., None]
-
-    top_left = source[base_y_clipped, base_x_wrapped]
-    top_right = source[base_y_clipped, next_x_wrapped]
-    bottom_left = source[next_y_clipped, base_x_wrapped]
-    bottom_right = source[next_y_clipped, next_x_wrapped]
-
-    top = top_left * (1.0 - weight_x) + top_right * weight_x
-    bottom = bottom_left * (1.0 - weight_x) + bottom_right * weight_x
-    projected = top * (1.0 - weight_y) + bottom * weight_y
-    projected = np.clip(projected, 0.0, 255.0).astype(np.uint8)
-    return Image.fromarray(projected, mode="RGB")
-
-
 def preprocess_vln_memory_image(image: Image.Image) -> Image.Image:
-    return project_erp_to_perspective(
-        image=image,
-        output_size=DEFAULT_VLN_MEMORY_IMAGE_SIZE,
-        horizontal_fov_degrees=DEFAULT_VLN_MEMORY_HORIZONTAL_FOV_DEGREES,
-    )
+    processed_image = image.convert("RGB").resize(DEFAULT_VLN_MEMORY_IMAGE_SIZE)
+    return crop_erp_latitude(processed_image)
 
 
 def preprocess_vln_current_image(
@@ -166,9 +85,89 @@ def preprocess_vln_current_image(
     add_visual_prompt: bool = False,
 ) -> Image.Image:
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
+    processed_image = crop_erp_latitude(processed_image)
     if add_visual_prompt:
         processed_image = add_longitude_visual_prompt(processed_image)
     return processed_image
+
+
+def build_vln_image_selection(
+    current_step: int,
+    last_frame_index: int,
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+) -> List[int]:
+    max_memory_images = max(0, int(max_memory_images))
+    memory_pool_window_frames = max(1, int(memory_pool_window_frames))
+    current_frame_index = min(max(0, int(current_step)), int(last_frame_index))
+    pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
+    candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
+
+    total_selected_images = max_memory_images + 1
+    if total_selected_images <= 0 or not candidate_frame_indices:
+        return [current_frame_index]
+
+    if len(candidate_frame_indices) <= total_selected_images:
+        return candidate_frame_indices
+
+    last_candidate_position = len(candidate_frame_indices) - 1
+    selected_positions = [
+        (slot * last_candidate_position) // (total_selected_images - 1)
+        for slot in range(total_selected_images)
+    ]
+    return [candidate_frame_indices[position] for position in selected_positions]
+
+
+def select_vln_image_paths(
+    image_paths: List[str],
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+) -> List[str]:
+    if not image_paths:
+        return []
+
+    selected_indices = build_vln_image_selection(
+        current_step=len(image_paths) - 1,
+        last_frame_index=len(image_paths) - 1,
+        max_memory_images=max_memory_images,
+        memory_pool_window_frames=memory_pool_window_frames,
+    )
+    return [image_paths[index] for index in selected_indices]
+
+
+def text_content(text: str) -> Dict[str, str]:
+    return {"type": "text", "text": text}
+
+
+def image_content() -> Dict[str, str]:
+    return {"type": "image"}
+
+
+def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, str]]:
+    if num_images <= 0:
+        raise ValueError("VLN samples require at least one image")
+
+    num_memory_images = max(0, num_images - 1)
+    content = [text_content(f"Instruction: {instruction.strip()}")]
+
+    if num_memory_images > 0:
+        content.append(
+            text_content(
+                "\nHistory memory observations are panoramic views ordered from older to newer:"
+            )
+        )
+        content.extend(image_content() for _ in range(num_memory_images))
+
+    content.extend(
+        [
+            text_content(
+                "\nCurrent observation (360-degree panoramic view centered on the robot's current forward direction):"
+            ),
+            image_content(),
+            text_content("\nPredict the next action."),
+        ]
+    )
+    return content
 
 
 def resolve_longitude_prompt_font():
@@ -279,17 +278,71 @@ def _resolve_content_item(
     raise NotImplementedError(f"Unsupported content item type: {item_type}")
 
 
+def _require_non_empty_string(example: Dict[str, Any], field_name: str) -> str:
+    value = example.get(field_name)
+    if isinstance(value, str):
+        value = value.strip()
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"VLN example field '{field_name}' must be a non-empty string")
+
+
+def _extract_vln_instruction(example: Dict[str, Any]) -> str:
+    instruction = _require_non_empty_string(example, "instruction")
+    if isinstance(instruction, str) and instruction.strip():
+        return instruction.strip()
+    raise ValueError("VLN example is missing an instruction")
+
+
+def _extract_vln_action(example: Dict[str, Any]) -> str:
+    action = _require_non_empty_string(example, "action")
+    if action not in VLN_ACTIONS:
+        raise ValueError(
+            f"VLN example field 'action' must be one of {sorted(VLN_ACTIONS)}, got {action!r}"
+        )
+    return action
+
+
+def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
+    raw_images = example.get("images", [])
+    if not isinstance(raw_images, list) or not raw_images:
+        raise ValueError("VLN example field 'images' must contain the full image history")
+    for image_path in raw_images:
+        if not isinstance(image_path, str) or not image_path:
+            raise ValueError("VLN example field 'images' must contain non-empty string paths")
+
+    selected_images = select_vln_image_paths(raw_images)
+    instruction = _extract_vln_instruction(example)
+    action = _extract_vln_action(example)
+
+    normalized = dict(example)
+    normalized["images"] = selected_images
+    normalized["messages"] = [
+        {
+            "role": "system",
+            "content": [text_content(VLN_SYSTEM_PROMPT)],
+        },
+        {
+            "role": "user",
+            "content": build_vln_user_content(
+                instruction=instruction,
+                num_images=len(selected_images),
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": [text_content(action)],
+        },
+    ]
+    return normalized
+
+
 def resolve_messages_and_vision_paths(example: Dict[str, Any], image_root: Optional[str]):
     vision_paths = []
-    task_type = example.get("task type")
-    if task_type is not None and task_type not in SUPPORTED_TASK_TYPES:
-        raise NotImplementedError(f"Unsupported task type: {task_type}")
-
     raw_messages = example.get("messages")
     if not isinstance(raw_messages, list) or not raw_messages:
         raise ValueError(
-            "Training example is missing prebuilt 'messages'. "
-            "Regenerate the dataset with src/data/prepare_training_data.py."
+            "Internal VLN sample normalization failed to build messages from compact fields"
         )
 
     raw_images = example.get("images", [])
@@ -366,7 +419,6 @@ class SupervisedDataset(Dataset):
         self.add_visual_prompt = add_visual_prompt
         self.prompt_format = prompt_format
         self._fp = None
-        self._task_types = None
 
         offsets = []
         with open(self.jsonl_path, "rb") as handle:
@@ -404,61 +456,24 @@ class SupervisedDataset(Dataset):
         handle.seek(self.offsets[index])
         return json.loads(handle.readline())
 
-    def _resolve_image_processing(self, task_type: Optional[str], image_index: int, num_images: int):
-        if task_type == "vln":
-            if image_index == num_images - 1:
-                return DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE, self.add_visual_prompt
-            return DEFAULT_VLN_MEMORY_IMAGE_SIZE, False
-
-        if task_type == "idm":
-            return DEFAULT_IDM_IMAGE_SIZE, False
-
-        return self.image_size, self.add_visual_prompt
-
-    def _load_images(self, image_paths: List[str], task_type: Optional[str]):
+    def _load_images(self, image_paths: List[str]):
         images = []
         num_images = len(image_paths)
         for image_index, image_path in enumerate(image_paths):
             with Image.open(image_path) as image:
-                if task_type == "vln":
-                    is_current_observation = image_index == num_images - 1
-                    if is_current_observation:
-                        processed_image = preprocess_vln_current_image(
-                            image=image,
-                            add_visual_prompt=self.add_visual_prompt,
-                        )
-                    else:
-                        processed_image = preprocess_vln_memory_image(image)
-                else:
-                    resize_size, add_visual_prompt = self._resolve_image_processing(
-                        task_type=task_type,
-                        image_index=image_index,
-                        num_images=num_images,
+                is_current_observation = image_index == num_images - 1
+                if is_current_observation:
+                    processed_image = preprocess_vln_current_image(
+                        image=image,
+                        add_visual_prompt=self.add_visual_prompt,
                     )
-                    processed_image = image.convert("RGB").resize(resize_size)
-                    processed_image = crop_erp_latitude(processed_image)
-                    if add_visual_prompt:
-                        processed_image = add_longitude_visual_prompt(processed_image)
+                else:
+                    processed_image = preprocess_vln_memory_image(image)
                 images.append(processed_image)
         return images
 
-    def get_task_types(self) -> List[Optional[str]]:
-        if self._task_types is not None:
-            return self._task_types
-
-        task_types = []
-        with open(self.jsonl_path, "r", encoding="utf-8") as handle:
-            for offset in self.offsets:
-                handle.seek(offset)
-                example = json.loads(handle.readline())
-                task_types.append(example.get("task type"))
-
-        self._task_types = task_types
-        return self._task_types
-
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        example = self._load_example(index)
-        task_type = example.get("task type")
+        example = apply_vln_memory_policy(self._load_example(index))
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
             image_root=self.image_root,
@@ -479,7 +494,6 @@ class SupervisedDataset(Dataset):
                 text=full_text,
                 images=self._load_images(
                     image_paths=vision_paths,
-                    task_type=task_type,
                 ),
                 return_tensors="pt",
                 truncation=self.model_max_length is not None,

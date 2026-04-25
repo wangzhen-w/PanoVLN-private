@@ -8,7 +8,6 @@ from transformers.trainer_utils import get_last_checkpoint
 from config.config import load_config
 from data.collator import MultiModalDataCollator
 from data.data import SupervisedDataset
-from data.sampler import TaskTypeBlockSampler
 from utils import (
     build_action_accuracy,
     init_wandb,
@@ -24,42 +23,6 @@ from utils import (
 )
 
 RANK = int(os.environ.get("RANK", "0"))
-
-
-class NavidaTrainer(Trainer):
-    def _get_train_sampler(self, train_dataset=None):
-        if train_dataset is None:
-            train_dataset = self.train_dataset
-
-        if self.args.train_sampling_strategy != "task_type_block":
-            return super()._get_train_sampler(train_dataset=train_dataset)
-
-        if train_dataset is None:
-            return None
-
-        if not hasattr(train_dataset, "get_task_types"):
-            raise ValueError(
-                "task_type_block sampling requires the dataset to implement get_task_types()"
-            )
-
-        world_size = max(1, int(getattr(self.args, "world_size", 1)))
-        block_size = max(
-            1,
-            world_size
-            * int(self.args.per_device_train_batch_size)
-            * int(self.args.gradient_accumulation_steps),
-        )
-        rank0_print(
-            RANK,
-            f"using task_type_block sampler with global block size={block_size} "
-            f"(world_size={world_size}, per_device_train_batch_size={self.args.per_device_train_batch_size}, "
-            f"gradient_accumulation_steps={self.args.gradient_accumulation_steps})",
-        )
-        return TaskTypeBlockSampler(
-            task_types=train_dataset.get_task_types(),
-            block_size=block_size,
-            seed=self.args.seed,
-        )
 
 
 def copy_chat_template_files(source_dir: str, output_dir: str):
@@ -168,7 +131,6 @@ def main():
         dataloader_num_workers=cfg.training.dataloader_num_workers,
         max_grad_norm=cfg.training.max_grad_norm,
         deepspeed=cfg.training.deepspeed,
-        train_sampling_strategy=cfg.training.train_sampling_strategy,
         ddp_find_unused_parameters=False,
         gradient_checkpointing=cfg.training.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -183,7 +145,7 @@ def main():
 
     init_wandb(cfg.wandb, training_args, RANK)
 
-    trainer = NavidaTrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

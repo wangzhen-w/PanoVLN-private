@@ -16,7 +16,7 @@ CONFIG_PATH="config/vln_r2r.yaml"
 SAVE_PATH="/workspace/code_dir/a_property/vln_result/erp_mem_no_vis_atom"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
-MEMORY_POOL_WINDOW_FRAMES=200
+MEMORY_POOL_WINDOW_FRAMES=100
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 

@@ -20,9 +20,6 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
 }
-CHAT_TEMPLATE_ASSISTANT_PREFIX = "<|im_start|>assistant\n"
-
-
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -242,18 +239,6 @@ def _content_to_text(content: Any) -> str:
     return ""
 
 
-def build_chat_template_prompt(processor, messages: List[Dict[str, Any]]) -> str:
-    prompt_text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    if not prompt_text.endswith("\n"):
-        prompt_text = f"{prompt_text}\n"
-    return prompt_text + CHAT_TEMPLATE_ASSISTANT_PREFIX
-
-
 def build_prompt_and_target(
     messages: List[Dict[str, Any]],
     prompt_format: str,
@@ -271,7 +256,12 @@ def build_prompt_and_target(
     if prompt_format == "chat_template":
         if processor is None or not hasattr(processor, "apply_chat_template"):
             raise ValueError("chat_template prompt_format requires processor.apply_chat_template")
-        prompt_text = build_chat_template_prompt(processor, prompt_messages)
+        prompt_text = processor.apply_chat_template(
+            prompt_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
         return {"prompt": prompt_text, "target": target_text}
 
     chunks = []

@@ -10,24 +10,11 @@ ACTIONS = ("move_forward", "turn_left", "turn_right", "stop")
 
 
 def extract_action(sample: Dict) -> Optional[str]:
-    messages = sample.get("messages")
-    if not isinstance(messages, list):
-        return None
-
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
-        content = message.get("content")
-        if isinstance(content, list):
-            for item in reversed(content):
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text = str(item.get("text", "")).strip().lower()
-                    if text in ACTIONS:
-                        return text
-        elif isinstance(content, str):
-            text = content.strip().lower()
-            if text in ACTIONS:
-                return text
+    action = sample.get("action")
+    if isinstance(action, str):
+        action = action.strip().lower()
+        if action in ACTIONS:
+            return action
     return None
 
 

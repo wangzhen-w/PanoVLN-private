@@ -66,7 +66,6 @@ class TrainingConfig:
     gradient_checkpointing: bool = True
     max_grad_norm: float = 1.0
     deepspeed: Optional[str] = None
-    train_sampling_strategy: Optional[str] = None
 
 
 @dataclass

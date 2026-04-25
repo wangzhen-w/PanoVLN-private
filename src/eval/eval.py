@@ -25,18 +25,15 @@ from habitat.config.default_structured_configs import (
 )
 from PIL import Image
 from peft import PeftModel
-from src.data.prepare_training_data import (
-    DEFAULT_MAX_MEMORY_IMAGES,
-    DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
+from src.train.data.data import (
+    DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
+    DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
     VLN_SYSTEM_PROMPT,
     build_vln_image_selection,
     build_vln_user_content,
-)
-from src.train.data.data import (
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
 )
-from src.train.utils import build_chat_template_prompt
 
 SYSTEM_PROMPT = VLN_SYSTEM_PROMPT
 DEFAULT_EVAL_MODEL_PATH = "/workspace/code_dir/a_property/model/Qwen3.5-4B"
@@ -84,10 +81,9 @@ def validate_eval_model_path(model_path: str) -> str:
 
 
 def build_eval_messages(instruction: str, images: List[Image.Image]):
-    placeholder_images = [f"image_{index}" for index in range(len(images))]
     user_content_template = build_vln_user_content(
         instruction=instruction,
-        user_images=placeholder_images,
+        num_images=len(images),
     )
 
     messages = [
@@ -104,6 +100,17 @@ def build_eval_messages(instruction: str, images: List[Image.Image]):
         }
     )
     return messages
+
+
+def build_eval_generation_prompt(processor, messages: List[Dict]) -> str:
+    if processor is None or not hasattr(processor, "apply_chat_template"):
+        raise ValueError("eval generation prompt requires processor.apply_chat_template")
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
 
 
 def select_vln_eval_image_indices(
@@ -531,7 +538,7 @@ class NaVIDA_Agent(Agent):
 
 
     def predict_inference(self):
-        texts = [build_chat_template_prompt(self.processor, self.conversations)]
+        texts = [build_eval_generation_prompt(self.processor, self.conversations)]
 
         prompt_inputs = self.processor(
             text=texts,

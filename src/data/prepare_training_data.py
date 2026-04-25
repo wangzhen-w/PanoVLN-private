@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from tqdm import tqdm
 
@@ -9,21 +9,7 @@ from tqdm import tqdm
 FORWARD_DISTANCE_CM = 25
 TURN_ANGLE_DEGREE = 15
 DEFAULT_MAX_MEMORY_IMAGES = 10
-DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 200
-VLN_SYSTEM_PROMPT = (
-    "You are a visual language navigation agent. "
-    "Given a navigation instruction, your recent memory observations, and your current observation, "
-    "predict the next action. "
-    "Action space: move_forward (0.25 meters), turn_left (15 degrees), "
-    "turn_right (15 degrees), stop. "
-    "Use stop only when you think the goal has been reached. "
-    "Reply with exactly one action."
-)
-IDM_SYSTEM_PROMPT = (
-    "You are a visual language navigation agent. Given the current panoramic view and the goal panoramic view, "
-    "output exactly one action that moves the robot from the current view toward the goal view: "
-    "move_forward, turn_left, turn_right, or stop."
-)
+DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 100
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -56,99 +42,8 @@ def write_jsonl(output_path: str, items: List[Dict]) -> None:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
-def text_content(text: str) -> Dict[str, str]:
-    return {"type": "text", "text": text}
-
-
-def image_content() -> Dict[str, str]:
-    return {"type": "image"}
-
-
-def build_system_prompt(task_type: str) -> str:
-    if task_type == "vln":
-        return VLN_SYSTEM_PROMPT
-    if task_type == "idm":
-        return IDM_SYSTEM_PROMPT
-    raise NotImplementedError(f"Unsupported task type: {task_type}")
-
-
-def build_vln_user_content(instruction: str, user_images: List[str]) -> List[Dict[str, str]]:
-    if not user_images:
-        raise ValueError("VLN samples require at least one image")
-
-    num_memory_images = max(0, len(user_images) - 1)
-    instruction = instruction.strip()
-    content = [text_content(f"Instruction: {instruction}")]
-
-    if num_memory_images > 0:
-        content.append(
-            text_content(
-                "\nHistory memory observations are 90-degree perspective views ordered from older to newer:"
-            )
-        )
-        content.extend(image_content() for _ in range(num_memory_images))
-
-    content.extend(
-        [
-            text_content(
-                "\nCurrent observation (360-degree panoramic view centered on the robot's current forward direction):"
-            ),
-            image_content(),
-            text_content("\nPredict the next action."),
-        ]
-    )
-    return content
-
-
-def build_idm_user_content(user_images: List[str]) -> List[Dict[str, str]]:
-    if len(user_images) != 2:
-        raise ValueError(f"IDM samples require exactly 2 images, got {len(user_images)}")
-    return [
-        text_content(
-            "You have been given an image of the current view "
-        ),
-        image_content(),
-        text_content(
-            " and an image of the goal view "
-        ),
-        image_content(),
-        text_content(
-            ". Analyze the two images to predict the navigation action that "
-            "would move the robot from the current view to the goal view."
-        ),
-    ]
-
-
-def build_training_messages(
-    task_type: str,
-    instruction: str,
-    user_images: List[str],
-    assistant_text: str,
-) -> List[Dict]:
-    if task_type == "vln":
-        user_content = build_vln_user_content(
-            instruction=instruction,
-            user_images=user_images,
-        )
-    elif task_type == "idm":
-        user_content = build_idm_user_content(user_images)
-    else:
-        raise NotImplementedError(f"Unsupported task type: {task_type}")
-
-    return [
-        {
-            "role": "system",
-            "content": [text_content(build_system_prompt(task_type))],
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
-        {
-            "role": "assistant",
-            "content": [text_content(assistant_text)],
-        },
-    ]
+def write_jsonl_item(handle, item: Dict) -> None:
+    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def build_dataset_config(input_root: str) -> Dict[str, Dict[str, str]]:
@@ -212,28 +107,14 @@ def build_vln_image_selection(
     max_memory_images: int,
     memory_pool_window_frames: int,
 ) -> List[int]:
-    max_memory_images = max(0, int(max_memory_images))
-    memory_pool_window_frames = max(1, int(memory_pool_window_frames))
-    current_frame_index = min(current_step, last_frame_index)
-    pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
-    candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
+    from src.train.data.data import build_vln_image_selection as select_vln_memory_indices
 
-    total_selected_images = max_memory_images + 1
-    if total_selected_images <= 0 or not candidate_frame_indices:
-        return [current_frame_index]
-
-    if len(candidate_frame_indices) <= total_selected_images:
-        return candidate_frame_indices
-
-    last_candidate_position = len(candidate_frame_indices) - 1
-    selected_positions = [
-        (slot * last_candidate_position) // (total_selected_images - 1)
-        for slot in range(total_selected_images)
-    ]
-    return [
-        candidate_frame_indices[position]
-        for position in selected_positions
-    ]
+    return select_vln_memory_indices(
+        current_step=current_step,
+        last_frame_index=last_frame_index,
+        max_memory_images=max_memory_images,
+        memory_pool_window_frames=memory_pool_window_frames,
+    )
 
 
 def build_vln_images(
@@ -243,32 +124,22 @@ def build_vln_images(
     max_memory_images: int,
     memory_pool_window_frames: int,
 ) -> List[str]:
-    del actions
-    selected_frame_indices = build_vln_image_selection(
-        current_step=current_step,
-        last_frame_index=len(episode_image_list) - 1,
-        max_memory_images=max_memory_images,
-        memory_pool_window_frames=memory_pool_window_frames,
-    )
-    return [episode_image_list[frame_index] for frame_index in selected_frame_indices]
+    del actions, max_memory_images, memory_pool_window_frames
+    current_frame_index = min(max(0, int(current_step)), len(episode_image_list) - 1)
+    return episode_image_list[:current_frame_index + 1]
 
 
-def build_idm_images(episode_image_list: List[str], action_chunk: Dict[str, int]) -> List[str]:
-    current_image = episode_image_list[action_chunk["start_step"]]
-    goal_image = episode_image_list[min(action_chunk["end_step"] + 1, len(episode_image_list) - 1)]
-    return [current_image, goal_image]
-
-
-def process_single_type(
+def process_dataset(
     selected_subset_list: List[str],
     dataset_config: Dict[str, Dict[str, str]],
     input_root: str,
-    task_type: str,
     max_memory_images: int,
     memory_pool_window_frames: int,
     max_episodes_per_subset: int = None,
-) -> List[Dict]:
+    output_handle=None,
+):
     data2save = []
+    total_samples = 0
     for subset in selected_subset_list:
         subset_config = dataset_config[subset]
         image_path = subset_config["image_path"]
@@ -284,8 +155,8 @@ def process_single_type(
         if max_episodes_per_subset is not None:
             annotation = annotation[:max_episodes_per_subset]
 
-        subset_sample_start = len(data2save)
-        progress = tqdm(annotation, desc=f"{task_type}:{subset}", dynamic_ncols=True)
+        subset_sample_start = total_samples
+        progress = tqdm(annotation, desc=subset, dynamic_ncols=True)
 
         for episode_item in progress:
             episode_id = episode_item["episode_id"]
@@ -308,50 +179,40 @@ def process_single_type(
             action_chunks = build_action_chunks(actions)
 
             for action_chunk in action_chunks:
-                if task_type == "idm" and action_chunk["action_id"] == 0:
-                    continue
+                user_images = build_vln_images(
+                    episode_image_list=episode_image_list,
+                    actions=actions,
+                    current_step=action_chunk["start_step"],
+                    max_memory_images=max_memory_images,
+                    memory_pool_window_frames=memory_pool_window_frames,
+                )
 
-                if task_type == "vln":
-                    user_images = build_vln_images(
-                        episode_image_list=episode_image_list,
-                        actions=actions,
-                        current_step=action_chunk["start_step"],
-                        max_memory_images=max_memory_images,
-                        memory_pool_window_frames=memory_pool_window_frames,
-                    )
-                elif task_type == "idm":
-                    user_images = build_idm_images(episode_image_list, action_chunk)
+                sample = {
+                    "instruction": instruction,
+                    "action": action_chunk["text"],
+                    "images": list(user_images),
+                    "episode_id": str(episode_id),
+                    "dataset": subset,
+                    "step_index": action_chunk["start_step"],
+                }
+                if output_handle is None:
+                    data2save.append(sample)
                 else:
-                    raise NotImplementedError(f"Unsupported task type: {task_type}")
+                    write_jsonl_item(output_handle, sample)
+                total_samples += 1
 
-                messages = build_training_messages(
-                    task_type=task_type,
-                    instruction=instruction,
-                    user_images=user_images,
-                    assistant_text=action_chunk["text"],
-                )
-
-                data2save.append(
-                    {
-                        "messages": messages,
-                        "images": list(user_images),
-                        "episode_id": str(episode_id),
-                        "task type": task_type,
-                    }
-                )
-
-        subset_sample_count = len(data2save) - subset_sample_start
+        subset_sample_count = total_samples - subset_sample_start
         print(
-            f"[{task_type}][{subset}] episodes={len(annotation)} "
-            f"samples={subset_sample_count}"
+            f"[{subset}] episodes={len(annotation)} samples={subset_sample_count}"
         )
 
-    return data2save
+    if output_handle is None:
+        return data2save
+    return total_samples
 
 
 def main(
     selected_subset_list: List[str],
-    task_type_list: List[str],
     input_root: str,
     output_path: str,
     max_memory_images: int,
@@ -359,26 +220,23 @@ def main(
     max_episodes_per_subset: int = None,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
-    data2save = []
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    total_samples = 0
 
-    for task_type in task_type_list:
-        if task_type not in {"vln", "idm"}:
-            raise NotImplementedError(f"Unsupported task type: {task_type}")
-
-        data2save.extend(
-            process_single_type(
-                selected_subset_list=selected_subset_list,
-                dataset_config=dataset_config,
-                input_root=input_root,
-                task_type=task_type,
-                max_memory_images=max_memory_images,
-                memory_pool_window_frames=memory_pool_window_frames,
-                max_episodes_per_subset=max_episodes_per_subset,
-            )
+    with open(output_path, "w", encoding="utf-8") as output_handle:
+        total_samples += process_dataset(
+            selected_subset_list=selected_subset_list,
+            dataset_config=dataset_config,
+            input_root=input_root,
+            max_memory_images=max_memory_images,
+            memory_pool_window_frames=memory_pool_window_frames,
+            max_episodes_per_subset=max_episodes_per_subset,
+            output_handle=output_handle,
         )
 
-    print(f"total number of samples = {len(data2save)}")
-    write_jsonl(output_path, data2save)
+    print(f"total number of samples = {total_samples}")
 
 
 if __name__ == "__main__":
@@ -387,11 +245,6 @@ if __name__ == "__main__":
         "--dataset_name",
         nargs="+",
         default=["r2r"],
-    )
-    parser.add_argument(
-        "--task_type",
-        nargs="+",
-        default=["vln", "idm"],
     )
     parser.add_argument(
         "--input_root",
@@ -422,7 +275,6 @@ if __name__ == "__main__":
 
     main(
         selected_subset_list=args.dataset_name,
-        task_type_list=args.task_type,
         input_root=args.input_root,
         output_path=args.output_path,
         max_memory_images=args.max_memory_images,
