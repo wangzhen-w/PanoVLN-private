@@ -3,7 +3,7 @@ import os
 import sys
 import warnings
 from contextlib import contextmanager
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import PIL.Image as Image
 import torch
@@ -24,19 +24,16 @@ CONFIG = {
         "config_path": "./config/vln_r2r_train.yaml",
         "image_dir": "r2r",
         "annotation_name": "r2r.jsonl",
-        "default_split": "train",
     },
     "rxr": {
         "config_path": "./config/vln_rxr_train.yaml",
         "image_dir": "rxr",
         "annotation_name": "rxr.jsonl",
-        "default_split": "train",
     },
     "envdrop": {
         "config_path": "./config/vln_envdrop.yaml",
         "image_dir": "envdrop",
         "annotation_name": "envdrop.jsonl",
-        "default_split": "envdrop",
     },
     "scalevln": {
         "config_path": "./config/vln_scalevln.yaml",
@@ -95,15 +92,6 @@ SUPPORTED_ACTION_IDS = {
     TURN_LEFT_ACTION,
     TURN_RIGHT_ACTION,
 }
-
-
-def resolve_existing_path(candidates: Iterable[str]) -> str:
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(
-        "None of the candidate paths exist:\n" + "\n".join(candidates)
-    )
 
 
 def default_output_path(output_root: str, dataset_name: str) -> str:
@@ -247,10 +235,8 @@ def build_worker_assignments(
 
 def resolve_dataset_paths(
     dataset_name: str,
-    input_root: str,
     output_root: Optional[str] = None,
-    dataset_split: Optional[str] = None,
-) -> Tuple[Optional[str], Optional[str], str, str, str]:
+) -> Tuple[Optional[str], Optional[str]]:
     dataset_config = CONFIG[dataset_name]
     annotation_path = None
     image_path = None
@@ -260,114 +246,19 @@ def resolve_dataset_paths(
         )
         image_path = os.path.join(output_root, "images", dataset_config["image_dir"])
 
-    dataset_split = dataset_split or dataset_config.get("default_split")
-    has_janus_layout = os.path.isdir(os.path.join(input_root, "datasets")) and os.path.isdir(
-        os.path.join(input_root, "scene_datasets")
-    )
-
-    if has_janus_layout:
-        scene_root = os.path.join(input_root, "scene_datasets")
-        scene_dataset = None
-
-        if dataset_name == "r2r":
-            if dataset_split is None:
-                raise ValueError("dataset_split is required for janus r2r")
-            data_path = os.path.join(
-                input_root, "datasets", "r2r", dataset_split, f"{dataset_split}.json.gz"
-            )
-        elif dataset_name == "rxr":
-            if dataset_split is None:
-                raise ValueError("dataset_split is required for janus rxr")
-            guide_suffix = "_guide" if not dataset_split.endswith("_guide") else ""
-            data_path = os.path.join(
-                input_root, "datasets", "rxr", dataset_split, f"{dataset_split}{guide_suffix}.json.gz"
-            )
-        elif dataset_name == "envdrop":
-            data_path = os.path.join(
-                input_root, "datasets", "r2r", "envdrop", "envdrop.json.gz"
-            )
-        else:
-            data_path = resolve_existing_path(
-                [
-                    os.path.join(input_root, "datasets", "scalevln", "scalevln_subset_150k.json.gz"),
-                    os.path.join(input_root, "datasets", "scalevln", "scalevln_subset_150k.json"),
-                    os.path.join(input_root, "datasets", "scalevln", "scalevln_150k", "scalevln_subset_150k.json.gz"),
-                ]
-            )
-    else:
-        if dataset_name in {"r2r", "rxr", "envdrop"}:
-            scene_root = os.path.join(input_root, "Matterport3D", "mp3d_habitat")
-            scene_dataset = os.path.join(scene_root, "mp3d_scene_dataset_config.json")
-        else:
-            scene_root = os.path.join(input_root, "HM3D")
-            scene_dataset = os.path.join(
-                scene_root, "hm3d_annotated_basis.scene_dataset_config.json"
-            )
-
-        if dataset_name == "r2r":
-            if dataset_split is None:
-                raise ValueError("dataset_split is required for r2r")
-            data_path = os.path.join(
-                input_root,
-                "R2R_VLNCE_v1-3_preprocessed",
-                dataset_split,
-                f"{dataset_split}.json.gz",
-            )
-        elif dataset_name == "rxr":
-            if dataset_split is None:
-                raise ValueError("dataset_split is required for rxr")
-            guide_suffix = "_guide" if not dataset_split.endswith("_guide") else ""
-            data_path = os.path.join(
-                input_root,
-                "RxR_VLNCE_v0",
-                dataset_split,
-                f"{dataset_split}{guide_suffix}.json.gz",
-            )
-        elif dataset_name == "envdrop":
-            data_path = os.path.join(
-                input_root, "R2R_VLNCE_v1-3_preprocessed", "envdrop", "envdrop.json.gz"
-            )
-        else:
-            data_path = resolve_existing_path(
-                [
-                    os.path.join(
-                        input_root, "ScaleVLN_150k", "scalevln_subset_150k.json.gz"
-                    ),
-                    os.path.join(input_root, "StreamVLN", "scalevln_subset_150k.json.gz"),
-                ]
-            )
-
-    return annotation_path, image_path, scene_root, scene_dataset, data_path
+    return annotation_path, image_path
 
 
-def build_env_config(dataset_name: str, input_root: str, dataset_split: Optional[str] = None):
+def build_env_config(dataset_name: str):
     config_path = os.path.join(
         PROJECT_ROOT,
         CONFIG[dataset_name]["config_path"].lstrip("./"),
     )
-    _, _, scene_root, scene_dataset, data_path = resolve_dataset_paths(
-        dataset_name=dataset_name,
-        input_root=input_root,
-        dataset_split=dataset_split,
-    )
-
-    env_config = get_config(config_path)
-    with habitat.config.read_write(env_config):
-        env_config.habitat.dataset.scenes_dir = scene_root
-        env_config.habitat.dataset.data_path = data_path
-        if dataset_split is not None:
-            env_config.habitat.dataset.split = dataset_split
-        if scene_dataset and os.path.exists(scene_dataset):
-            env_config.habitat.simulator.scene_dataset = scene_dataset
-    return env_config
+    return get_config(config_path)
 
 
-def load_dataset(dataset_name: str, input_root: str, dataset_split: Optional[str] = None):
-    env_config = build_env_config(
-        dataset_name=dataset_name,
-        input_root=input_root,
-        dataset_split=dataset_split,
-    )
+def load_dataset(dataset_name: str):
+    env_config = build_env_config(dataset_name=dataset_name)
     dataset = habitat.datasets.make_dataset(
         id_dataset=env_config.habitat.dataset.type,
         config=env_config.habitat.dataset,

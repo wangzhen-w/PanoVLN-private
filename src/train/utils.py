@@ -243,15 +243,20 @@ def build_prompt_and_target(
     messages: List[Dict[str, Any]],
     prompt_format: str,
     processor=None,
+    require_target: bool = True,
 ) -> Dict[str, str]:
     if not messages:
         raise ValueError("messages is empty")
-    if messages[-1].get("role") != "assistant":
-        raise ValueError("The last message must be from the assistant")
 
-    target_msg = messages[-1]
-    target_text = _content_to_text(target_msg.get("content", ""))
-    prompt_messages = messages[:-1]
+    target_text = ""
+    if messages[-1].get("role") == "assistant":
+        target_msg = messages[-1]
+        target_text = _content_to_text(target_msg.get("content", ""))
+        prompt_messages = messages[:-1]
+    elif require_target:
+        raise ValueError("The last message must be from the assistant")
+    else:
+        prompt_messages = messages
 
     if prompt_format == "chat_template":
         if processor is None or not hasattr(processor, "apply_chat_template"):
@@ -260,7 +265,7 @@ def build_prompt_and_target(
             prompt_messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=True,
         )
         return {"prompt": prompt_text, "target": target_text}
 

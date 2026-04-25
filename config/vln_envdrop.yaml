@@ -9,7 +9,6 @@ defaults:
   - /habitat/task/lab_sensors:
     - gps_sensor
     - compass_sensor
-  - /habitat/task/measurements/oracle_success@habitat.task.measurements.oracle_success
   - _self_
 
 habitat:
@@ -43,12 +42,11 @@ habitat:
         type: SPL
       oracle_success:
         type: OracleSuccess
-        success_distance: 3.0
       oracle_navigation_error:
         type: OracleNavigationError
         
   dataset:
     type: R2RVLNCE-v1
     split: envdrop
-    scenes_dir: /workspace/data_dir/dataset/janusvln_data/scene_datasets
-    data_path: /workspace/data_dir/dataset/janusvln_data/datasets/r2r/{split}/{split}.json.gz
+    scenes_dir: /workspace/data/wz_data/dataset/janusvln_data/scene_datasets
+    data_path: /workspace/data/wz_data/dataset/janusvln_data/datasets/r2r/{split}/{split}.json.gz

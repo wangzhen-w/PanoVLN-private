@@ -232,8 +232,6 @@ def generate_annotations_sequential(
 def preprocess_worker(
     result_queue,
     dataset_name,
-    input_root,
-    dataset_split,
     goal_radius,
     episode_ids,
     partial_output_path,
@@ -250,8 +248,6 @@ def preprocess_worker(
 
         env_config, dataset = load_dataset(
             dataset_name=dataset_name,
-            input_root=input_root,
-            dataset_split=dataset_split,
         )
         with habitat.config.read_write(env_config):
             env_config.habitat.simulator.habitat_sim_v0.gpu_device_id = local_gpu_id
@@ -322,9 +318,7 @@ def terminate_processes(process_jobs):
 
 def process_dataset(
     dataset_name,
-    input_root,
     output_root,
-    dataset_split,
     goal_radius,
     requested_gpu_ids,
     visible_gpu_ids,
@@ -353,8 +347,6 @@ def process_dataset(
 
     env_config, dataset = load_dataset(
         dataset_name=dataset_name,
-        input_root=input_root,
-        dataset_split=dataset_split,
     )
     all_selected_episodes = filter_episodes(
         dataset.episodes,
@@ -474,8 +466,6 @@ def process_dataset(
             args=(
                 result_queue,
                 dataset_name,
-                input_root,
-                dataset_split,
                 goal_radius,
                 plan["episode_ids"],
                 partial_output_path,
@@ -582,12 +572,6 @@ def main():
         default=["r2r"],
     )
     parser.add_argument(
-        "--input_root",
-        type=str,
-        default="/workspace/data_dir/dataset/general_VLN_data",
-        help="Root directory of the source datasets.",
-    )
-    parser.add_argument(
         "--output_root",
         type=str,
         default="/workspace/data_dir/dataset/train/NAVIDA_pano",
@@ -597,14 +581,6 @@ def main():
         "--goal_radius",
         type=float,
         default=DEFAULT_GOAL_RADIUS,
-    )
-    parser.add_argument(
-        "--dataset_split",
-        "--split",
-        dest="dataset_split",
-        type=str,
-        default=None,
-        help="Optional split override, e.g. val_unseen.",
     )
     parser.add_argument(
         "--gpu_ids",
@@ -660,13 +636,11 @@ def main():
 
         output_path = default_output_path(args.output_root, dataset_name)
         print(
-            f"processing {dataset_name} with input_root={args.input_root} -> {output_path}"
+            f"processing {dataset_name} with yaml dataset config -> {output_path}"
         )
         process_dataset(
             dataset_name=dataset_name,
-            input_root=args.input_root,
             output_root=args.output_root,
-            dataset_split=args.dataset_split,
             goal_radius=args.goal_radius,
             requested_gpu_ids=requested_gpu_ids,
             visible_gpu_ids=visible_gpu_ids,

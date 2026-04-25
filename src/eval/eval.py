@@ -34,6 +34,7 @@ from src.train.data.data import (
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
 )
+from src.train.utils import build_prompt_and_target
 
 SYSTEM_PROMPT = VLN_SYSTEM_PROMPT
 DEFAULT_EVAL_MODEL_PATH = "/workspace/code_dir/a_property/model/Qwen3.5-4B"
@@ -103,14 +104,13 @@ def build_eval_messages(instruction: str, images: List[Image.Image]):
 
 
 def build_eval_generation_prompt(processor, messages: List[Dict]) -> str:
-    if processor is None or not hasattr(processor, "apply_chat_template"):
-        raise ValueError("eval generation prompt requires processor.apply_chat_template")
-    return processor.apply_chat_template(
+    prompt_and_target = build_prompt_and_target(
         messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
+        prompt_format="chat_template",
+        processor=processor,
+        require_target=False,
     )
+    return prompt_and_target["prompt"]
 
 
 def select_vln_eval_image_indices(

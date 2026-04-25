@@ -11,19 +11,19 @@ export HABITAT_SIM_LOG=quiet
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-MODEL_PATH="/workspace/code_dir/a_property/model/Trained/erp_mem_no_vis_atom"
+MODEL_PATH="/workspace/data/wz_data/model/Trained/erp_linear_mem_100_10"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/code_dir/a_property/vln_result/erp_mem_no_vis_atom"
+SAVE_PATH="/workspace/data/wz_data/vln_result/erp_linear_mem_100_10"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 
-GPU_IDS="4,5,6,7"
+GPU_IDS="0,1,2,3,6,7"
 PROCS_PER_GPU=2
 MAX_EPISODES=0
-SAVE_TOPDOWN=true
+SAVE_TOPDOWN=false
 SEED=42
 
 mkdir -p "$SAVE_PATH"

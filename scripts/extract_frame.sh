@@ -12,12 +12,10 @@ export GLOG_minloglevel="3"
 export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 PYTHON_BIN="python"
-SPLIT="train"
-INPUT_ROOT="/workspace/code_dir/a_property/dataset/janusvln_data"
-OUTPUT_ROOT="/workspace/code_dir/a_property/dataset/NAVIDA_pano_${SPLIT}"
-DATASET_NAMES=(r2r)
-GPU_IDS="4,5,6,7"
-PROCESSES_PER_GPU="3"
+OUTPUT_ROOT="/workspace/data/wz_data/dataset/NAVIDA_pano"
+DATASET_NAMES=(rxr)
+GPU_IDS="0,1,3,4,5,6,7"
+PROCESSES_PER_GPU="2"
 SAVE_IMAGE="true"
 SKIP_EXISTING_EPISODES="true"
 MAX_EPISODES=""
@@ -25,9 +23,8 @@ EPISODE_IDS=""
 
 mkdir -p "${OUTPUT_ROOT}"
 
-echo "INPUT_ROOT: ${INPUT_ROOT}"
 echo "OUTPUT_ROOT: ${OUTPUT_ROOT}"
-echo "SPLIT: ${SPLIT}"
+echo "Habitat dataset paths: config/*.yaml"
 echo "DATASET_NAMES: ${DATASET_NAMES[*]}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "PROCESSES_PER_GPU: ${PROCESSES_PER_GPU}"
@@ -43,9 +40,7 @@ NUM_THREAD="$((GPU_COUNT * PROCESSES_PER_GPU))"
 
 CMD=(
     "${PYTHON_BIN}" src/data/extract_frame.py
-    --input_root "${INPUT_ROOT}"
     --output_root "${OUTPUT_ROOT}"
-    --split "${SPLIT}"
     --dataset_name "${DATASET_NAMES[@]}"
     --gpu_ids "${GPU_IDS}"
     --num_thread "${NUM_THREAD}"

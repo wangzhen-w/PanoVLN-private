@@ -12,13 +12,11 @@ export GLOG_minloglevel="3"
 export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 PYTHON_BIN="python"
-SPLIT="train"
-INPUT_ROOT="/workspace/code_dir/a_property/dataset/janusvln_data"
-OUTPUT_ROOT="/workspace/code_dir/a_property/dataset/NAVIDA_pano_${SPLIT}"
-DATASET_NAMES=(r2r)
-GOAL_RADIUS="0.5"
-GPU_IDS="4,5,6,7"
-PROCESSES_PER_GPU="3"
+OUTPUT_ROOT="/workspace/data/wz_data/dataset/NAVIDA_pano"
+DATASET_NAMES=(envdrop)
+GOAL_RADIUS="0.3"
+GPU_IDS="0,1,2,3,4"
+PROCESSES_PER_GPU="4"
 SKIP_EXISTING_EPISODES="true"
 MAX_EPISODES=""
 EPISODE_IDS=""
@@ -29,9 +27,8 @@ if [[ -n "${TEMP_ROOT}" ]]; then
     mkdir -p "${TEMP_ROOT}"
 fi
 
-echo "INPUT_ROOT: ${INPUT_ROOT}"
 echo "OUTPUT_ROOT: ${OUTPUT_ROOT}"
-echo "SPLIT: ${SPLIT}"
+echo "Habitat dataset paths: config/*.yaml"
 echo "DATASET_NAMES: ${DATASET_NAMES[*]}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "PROCESSES_PER_GPU: ${PROCESSES_PER_GPU}"
@@ -43,9 +40,7 @@ fi
 
 CMD=(
     "${PYTHON_BIN}" src/data/preprocess.py
-    --input_root "${INPUT_ROOT}"
     --output_root "${OUTPUT_ROOT}"
-    --split "${SPLIT}"
     --goal_radius "${GOAL_RADIUS}"
     --gpu_ids "${GPU_IDS}"
     --num_processes_per_gpu "${PROCESSES_PER_GPU}"

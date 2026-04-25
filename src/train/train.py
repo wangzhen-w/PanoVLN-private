@@ -67,8 +67,8 @@ def main():
     set_seed(cfg.training.seed)
 
     processor, tokenizer = load_processor_and_tokenizer(cfg)
-    train_image_root = cfg.data.train_image_root or cfg.data.image_root
-    eval_image_root = cfg.data.eval_image_root or cfg.data.image_root or train_image_root
+    train_image_root = cfg.data.train_image_root
+    eval_image_root = cfg.data.eval_image_root or train_image_root
 
     train_dataset = SupervisedDataset(
         jsonl_path=cfg.data.train_jsonl,

@@ -139,7 +139,6 @@ class RxRVLNCEDatasetV1(Dataset):
                 if self._language_from_episode(episode) in languages_to_load
             ]
 
-
     def from_json(
         self, json_str: str, scenes_dir: Optional[str] = None
     ) -> None:
@@ -196,29 +195,32 @@ class RxRVLNCEDatasetV1(Dataset):
 
 cs = ConfigStore.instance()
 
+
 @dataclass
 class R2RVLNCEDatasetConfig(DatasetConfig):
-    type: str = "R2RVLNCE-v1" 
+    type: str = "R2RVLNCE-v1"
     split: str = "train"
     scenes_dir: str = "data/scene_datasets/"
     data_path: str = "data/RxR_VLNCE_v0/{split}/{split}_gt.json.gz"
 
+
 @dataclass
 class RxRVLNCEDatasetConfig(DatasetConfig):
-    type: str = "RxRVLNCE-v1" 
+    type: str = "RxRVLNCE-v1"
     split: str = "train"
     scenes_dir: str = "data/scene_datasets/"
     roles: List[str] = field(default_factory=list)
     languages: List[str] = field(default_factory=list)
     data_path: str = "data/RxR_VLNCE_v0/{split}/{split}_{role}_gt.json.gz"
 
+
 cs.store(
-    group="habitat/dataset", 
-    name="r2rvlnce_v1", 
+    group="habitat/dataset",
+    name="r2rvlnce_v1",
     node=R2RVLNCEDatasetConfig
 )
 cs.store(
-    group="habitat/dataset", 
-    name="rxrvlnce_v1", 
+    group="habitat/dataset",
+    name="rxrvlnce_v1",
     node=RxRVLNCEDatasetConfig
 )

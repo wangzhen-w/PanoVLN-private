@@ -100,8 +100,6 @@ def replay_annotation_episode(env, episode, annotation, episode_image_path=None)
 def extract_data(
         result_queue,
         dataset_name,
-        input_root,
-        dataset_split,
         annotations,
         episode_ids,
         worker_index,
@@ -119,8 +117,6 @@ def extract_data(
 
         env_config, dataset = load_dataset(
             dataset_name=dataset_name,
-            input_root=input_root,
-            dataset_split=dataset_split,
         )
         with habitat.config.read_write(env_config):
             env_config.habitat.simulator.habitat_sim_v0.gpu_device_id = local_gpu_id
@@ -222,9 +218,7 @@ def extract_data(
 
 def process_single_dataset(
     dataset_name,
-    input_root,
     output_root,
-    dataset_split,
     save_image,
     num_thread,
     requested_gpu_ids,
@@ -234,11 +228,9 @@ def process_single_dataset(
     max_episodes,
     episode_ids,
 ):
-    ANNOT_PATH, IMAGE_PATH, _, _, _ = resolve_dataset_paths(
+    ANNOT_PATH, IMAGE_PATH = resolve_dataset_paths(
         dataset_name,
-        input_root,
         output_root,
-        dataset_split=dataset_split,
     )
     annotations = []
     with open(ANNOT_PATH, "r", encoding="utf-8") as f:
@@ -267,8 +259,6 @@ def process_single_dataset(
 
     _, dataset = load_dataset(
         dataset_name=dataset_name,
-        input_root=input_root,
-        dataset_split=dataset_split,
     )
     dataset.episodes = sorted(
         dataset.episodes, key=lambda episode: int(episode.episode_id)
@@ -408,8 +398,6 @@ def process_single_dataset(
         worker_args = (
             result_queue,
             dataset_name,
-            input_root,
-            dataset_split,
             worker_annotations,
             worker_episode_ids,
             assignment["worker_index"],
@@ -490,9 +478,7 @@ def process_single_dataset(
 
 def main(
     dataset2process,
-    input_root,
     output_root,
-    dataset_split,
     save_image,
     num_thread,
     requested_gpu_ids,
@@ -505,9 +491,7 @@ def main(
     for dataset_name in dataset2process:
         process_single_dataset(
             dataset_name=dataset_name,
-            input_root=input_root,
             output_root=output_root,
-            dataset_split=dataset_split,
             save_image=save_image,
             num_thread=num_thread,
             requested_gpu_ids=requested_gpu_ids,
@@ -533,20 +517,7 @@ if __name__ == "__main__":
         default=False,
         type=str2bool,
     )
-    parser.add_argument(
-        "--dataset_split",
-        "--split",
-        dest="dataset_split",
-        type=str,
-        default=None,
-        help="Optional split override, e.g. val_unseen.",
-    )
     parser.add_argument("--num_thread", type=int, default=16)
-    parser.add_argument(
-        "--input_root",
-        type=str,
-        default="/workspace/data_dir/dataset/general_VLN_data",
-    )
     parser.add_argument(
         "--output_root",
         type=str,
@@ -595,9 +566,7 @@ if __name__ == "__main__":
 
     main(
         dataset2process=args.dataset_name,
-        input_root=args.input_root,
         output_root=args.output_root,
-        dataset_split=args.dataset_split,
         save_image=args.save_image,
         num_thread=args.num_thread,
         requested_gpu_ids=requested_gpu_ids,

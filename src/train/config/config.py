@@ -20,7 +20,6 @@ class ModelConfig:
 class DataConfig:
     train_jsonl: str
     eval_jsonl: Optional[str] = None
-    image_root: Optional[str] = None
     train_image_root: Optional[str] = None
     eval_image_root: Optional[str] = None
     train_max_samples: Optional[int] = None

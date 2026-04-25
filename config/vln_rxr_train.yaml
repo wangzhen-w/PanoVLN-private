@@ -9,8 +9,6 @@ defaults:
   - /habitat/task/lab_sensors:
     - gps_sensor
     - compass_sensor
-  - /habitat/task/measurements/oracle_success@habitat.task.measurements.oracle_success
-  - /habitat/task/measurements/ndtw@habitat.task.measurements.ndtw
   - _self_
 
 habitat:
@@ -44,13 +42,10 @@ habitat:
         type: SPL
       oracle_success:
         type: OracleSuccess
-        success_distance: 3.0
       oracle_navigation_error:
         type: OracleNavigationError
       ndtw:
         type: NDTW
-        success_distance: 3.0
-        gt_path: /workspace/data_dir/dataset/janusvln_data/datasets/rxr/{split}/{split}_{role}_gt.json.gz
         
         
   dataset:
@@ -58,5 +53,5 @@ habitat:
     split: train
     roles: [guide]
     languages: ["en-US", "en-IN"]
-    scenes_dir: /workspace/data_dir/dataset/janusvln_data/scene_datasets
-    data_path: /workspace/data_dir/dataset/janusvln_data/datasets/rxr/{split}/{split}_{role}.json.gz
+    scenes_dir: /workspace/data/wz_data/dataset/janusvln_data/scene_datasets
+    data_path: /workspace/data/wz_data/dataset/janusvln_data/datasets/rxr/{split}/{split}_{role}.json.gz

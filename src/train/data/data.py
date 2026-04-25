@@ -153,7 +153,7 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
     if num_memory_images > 0:
         content.append(
             text_content(
-                "\nHistory memory observations are panoramic views ordered from older to newer:"
+                "\nHistory memory observations are panoramic views with the top and bottom 20 degrees cropped, ordered from older to newer:"
             )
         )
         content.extend(image_content() for _ in range(num_memory_images))
@@ -161,7 +161,7 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
     content.extend(
         [
             text_content(
-                "\nCurrent observation (360-degree panoramic view centered on the robot's current forward direction):"
+                "\nCurrent observation (360-degree panoramic view centered on the robot's current forward direction, with the top and bottom 20 degrees cropped):"
             ),
             image_content(),
             text_content("\nPredict the next action."),
