@@ -1,7 +1,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 import torch
 import numpy as np
 # Import torch before habitat to avoid CUDA runtime conflicts during module loading.
@@ -37,30 +37,20 @@ from src.train.data.data import (
 from src.train.utils import build_prompt_and_target
 
 SYSTEM_PROMPT = VLN_SYSTEM_PROMPT
-DEFAULT_EVAL_MODEL_PATH = "/workspace/code_dir/a_property/model/Qwen3.5-4B"
 TARGET_KEYS = ("success", "spl", "oracle_success", "distance_to_goal", "path_length", "ndtw")
-RESULT_FILENAME = "result.jsonl"
-RESULT_SUMMARY_FILENAME = "result_summary.json"
 CHECKPOINT_DIR_PATTERN = re.compile(r"^checkpoint-\d+$")
+DEFAULT_EVAL_GENERATION_KWARGS = {
+    "max_new_tokens": 24,
+    "temperature": 0,
+    "top_p": None,
+    "num_beams": 1,
+}
 
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)
 logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 
 ATOMIC_ACTION_NAMES = ("stop", "move_forward", "turn_left", "turn_right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
-ATOMIC_ACTION_ALIASES = {
-    "stop": ("stop",),
-    "move_forward": ("move_forward", "move forward", "move-forward", "forward"),
-    "turn_left": ("turn_left", "turn left", "turn-left", "left"),
-    "turn_right": ("turn_right", "turn right", "turn-right", "right"),
-}
-ATOMIC_ACTION_REGEXES = {
-    action_name: tuple(
-        re.compile(rf"(?<![0-9a-z_]){re.escape(alias)}(?![0-9a-z_])")
-        for alias in aliases
-    )
-    for action_name, aliases in ATOMIC_ACTION_ALIASES.items()
-}
 
 
 def seed_all(seed=41):
@@ -149,119 +139,27 @@ def preprocess_vln_eval_images(
     return selected_images
 
 
-def _strip_generation_wrappers(output: str) -> str:
-    output_match = re.search(r"<answer>(.*?)</answer>", output, flags=re.IGNORECASE | re.DOTALL)
-    action_text = output_match.group(1) if output_match else output
-    action_text = re.sub(r"</?think>", " ", action_text, flags=re.IGNORECASE)
-    action_text = re.sub(r"</?answer>", " ", action_text, flags=re.IGNORECASE)
-    return " ".join(action_text.split()).strip()
-
-
-def _normalize_action_candidate(text: str) -> str:
-    return re.sub(r"[\s\-]+", "_", text.lower().strip(" \t\r\n`'\".,;:!?()[]{}"))
-
-
-def _match_atomic_actions(text: str) -> List[Tuple[int, str]]:
-    normalized_text = text.lower()
-    matches = []
-    for action_name, patterns in ATOMIC_ACTION_REGEXES.items():
-        first_match_position = None
-        for pattern in patterns:
-            match = pattern.search(normalized_text)
-            if match is None:
-                continue
-            if first_match_position is None or match.start() < first_match_position:
-                first_match_position = match.start()
-        if first_match_position is not None:
-            matches.append((first_match_position, action_name))
-    matches.sort(key=lambda item: item[0])
-    return matches
-
-
 def parse_atomic_action(output: str):
-    action_text = _strip_generation_wrappers(output)
+    if "</think>" in output.lower():
+        output = re.split(r"</think>", output, flags=re.IGNORECASE)[-1]
+
+    action_text = " ".join(output.split()).lower().strip(" \t\r\n`'\".,;:!?()[]{}")
     if not action_text:
         return None
 
-    normalized_candidate = _normalize_action_candidate(action_text)
-    if normalized_candidate in ATOMIC_ACTION_TO_ID:
-        return ATOMIC_ACTION_TO_ID[normalized_candidate]
+    if action_text in ATOMIC_ACTION_TO_ID:
+        return ATOMIC_ACTION_TO_ID[action_text]
 
-    matched_actions = _match_atomic_actions(action_text)
-    if not matched_actions:
+    matched_actions = [
+        action_name
+        for action_name in ATOMIC_ACTION_NAMES
+        if re.search(rf"(?<![0-9a-z_]){re.escape(action_name)}(?![0-9a-z_])", action_text)
+    ]
+    if len(matched_actions) != 1:
         return None
 
-    unique_actions = {action_name for _, action_name in matched_actions}
-    if len(unique_actions) != 1:
-        return None
+    return ATOMIC_ACTION_TO_ID[matched_actions[0]]
 
-    _, action_name = matched_actions[0]
-    return ATOMIC_ACTION_TO_ID[action_name]
-
-
-def _build_action_token_prefix_map(action_token_sequences: Sequence[Sequence[int]]) -> Dict[Tuple[int, ...], Tuple[int, ...]]:
-    prefix_map = {}
-    for sequence in action_token_sequences:
-        prefix = ()
-        for token_id in sequence:
-            next_tokens = prefix_map.setdefault(prefix, set())
-            next_tokens.add(int(token_id))
-            prefix = prefix + (int(token_id),)
-        prefix_map.setdefault(prefix, set())
-    return {
-        prefix: tuple(sorted(token_ids))
-        for prefix, token_ids in prefix_map.items()
-    }
-
-
-class AtomicActionPrefixConstraint:
-    def __init__(self, tokenizer, eos_token_id):
-        self.action_token_sequences = {
-            action_name: tuple(
-                tokenizer(action_name, add_special_tokens=False)["input_ids"]
-            )
-            for action_name in ATOMIC_ACTION_NAMES
-        }
-        invalid_actions = [
-            action_name
-            for action_name, token_ids in self.action_token_sequences.items()
-            if not token_ids
-        ]
-        if invalid_actions:
-            raise ValueError(
-                "Failed to tokenize constrained atomic actions: "
-                + ", ".join(invalid_actions)
-            )
-
-        self.prefix_map = _build_action_token_prefix_map(self.action_token_sequences.values())
-        self.complete_sequences = set(self.action_token_sequences.values())
-        self.eos_token_id = eos_token_id
-        self.prompt_length = None
-        self.min_completion_tokens = max(len(token_ids) for token_ids in self.action_token_sequences.values())
-        if self.eos_token_id is not None:
-            self.min_completion_tokens += 1
-
-    def set_prompt_length(self, prompt_length: int) -> None:
-        self.prompt_length = int(prompt_length)
-
-    def prefix_allowed_tokens_fn(self, batch_id, input_ids):
-        del batch_id
-        if self.prompt_length is None:
-            raise RuntimeError("prompt_length must be set before constrained generation")
-
-        generated_token_ids = tuple(input_ids[self.prompt_length :].tolist())
-        allowed_tokens = self.prefix_map.get(generated_token_ids)
-        if allowed_tokens:
-            return list(allowed_tokens)
-
-        if generated_token_ids in self.complete_sequences:
-            if self.eos_token_id is not None:
-                return [self.eos_token_id]
-            return []
-
-        if self.eos_token_id is not None:
-            return [self.eos_token_id]
-        return list(self.prefix_map.get((), ()))
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -303,7 +201,7 @@ def _result_row(scene_id, episode_id, info):
 def _iter_result_paths(result_path):
     result_path = Path(result_path)
     paths = []
-    merged_path = result_path / RESULT_FILENAME
+    merged_path = result_path / "result.jsonl"
     if merged_path.exists():
         paths.append(merged_path)
     paths.extend(sorted(result_path.glob("result_rank*.jsonl")))
@@ -494,14 +392,10 @@ class NaVIDA_Agent(Agent):
             self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
         self.tokenizer = getattr(self.processor, "tokenizer", None)
         if self.tokenizer is None:
-            raise ValueError("Eval requires a tokenizer to constrain generation to atomic actions")
+            raise ValueError("Eval requires a tokenizer for generation token ids")
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         self.bos_token_id = getattr(self.tokenizer, "bos_token_id", None)
-        self.atomic_action_constraint = AtomicActionPrefixConstraint(
-            tokenizer=self.tokenizer,
-            eos_token_id=self.eos_token_id,
-        )
 
         if self.eos_token_id is not None:
             setattr(self.model.config, "eos_token_id", self.eos_token_id)
@@ -537,7 +431,11 @@ class NaVIDA_Agent(Agent):
         self.reset()
 
 
-    def predict_inference(self):
+    def predict_inference(self, gen_kwargs=None):
+        generation_kwargs = dict(DEFAULT_EVAL_GENERATION_KWARGS)
+        if gen_kwargs is not None:
+            generation_kwargs.update(gen_kwargs)
+
         texts = [build_eval_generation_prompt(self.processor, self.conversations)]
 
         prompt_inputs = self.processor(
@@ -547,26 +445,28 @@ class NaVIDA_Agent(Agent):
             padding=True,
         )
 
-        prompt_inputs.to(self.device)
-        input_token_len = int(prompt_inputs["input_ids"].shape[1])
-        self.atomic_action_constraint.set_prompt_length(input_token_len)
+        prompt_inputs = prompt_inputs.to(self.device)
         with torch.inference_mode():
-            outputs = self.model.generate(
+            cont = self.model.generate(
                 **prompt_inputs,
-                do_sample=False,
-                use_cache=True,
-                num_return_sequences=1,
-                max_new_tokens=self.atomic_action_constraint.min_completion_tokens,
-                prefix_allowed_tokens_fn=self.atomic_action_constraint.prefix_allowed_tokens_fn,
+                eos_token_id=self.eos_token_id,
+                pad_token_id=self.pad_token_id,
+                do_sample=True if generation_kwargs["temperature"] > 0 else False,
+                temperature=generation_kwargs["temperature"],
+                top_p=generation_kwargs["top_p"],
+                num_beams=generation_kwargs["num_beams"],
+                max_new_tokens=generation_kwargs["max_new_tokens"],
             )
-        output_ids = outputs
-        n_diff_input_output = (prompt_inputs["input_ids"] != output_ids[:, :input_token_len]).sum().item()
-        if n_diff_input_output > 0:
-            print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
-        outputs_text = self.processor.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)
-        outputs_text = outputs_text[0]
-        outputs_text = outputs_text.strip()
-        return outputs_text
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :] for in_ids, out_ids in zip(prompt_inputs.input_ids, cont)
+        ]
+        answers = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        answers = [s.lower().strip() for s in answers]
+        return answers[0] if answers else ""
 
     def _record_previous_action(self):
         if self.last_returned_action is None:
@@ -661,7 +561,7 @@ def main():
     parser.add_argument("--exp-config",type=str,required=True,help="path to config yaml containing info about experiment")
     parser.add_argument("--split-num",type=int,required=True,help="chunks of evluation")
     parser.add_argument("--split-id",type=int,required=True,help="chunks ID of evluation")
-    parser.add_argument("--model-path",type=str,default=DEFAULT_EVAL_MODEL_PATH,help="location of fully saved model weights")
+    parser.add_argument("--model-path",type=str,required=True,help="location of fully saved model weights")
     parser.add_argument("--lora-path",type=str,help="location of lora weights", default=None)
     parser.add_argument("--result-path",type=str,required=True,help="location to save results")
     parser.add_argument("--forward-distance",type=int,help="distance that one forward action takes",default=25)

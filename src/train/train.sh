@@ -7,7 +7,7 @@ echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
 OUTPUT_DIR="/workspace/data/wz_data/model/Trained/erp_linear_mem_100_10_think"
-GPU_DEVICES="0,1,2,3"
+GPU_DEVICES="4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT="29520"

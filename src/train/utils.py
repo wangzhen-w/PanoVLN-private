@@ -16,7 +16,7 @@ from transformers.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForConditionalGene
 
 
 DEFAULT_TRAINABLE_MODULES = {
-    "visual": False,
+    "visual": True,
     "visual_merger": True,
     "language_model": True,
 }
@@ -265,7 +265,7 @@ def build_prompt_and_target(
             prompt_messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True,
+            enable_thinking=False,
         )
         return {"prompt": prompt_text, "target": target_text}
 
