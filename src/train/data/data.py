@@ -21,13 +21,14 @@ DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
 VLN_ACTIONS = {"move_forward", "turn_left", "turn_right", "stop"}
+VLN_ACTION_SEQUENCE_LENGTH = 4
 VLN_SYSTEM_PROMPT = (
     "You are a visual language navigation agent. "
-    "Given a navigation instruction, your recent memory observations, and your current observation, "
-    "predict the next action. "
+    "Given a navigation instruction, your recent panoramic observations, and your current panoramic observation, "
+    "predict the next 4 navigation actions. "
     "Action space: move_forward (0.25 meters), turn_left (15 degrees), turn_right (15 degrees), stop. "
     "Use stop only when you think the goal has been reached. "
-    "Reply with exactly one action."
+    "Return exactly 4 actions from the action space in execution order."
 )
 LONGITUDE_PROMPT_STEP_DEG = 15
 LONGITUDE_PROMPT_LABEL_STEP_DEG = 15
@@ -164,7 +165,7 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
                 "\nCurrent observation (360-degree panoramic view centered on the robot's current forward direction):"
             ),
             image_content(),
-            text_content("\nPredict the next action."),
+            text_content("\nPredict the next 4 actions."),
         ]
     )
     return content
@@ -294,13 +295,27 @@ def _extract_vln_instruction(example: Dict[str, Any]) -> str:
     raise ValueError("VLN example is missing an instruction")
 
 
-def _extract_vln_action(example: Dict[str, Any]) -> str:
-    action = _require_non_empty_string(example, "action")
-    if action not in VLN_ACTIONS:
+def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
+    action_sequence = example.get("action_sequence")
+    if not isinstance(action_sequence, list):
+        raise ValueError("VLN example field 'action_sequence' must be a list")
+    if len(action_sequence) != VLN_ACTION_SEQUENCE_LENGTH:
         raise ValueError(
-            f"VLN example field 'action' must be one of {sorted(VLN_ACTIONS)}, got {action!r}"
+            "VLN example field 'action_sequence' must contain exactly "
+            f"{VLN_ACTION_SEQUENCE_LENGTH} actions, got {len(action_sequence)}"
         )
-    return action
+
+    normalized_actions = []
+    for action_index, action in enumerate(action_sequence):
+        if isinstance(action, str):
+            action = action.strip()
+        if action not in VLN_ACTIONS:
+            raise ValueError(
+                "VLN example field 'action_sequence' must contain only "
+                f"{sorted(VLN_ACTIONS)}, got {action!r} at index {action_index}"
+            )
+        normalized_actions.append(action)
+    return normalized_actions
 
 
 def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
@@ -313,7 +328,7 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
 
     selected_images = select_vln_image_paths(raw_images)
     instruction = _extract_vln_instruction(example)
-    action = _extract_vln_action(example)
+    action_sequence = _extract_vln_action_sequence(example)
 
     normalized = dict(example)
     normalized["images"] = selected_images
@@ -331,7 +346,7 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
         },
         {
             "role": "assistant",
-            "content": [text_content(action)],
+            "content": [text_content(", ".join(action_sequence))],
         },
     ]
     return normalized

@@ -51,6 +51,27 @@ logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 
 ATOMIC_ACTION_NAMES = ("stop", "move_forward", "turn_left", "turn_right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
+STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
+ACTION_SEQUENCE_LENGTH = 4
+REPLAN_ACTION_COUNT_WITHOUT_STOP = 2
+ATOMIC_ACTION_PATTERNS = [
+    (
+        action_id,
+        re.compile(
+            r"(?<![0-9a-z_])(?:"
+            + "|".join(
+                re.escape(variant)
+                for variant in (
+                    action_name,
+                    action_name.replace("_", " "),
+                    action_name.replace("_", "-"),
+                )
+            )
+            + r")(?![0-9a-z_])"
+        ),
+    )
+    for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)
+]
 
 
 def seed_all(seed=41):
@@ -139,26 +160,31 @@ def preprocess_vln_eval_images(
     return selected_images
 
 
-def parse_atomic_action(output: str):
+def parse_action_sequence(output: str, max_actions: int = ACTION_SEQUENCE_LENGTH):
     if "</think>" in output.lower():
         output = re.split(r"</think>", output, flags=re.IGNORECASE)[-1]
 
     action_text = " ".join(output.split()).lower().strip(" \t\r\n`'\".,;:!?()[]{}")
     if not action_text:
-        return None
+        return []
 
-    if action_text in ATOMIC_ACTION_TO_ID:
-        return ATOMIC_ACTION_TO_ID[action_text]
+    matches = []
+    for action_id, pattern in ATOMIC_ACTION_PATTERNS:
+        for match in pattern.finditer(action_text):
+            matches.append((match.start(), match.end(), action_id))
 
-    matched_actions = [
-        action_name
-        for action_name in ATOMIC_ACTION_NAMES
-        if re.search(rf"(?<![0-9a-z_]){re.escape(action_name)}(?![0-9a-z_])", action_text)
-    ]
-    if len(matched_actions) != 1:
-        return None
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    actions = []
+    last_end = -1
+    for start, end, action_id in matches:
+        if start < last_end:
+            continue
+        actions.append(action_id)
+        last_end = end
+        if len(actions) >= max_actions:
+            break
 
-    return ATOMIC_ACTION_TO_ID[matched_actions[0]]
+    return actions
 
 
 def str2bool(v):
@@ -331,6 +357,7 @@ def evaluate_agent(
             agent.finalize_episode()
             result_row = _result_row(episode.scene_id, episode.episode_id, info)
             result_row["model_generated_actions"] = list(agent.model_generated_actions)
+            result_row["model_parsed_action_sequences"] = list(agent.model_parsed_action_sequences)
             _append_result_row(result_path, split_id, result_row)
             agent.reset()
 
@@ -425,6 +452,8 @@ class NaVIDA_Agent(Agent):
         self.executed_action_history = []
         self.last_returned_action = None
         self.model_generated_actions = []
+        self.model_parsed_action_sequences = []
+        self.pending_action_queue = []
         self.topdown_frames = []
         self.conversations = []
 
@@ -487,7 +516,7 @@ class NaVIDA_Agent(Agent):
             selected_indices=selected_indices,
         )
 
-    def _predict_action_from_images(self, instruction, selected_images):
+    def _predict_action_sequence_from_images(self, instruction, selected_images):
         self.current_images = selected_images
         self.conversations = build_eval_messages(
             instruction=instruction,
@@ -496,8 +525,17 @@ class NaVIDA_Agent(Agent):
 
         navigation = self.predict_inference()
         self.model_generated_actions.append(navigation)
-        action_id = parse_atomic_action(navigation)
-        return navigation, action_id
+        action_ids = parse_action_sequence(navigation)
+        self.model_parsed_action_sequences.append(list(action_ids))
+        return navigation, action_ids
+
+    def _build_pending_action_queue(self, action_ids):
+        action_ids = list(action_ids[:ACTION_SEQUENCE_LENGTH])
+        if not action_ids:
+            return [STOP_ACTION_ID]
+        if STOP_ACTION_ID in action_ids:
+            return action_ids[:action_ids.index(STOP_ACTION_ID) + 1]
+        return action_ids[:REPLAN_ACTION_COUNT_WITHOUT_STOP]
 
     def finalize_episode(self):
         self._record_previous_action()
@@ -519,6 +557,8 @@ class NaVIDA_Agent(Agent):
         self.executed_action_history = []
         self.last_returned_action = None
         self.model_generated_actions = []
+        self.model_parsed_action_sequences = []
+        self.pending_action_queue = []
         self.conversations = []
         
     def act(self, observations, info, episode_id):
@@ -536,19 +576,24 @@ class NaVIDA_Agent(Agent):
         rgb = observations["rgb"]
         self.rgb_history.append(Image.fromarray(rgb.astype('uint8')).convert('RGB'))
 
-        selected_indices = self._select_image_indices()
-        selected_images = self._prepare_selected_images(selected_indices)
-        navigation, action_id = self._predict_action_from_images(
-            instruction=observations["instruction"]["text"],
-            selected_images=selected_images,
-        )
-
-        if action_id is None:
-            print(
-                f"[Warning] Failed to parse a valid action from model output on episode {episode_id}: "
-                f"{navigation!r}. Defaulting to stop."
+        if not self.pending_action_queue:
+            selected_indices = self._select_image_indices()
+            selected_images = self._prepare_selected_images(selected_indices)
+            navigation, action_ids = self._predict_action_sequence_from_images(
+                instruction=observations["instruction"]["text"],
+                selected_images=selected_images,
             )
-            action_id = 0
+
+            if not action_ids:
+                print(
+                    f"[Warning] Failed to parse a valid action sequence from model output "
+                    f"on episode {episode_id}: {navigation!r}. Defaulting to stop."
+                )
+            self.pending_action_queue = self._build_pending_action_queue(action_ids)
+
+        action_id = self.pending_action_queue.pop(0)
+        if action_id == STOP_ACTION_ID:
+            self.pending_action_queue = []
 
         self.last_returned_action = action_id
 

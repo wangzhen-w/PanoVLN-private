@@ -17,7 +17,7 @@ if PROJECT_ROOT not in sys.path:
 
 DEFAULT_GOAL_RADIUS = 0.5
 ERP_IMAGE_SIZE = (1280, 640)
-LOCALITY_BLOCK_SIZE_MULTIPLIER = 2.0
+LOCALITY_BLOCK_SIZE_MULTIPLIER = 0.5
 
 CONFIG = {
     "r2r": {
@@ -92,6 +92,10 @@ SUPPORTED_ACTION_IDS = {
     TURN_LEFT_ACTION,
     TURN_RIGHT_ACTION,
 }
+
+
+class ShortestPathRolloutError(RuntimeError):
+    """Raised when Habitat cannot produce a valid shortest-path rollout."""
 
 
 def default_output_path(output_root: str, dataset_name: str) -> str:
@@ -465,6 +469,14 @@ def positions_equal(
     return euclidean_distance(a, b) <= tol
 
 
+def position_within_radius(
+    a: Sequence[float],
+    b: Sequence[float],
+    radius: float,
+) -> bool:
+    return euclidean_distance(a, b) <= float(radius)
+
+
 def action_to_int(action) -> int:
     if isinstance(action, str):
         mapping = {
@@ -544,11 +556,24 @@ def rollout_shortest_path_episode(
     saved_frame_index = 0
     while next_target_index < len(target_positions):
         target_position = target_positions[next_target_index]
+        current_position = to_position_list(env.sim.get_agent_state().position)
+        if position_within_radius(current_position, target_position, goal_radius):
+            next_target_index += 1
+            continue
+
         next_action = action_to_int(follower.get_next_action(target_position))
 
         if next_action == STOP_ACTION:
-            next_target_index += 1
-            continue
+            current_position = to_position_list(env.sim.get_agent_state().position)
+            if position_within_radius(current_position, target_position, goal_radius):
+                next_target_index += 1
+                continue
+            raise ShortestPathRolloutError(
+                f"Episode {episode.episode_id} shortest-path follower returned stop "
+                f"before reaching waypoint {next_target_index}: "
+                f"distance={euclidean_distance(current_position, target_position):.3f}, "
+                f"goal_radius={goal_radius}"
+            )
 
         observation = env.step(next_action)
         actions.append(next_action)
@@ -560,7 +585,7 @@ def rollout_shortest_path_episode(
             )
 
         if env.episode_over:
-            raise RuntimeError(
+            raise ShortestPathRolloutError(
                 f"Episode {episode.episode_id} terminated before final stop action"
             )
 

@@ -1,15 +1,13 @@
 import argparse
 import json
 import os
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from tqdm import tqdm
 
 
-FORWARD_DISTANCE_CM = 25
-TURN_ANGLE_DEGREE = 15
-DEFAULT_MAX_MEMORY_IMAGES = 10
-DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 100
+DEFAULT_ACTION_HORIZON = 4
+DEFAULT_ACTION_STRIDE = 4
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -31,15 +29,6 @@ def frame_index_from_filename(filename: str) -> str:
 
 def to_relative_path(path: str, root: str) -> str:
     return os.path.relpath(path, root).replace(os.sep, "/")
-
-
-def write_jsonl(output_path: str, items: List[Dict]) -> None:
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as handle:
-        for item in items:
-            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def write_jsonl_item(handle, item: Dict) -> None:
@@ -89,42 +78,56 @@ def load_episode_images(
     return episode_image_list
 
 
-def build_action_chunks(actions: List[int]) -> List[Dict[str, int]]:
-    return [
-        {
-            "action_id": action_id,
-            "start_step": step_index,
-            "end_step": step_index,
-            "text": action_id_to_str(action_id),
-        }
-        for step_index, action_id in enumerate(actions)
-    ]
-
-
-def build_vln_image_selection(
-    current_step: int,
-    last_frame_index: int,
-    max_memory_images: int,
-    memory_pool_window_frames: int,
+def build_action_chunk_starts(
+    num_actions: int,
+    action_horizon: int = DEFAULT_ACTION_HORIZON,
+    action_stride: int = DEFAULT_ACTION_STRIDE,
 ) -> List[int]:
-    from src.train.data.data import build_vln_image_selection as select_vln_memory_indices
+    action_horizon = max(1, int(action_horizon))
+    action_stride = max(1, int(action_stride))
+    if num_actions < action_horizon:
+        raise ValueError(
+            f"Episode action count must be at least {action_horizon}, got {num_actions}"
+        )
 
-    return select_vln_memory_indices(
-        current_step=current_step,
-        last_frame_index=last_frame_index,
-        max_memory_images=max_memory_images,
-        memory_pool_window_frames=memory_pool_window_frames,
-    )
+    if num_actions == action_horizon:
+        return [0]
+
+    last_full_start = num_actions - action_horizon
+    start_steps = list(range(0, last_full_start + 1, action_stride))
+    if start_steps[-1] != last_full_start:
+        start_steps.append(last_full_start)
+
+    return start_steps
+
+
+def build_action_chunks(
+    actions: List[int],
+    action_horizon: int = DEFAULT_ACTION_HORIZON,
+    action_stride: int = DEFAULT_ACTION_STRIDE,
+) -> List[Dict[str, Any]]:
+    action_chunks = []
+    for start_step in build_action_chunk_starts(
+        num_actions=len(actions),
+        action_horizon=action_horizon,
+        action_stride=action_stride,
+    ):
+        action_ids = actions[start_step:start_step + action_horizon]
+        action_chunks.append(
+            {
+                "action_ids": action_ids,
+                "start_step": start_step,
+                "end_step": start_step + len(action_ids) - 1,
+                "texts": [action_id_to_str(action_id) for action_id in action_ids],
+            }
+        )
+    return action_chunks
 
 
 def build_vln_images(
     episode_image_list: List[str],
-    actions: List[int],
     current_step: int,
-    max_memory_images: int,
-    memory_pool_window_frames: int,
 ) -> List[str]:
-    del actions, max_memory_images, memory_pool_window_frames
     current_frame_index = min(max(0, int(current_step)), len(episode_image_list) - 1)
     return episode_image_list[:current_frame_index + 1]
 
@@ -133,8 +136,6 @@ def process_dataset(
     selected_subset_list: List[str],
     dataset_config: Dict[str, Dict[str, str]],
     input_root: str,
-    max_memory_images: int,
-    memory_pool_window_frames: int,
     max_episodes_per_subset: int = None,
     output_handle=None,
 ):
@@ -145,7 +146,6 @@ def process_dataset(
         image_path = subset_config["image_path"]
         annotation_path = subset_config["annotation_path"]
         frame_index_fn = subset_config["frame_index_fn"]
-        sub_image_path = subset_config.get("sub_image_path")
 
         annotation = []
         with open(annotation_path, "r", encoding="utf-8") as handle:
@@ -166,8 +166,6 @@ def process_dataset(
 
             episode_image_dir = str(episode_item.get("episode_id", episode_item.get("video_id")))
             episode_image_path = os.path.join(image_path, episode_image_dir)
-            if sub_image_path is not None:
-                episode_image_path = os.path.join(episode_image_path, sub_image_path)
 
             episode_image_list = load_episode_images(
                 episode_image_path=episode_image_path,
@@ -181,19 +179,17 @@ def process_dataset(
             for action_chunk in action_chunks:
                 user_images = build_vln_images(
                     episode_image_list=episode_image_list,
-                    actions=actions,
                     current_step=action_chunk["start_step"],
-                    max_memory_images=max_memory_images,
-                    memory_pool_window_frames=memory_pool_window_frames,
                 )
 
                 sample = {
                     "instruction": instruction,
-                    "action": action_chunk["text"],
+                    "action_sequence": list(action_chunk["texts"]),
                     "images": list(user_images),
                     "episode_id": str(episode_id),
                     "dataset": subset,
                     "step_index": action_chunk["start_step"],
+                    "end_step": action_chunk["end_step"],
                 }
                 if output_handle is None:
                     data2save.append(sample)
@@ -215,8 +211,6 @@ def main(
     selected_subset_list: List[str],
     input_root: str,
     output_path: str,
-    max_memory_images: int,
-    memory_pool_window_frames: int,
     max_episodes_per_subset: int = None,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
@@ -230,8 +224,6 @@ def main(
             selected_subset_list=selected_subset_list,
             dataset_config=dataset_config,
             input_root=input_root,
-            max_memory_images=max_memory_images,
-            memory_pool_window_frames=memory_pool_window_frames,
             max_episodes_per_subset=max_episodes_per_subset,
             output_handle=output_handle,
         )
@@ -257,16 +249,6 @@ if __name__ == "__main__":
         default="navida_train_data.jsonl",
     )
     parser.add_argument(
-        "--max_memory_images",
-        type=int,
-        default=DEFAULT_MAX_MEMORY_IMAGES,
-    )
-    parser.add_argument(
-        "--memory_pool_window_frames",
-        type=int,
-        default=DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
-    )
-    parser.add_argument(
         "--max_episodes_per_subset",
         type=int,
         default=None,
@@ -277,7 +259,5 @@ if __name__ == "__main__":
         selected_subset_list=args.dataset_name,
         input_root=args.input_root,
         output_path=args.output_path,
-        max_memory_images=args.max_memory_images,
-        memory_pool_window_frames=args.memory_pool_window_frames,
         max_episodes_per_subset=args.max_episodes_per_subset,
     )

@@ -19,9 +19,11 @@ if PROJECT_ROOT not in sys.path:
 from src.data.habitat_shortest_path import (
     DEFAULT_GOAL_RADIUS,
     CONFIG,
+    ShortestPathRolloutError,
     build_locality_balanced_episode_splits,
     build_worker_assignments,
     default_output_path,
+    extract_instruction,
     filter_episodes,
     group_episodes_by_scene,
     habitat,
@@ -65,6 +67,13 @@ def annotation_sort_key(item):
 def append_jsonl_item(handle, item):
     handle.write(json.dumps(item, ensure_ascii=False) + "\n")
     handle.flush()
+
+
+def skipped_output_path(output_path):
+    root, ext = os.path.splitext(output_path)
+    if ext == ".jsonl":
+        return f"{root}.skipped.jsonl"
+    return output_path + ".skipped.jsonl"
 
 
 def remove_if_exists(path):
@@ -121,6 +130,10 @@ def rank_output_path(progress_dir, worker_index):
     return os.path.join(progress_dir, f"rank_{worker_index:02d}.jsonl")
 
 
+def rank_skipped_output_path(progress_dir, worker_index):
+    return os.path.join(progress_dir, f"rank_{worker_index:02d}.skipped.jsonl")
+
+
 def list_rank_output_paths(progress_dir):
     if not os.path.isdir(progress_dir):
         return []
@@ -129,6 +142,18 @@ def list_rank_output_paths(progress_dir):
         os.path.join(progress_dir, file_name)
         for file_name in os.listdir(progress_dir)
         if file_name.startswith("rank_") and file_name.endswith(".jsonl")
+        and not file_name.endswith(".skipped.jsonl")
+    )
+
+
+def list_rank_skipped_output_paths(progress_dir):
+    if not os.path.isdir(progress_dir):
+        return []
+
+    return sorted(
+        os.path.join(progress_dir, file_name)
+        for file_name in os.listdir(progress_dir)
+        if file_name.startswith("rank_") and file_name.endswith(".skipped.jsonl")
     )
 
 
@@ -141,7 +166,30 @@ def load_annotation_index_from_paths(paths, tolerate_partial=False):
     return annotation_index
 
 
-def finalize_annotation_outputs(output_path, progress_dir, merge_existing_output):
+def make_skipped_item(dataset_name, episode, error):
+    return {
+        "episode_id": int(episode.episode_id),
+        "dataset": dataset_name,
+        "scene_id": getattr(episode, "scene_id", ""),
+        "instruction": extract_instruction(episode),
+        "reason": "shortest_path_rollout_failed",
+        "error": str(error),
+    }
+
+
+def configure_action_only_env(env_config, local_gpu_id=None):
+    with habitat.config.read_write(env_config):
+        if local_gpu_id is not None:
+            env_config.habitat.simulator.habitat_sim_v0.gpu_device_id = local_gpu_id
+
+        rgb_sensor = env_config.habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor
+        rgb_sensor.width = 1
+        rgb_sensor.height = 1
+
+        env_config.habitat.task.measurements = {}
+
+
+def finalize_annotation_outputs(output_path, progress_dir, merge_existing_output, cleanup=True):
     final_annotation_index = {}
     if merge_existing_output:
         final_annotation_index.update(load_annotation_index(output_path))
@@ -152,7 +200,38 @@ def finalize_annotation_outputs(output_path, progress_dir, merge_existing_output
         )
     )
     write_sorted_annotation_index(output_path, final_annotation_index)
-    remove_if_exists(progress_dir)
+    if cleanup:
+        remove_if_exists(progress_dir)
+
+
+def finalize_skipped_outputs(skipped_path, progress_dir, merge_existing_output, cleanup=True):
+    final_skipped_index = {}
+    if merge_existing_output:
+        final_skipped_index.update(load_annotation_index(skipped_path))
+    final_skipped_index.update(
+        load_annotation_index_from_paths(
+            list_rank_skipped_output_paths(progress_dir),
+            tolerate_partial=True,
+        )
+    )
+    write_sorted_annotation_index(skipped_path, final_skipped_index)
+    if cleanup:
+        remove_if_exists(progress_dir)
+
+
+def finalize_preprocess_outputs(output_path, progress_dir, merge_existing_output):
+    finalize_annotation_outputs(
+        output_path=output_path,
+        progress_dir=progress_dir,
+        merge_existing_output=merge_existing_output,
+        cleanup=False,
+    )
+    finalize_skipped_outputs(
+        skipped_path=skipped_output_path(output_path),
+        progress_dir=progress_dir,
+        merge_existing_output=merge_existing_output,
+        cleanup=True,
+    )
 
 
 def build_worker_plans(selected_episodes, worker_assignments):
@@ -184,10 +263,12 @@ def generate_annotations_sequential(
     dataset_name,
     goal_radius,
     progress_output_path,
+    skipped_progress_output_path,
     total_selected_count,
     num_skipped,
 ):
     dataset.episodes = sort_episodes_for_scene_locality(selected_episodes)
+    configure_action_only_env(env_config)
 
     env = None
     try:
@@ -207,21 +288,42 @@ def generate_annotations_sequential(
             )
 
         processed_count = num_skipped
+        dropped_count = 0
         os.makedirs(os.path.dirname(progress_output_path), exist_ok=True)
-        with open(progress_output_path, "a", encoding="utf-8") as progress_handle:
+        with open(progress_output_path, "a", encoding="utf-8") as progress_handle, open(
+            skipped_progress_output_path, "a", encoding="utf-8"
+        ) as skipped_handle:
             for episode in dataset.episodes:
-                item = rollout_shortest_path_episode(
-                    env=env,
-                    episode=episode,
-                    goal_radius=goal_radius,
-                )
+                episode_start_time = time.time()
+                try:
+                    item = rollout_shortest_path_episode(
+                        env=env,
+                        episode=episode,
+                        goal_radius=goal_radius,
+                    )
+                except ShortestPathRolloutError as error:
+                    append_jsonl_item(
+                        skipped_handle,
+                        make_skipped_item(dataset_name, episode, error),
+                    )
+                    processed_count += 1
+                    dropped_count += 1
+                    progress.update(1)
+                    progress.set_postfix_str(
+                        f"done={processed_count}/{total_selected_count}, "
+                        f"skipped={num_skipped}, dropped={dropped_count}, "
+                        f"ep={episode.episode_id}, rollout=failed"
+                    )
+                    continue
+
                 append_jsonl_item(progress_handle, item)
                 processed_count += 1
                 progress.update(1)
                 progress.set_postfix_str(
                     f"done={processed_count}/{total_selected_count}, "
-                    f"skipped={num_skipped}, ep={item['episode_id']}, "
-                    f"actions={len(item['actions'])}"
+                    f"skipped={num_skipped}, dropped={dropped_count}, "
+                    f"ep={item['episode_id']}, actions={len(item['actions'])}, "
+                    f"{time.time() - episode_start_time:.2f}s"
                 )
     finally:
         if env is not None:
@@ -235,6 +337,7 @@ def preprocess_worker(
     goal_radius,
     episode_ids,
     partial_output_path,
+    partial_skipped_output_path,
     worker_index,
     local_gpu_id,
     display_gpu_id,
@@ -249,8 +352,7 @@ def preprocess_worker(
         env_config, dataset = load_dataset(
             dataset_name=dataset_name,
         )
-        with habitat.config.read_write(env_config):
-            env_config.habitat.simulator.habitat_sim_v0.gpu_device_id = local_gpu_id
+        configure_action_only_env(env_config, local_gpu_id=local_gpu_id)
 
         selected_episode_ids = {int(episode_id) for episode_id in episode_ids}
         dataset.episodes = [
@@ -272,14 +374,35 @@ def preprocess_worker(
             env = habitat.Env(config=env_config.habitat, dataset=dataset)
 
         os.makedirs(os.path.dirname(partial_output_path), exist_ok=True)
-        with open(partial_output_path, "a", encoding="utf-8") as handle:
+        with open(partial_output_path, "a", encoding="utf-8") as handle, open(
+            partial_skipped_output_path, "a", encoding="utf-8"
+        ) as skipped_handle:
             for episode in dataset.episodes:
                 episode_start_time = time.time()
-                item = rollout_shortest_path_episode(
-                    env=env,
-                    episode=episode,
-                    goal_radius=goal_radius,
-                )
+                try:
+                    item = rollout_shortest_path_episode(
+                        env=env,
+                        episode=episode,
+                        goal_radius=goal_radius,
+                    )
+                except ShortestPathRolloutError as error:
+                    append_jsonl_item(
+                        skipped_handle,
+                        make_skipped_item(dataset_name, episode, error),
+                    )
+                    result_queue.put(
+                        {
+                            "status": "skipped",
+                            "worker_index": worker_index,
+                            "display_gpu_id": display_gpu_id,
+                            "process_index_on_gpu": process_index_on_gpu,
+                            "episode_id": int(episode.episode_id),
+                            "time_per_episode": time.time() - episode_start_time,
+                            "error": str(error),
+                        }
+                    )
+                    continue
+
                 append_jsonl_item(handle, item)
                 result_queue.put(
                     {
@@ -329,18 +452,27 @@ def process_dataset(
     temp_root,
 ):
     output_path = default_output_path(output_root, dataset_name)
+    skipped_path = skipped_output_path(output_path)
     progress_dir = progress_dir_path(output_path, temp_root=temp_root)
 
     if not skip_existing_episodes:
         remove_if_exists(output_path)
+        remove_if_exists(skipped_path)
         remove_if_exists(progress_dir)
 
     existing_annotation_index = {}
     if skip_existing_episodes:
         existing_annotation_index.update(load_annotation_index(output_path))
+        existing_annotation_index.update(load_annotation_index(skipped_path))
         existing_annotation_index.update(
             load_annotation_index_from_paths(
                 list_rank_output_paths(progress_dir),
+                tolerate_partial=True,
+            )
+        )
+        existing_annotation_index.update(
+            load_annotation_index_from_paths(
+                list_rank_skipped_output_paths(progress_dir),
                 tolerate_partial=True,
             )
         )
@@ -358,13 +490,14 @@ def process_dataset(
         if skip_existing_episodes and (
             os.path.exists(output_path) or os.path.isdir(progress_dir)
         ):
-            finalize_annotation_outputs(
+            finalize_preprocess_outputs(
                 output_path=output_path,
                 progress_dir=progress_dir,
                 merge_existing_output=True,
             )
         else:
             write_jsonl(output_path, [])
+            write_jsonl(skipped_path, [])
         return
 
     selected_episode_ids = {int(episode.episode_id) for episode in all_selected_episodes}
@@ -378,7 +511,7 @@ def process_dataset(
     num_skipped = len(completed_episode_ids)
 
     if not selected_episodes:
-        finalize_annotation_outputs(
+        finalize_preprocess_outputs(
             output_path=output_path,
             progress_dir=progress_dir,
             merge_existing_output=True,
@@ -410,10 +543,11 @@ def process_dataset(
             dataset_name=dataset_name,
             goal_radius=goal_radius,
             progress_output_path=rank_output_path(progress_dir, 0),
+            skipped_progress_output_path=rank_skipped_output_path(progress_dir, 0),
             total_selected_count=total_selected_count,
             num_skipped=num_skipped,
         )
-        finalize_annotation_outputs(
+        finalize_preprocess_outputs(
             output_path=output_path,
             progress_dir=progress_dir,
             merge_existing_output=skip_existing_episodes,
@@ -461,6 +595,9 @@ def process_dataset(
     for position, plan in enumerate(worker_plans, start=1):
         assignment = plan["assignment"]
         partial_output_path = rank_output_path(progress_dir, assignment["worker_index"])
+        partial_skipped_output_path = rank_skipped_output_path(
+            progress_dir, assignment["worker_index"]
+        )
         process = ctx.Process(
             target=preprocess_worker,
             args=(
@@ -469,6 +606,7 @@ def process_dataset(
                 goal_radius,
                 plan["episode_ids"],
                 partial_output_path,
+                partial_skipped_output_path,
                 assignment["worker_index"],
                 assignment["local_gpu_id"],
                 assignment["display_gpu_id"],
@@ -481,6 +619,7 @@ def process_dataset(
                 "process": process,
                 "assignment": assignment,
                 "partial_output_path": partial_output_path,
+                "partial_skipped_output_path": partial_skipped_output_path,
             }
         )
         worker_bars[assignment["worker_index"]] = tqdm(
@@ -496,6 +635,7 @@ def process_dataset(
         )
     
     processed_episodes = num_skipped
+    dropped_episodes = 0
     success = False
     try:
         while processed_episodes < total_selected_count:
@@ -523,18 +663,27 @@ def process_dataset(
                     f"{result['error']}"
                 )
 
+            if result["status"] == "skipped":
+                dropped_episodes += 1
+
             processed_episodes += 1
             total_bar.update(1)
             total_bar.set_postfix_str(
                 f"done={processed_episodes}/{total_selected_count}, "
-                f"skipped={num_skipped}"
+                f"skipped={num_skipped}, dropped={dropped_episodes}"
             )
 
             worker_bar = worker_bars[result["worker_index"]]
             worker_bar.update(1)
-            worker_bar.set_postfix_str(
-                f"ep={result['episode_id']}, {result['time_per_episode']:.2f}s"
-            )
+            if result["status"] == "skipped":
+                worker_bar.set_postfix_str(
+                    f"ep={result['episode_id']} dropped, "
+                    f"{result['time_per_episode']:.2f}s"
+                )
+            else:
+                worker_bar.set_postfix_str(
+                    f"ep={result['episode_id']}, {result['time_per_episode']:.2f}s"
+                )
 
         for job in process_jobs:
             job["process"].join()
@@ -557,7 +706,7 @@ def process_dataset(
         for worker_bar in worker_bars.values():
             worker_bar.close()
 
-    finalize_annotation_outputs(
+    finalize_preprocess_outputs(
         output_path=output_path,
         progress_dir=progress_dir,
         merge_existing_output=skip_existing_episodes,

@@ -53,5 +53,5 @@ habitat:
     split: val_unseen
     roles: [guide]
     languages: ["en-US", "en-IN"]
-    scenes_dir: /workspace/data/wz_data/dataset/janusvln_data/scene_datasets
-    data_path: /workspace/data/wz_data/dataset/janusvln_data/datasets/rxr/{split}/{split}_{role}.json.gz
+    scenes_dir: /workspace/code_dir/a_property/dataset/janusvln_data/scene_datasets
+    data_path: /workspace/code_dir/a_property/dataset/janusvln_data/datasets/rxr/{split}/{split}_{role}.json.gz

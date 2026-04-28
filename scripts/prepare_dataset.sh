@@ -14,10 +14,8 @@ export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
 INPUT_ROOT="/workspace/code_dir/a_property/dataset/NAVIDA_pano"
-OUTPUT_PATH="/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_atomic_pano_full_history.jsonl"
+OUTPUT_PATH="/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history.jsonl"
 DATASET_NAMES=(r2r rxr)
-MAX_MEMORY_IMAGES="10"
-MEMORY_POOL_WINDOW_FRAMES="100"
 MAX_EPISODES_PER_SUBSET=""
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
@@ -36,8 +34,6 @@ PREPARE_CMD=(
     --input_root "${INPUT_ROOT}"
     --dataset_name "${DATASET_NAMES[@]}"
     --output_path "${OUTPUT_PATH}"
-    --max_memory_images "${MAX_MEMORY_IMAGES}"
-    --memory_pool_window_frames "${MEMORY_POOL_WINDOW_FRAMES}"
 )
 
 if [[ -n "${MAX_EPISODES_PER_SUBSET}" ]]; then

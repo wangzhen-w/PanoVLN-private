@@ -303,12 +303,28 @@ def _build_action_patterns(action_vocab: List[str]) -> List[tuple]:
     return patterns
 
 
-def _extract_action(text: str, patterns: List[tuple]) -> Optional[str]:
+def _extract_action_sequence(
+    text: str,
+    patterns: List[tuple],
+    max_actions: Optional[int] = None,
+) -> List[str]:
     normalized = _normalize_action_text(text)
+    matches = []
     for action, pattern in patterns:
-        if pattern.search(normalized):
-            return action
-    return None
+        for match in pattern.finditer(normalized):
+            matches.append((match.start(), match.end(), action))
+
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    actions = []
+    last_end = -1
+    for start, end, action in matches:
+        if start < last_end:
+            continue
+        actions.append(action)
+        last_end = end
+        if max_actions is not None and len(actions) >= max_actions:
+            break
+    return actions
 
 
 def _build_action_weights(
@@ -410,6 +426,10 @@ def build_action_accuracy(
 
         total = 0
         correct = 0
+        sequence_total = 0
+        sequence_correct = 0
+        position_total = [0, 0, 0, 0]
+        position_correct = [0, 0, 0, 0]
         per_action_total = {action: 0 for action in action_vocab}
         per_action_correct = {action: 0 for action in action_vocab}
         per_action_tp = {action: 0 for action in action_vocab}
@@ -417,27 +437,60 @@ def build_action_accuracy(
         per_action_fn = {action: 0 for action in action_vocab}
 
         for pred_text, label_text in zip(pred_texts, label_texts):
-            pred_action = _extract_action(pred_text, patterns)
-            label_action = _extract_action(label_text, patterns)
+            label_actions = _extract_action_sequence(label_text, patterns)
 
-            if label_action is None:
+            if not label_actions:
                 continue
 
-            total += 1
-            per_action_total[label_action] += 1
-            if pred_action == label_action:
-                correct += 1
-                per_action_correct[label_action] += 1
-                per_action_tp[label_action] += 1
-                continue
+            pred_actions = _extract_action_sequence(
+                pred_text,
+                patterns,
+                max_actions=len(label_actions),
+            )
+            sequence_total += 1
+            if pred_actions == label_actions:
+                sequence_correct += 1
 
-            per_action_fn[label_action] += 1
-            if pred_action in per_action_fp:
-                per_action_fp[pred_action] += 1
+            for action_index, label_action in enumerate(label_actions):
+                pred_action = (
+                    pred_actions[action_index]
+                    if action_index < len(pred_actions)
+                    else None
+                )
+                action_correct = pred_action == label_action
+
+                if action_index < len(position_total):
+                    position_total[action_index] += 1
+                    if action_correct:
+                        position_correct[action_index] += 1
+
+                total += 1
+                per_action_total[label_action] += 1
+                if action_correct:
+                    correct += 1
+                    per_action_correct[label_action] += 1
+                    per_action_tp[label_action] += 1
+                    continue
+
+                per_action_fn[label_action] += 1
+                if pred_action in per_action_fp:
+                    per_action_fp[pred_action] += 1
 
         metrics = {
-            "action_accuracy": 0.0 if total == 0 else float(correct / total)
+            "action_accuracy": 0.0 if total == 0 else float(correct / total),
+            "sequence_accuracy": (
+                0.0
+                if sequence_total == 0
+                else float(sequence_correct / sequence_total)
+            ),
         }
+
+        for position_index, position_action_total in enumerate(position_total):
+            metrics[f"position_{position_index + 1}_accuracy"] = (
+                0.0
+                if position_action_total == 0
+                else float(position_correct[position_index] / position_action_total)
+            )
 
         weighted_f1_num = 0.0
         weighted_f1_den = 0.0
