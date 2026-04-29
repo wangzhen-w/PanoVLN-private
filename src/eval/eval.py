@@ -49,25 +49,27 @@ DEFAULT_EVAL_GENERATION_KWARGS = {
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)
 logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 
-ATOMIC_ACTION_NAMES = ("stop", "move_forward", "turn_left", "turn_right")
+ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
 STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
 ACTION_SEQUENCE_LENGTH = 4
 REPLAN_ACTION_COUNT_WITHOUT_STOP = 2
+ATOMIC_ACTION_VARIANTS = {
+    "stop": ("stop",),
+    "forward": ("forward", "move_forward", "move forward", "move-forward"),
+    "left": ("left", "turn_left", "turn left", "turn-left"),
+    "right": ("right", "turn_right", "turn right", "turn-right"),
+}
 ATOMIC_ACTION_PATTERNS = [
     (
         action_id,
         re.compile(
-            r"(?<![0-9a-z_])(?:"
+            r"(?:"
             + "|".join(
-                re.escape(variant)
-                for variant in (
-                    action_name,
-                    action_name.replace("_", " "),
-                    action_name.replace("_", "-"),
-                )
+                r"(?<![0-9a-z_])" + re.escape(variant.lower()) + r"(?![0-9a-z_])"
+                for variant in ATOMIC_ACTION_VARIANTS[action_name]
             )
-            + r")(?![0-9a-z_])"
+            + r")"
         ),
     )
     for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)
@@ -149,12 +151,7 @@ def preprocess_vln_eval_images(
         raw_image = rgb_history[frame_index]
         is_current_observation = image_position == len(selected_indices) - 1
         if is_current_observation:
-            selected_images.append(
-                preprocess_vln_current_image(
-                    image=raw_image,
-                    add_visual_prompt=False,
-                )
-            )
+            selected_images.append(preprocess_vln_current_image(raw_image))
         else:
             selected_images.append(preprocess_vln_memory_image(raw_image))
     return selected_images

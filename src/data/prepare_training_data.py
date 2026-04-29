@@ -8,18 +8,16 @@ from tqdm import tqdm
 
 DEFAULT_ACTION_HORIZON = 4
 DEFAULT_ACTION_STRIDE = 4
-
-
 def action_id_to_str(action_id: int) -> str:
     # id: 0-stop, 1 move forward, 2 turn left, 3 turn right
     if action_id == 0:
         return "stop"
     if action_id == 1:
-        return "move_forward"
+        return "forward"
     if action_id == 2:
-        return "turn_left"
+        return "left"
     if action_id == 3:
-        return "turn_right"
+        return "right"
     raise ValueError(f"Invalid action ID: {action_id}")
 
 
@@ -85,20 +83,20 @@ def build_action_chunk_starts(
 ) -> List[int]:
     action_horizon = max(1, int(action_horizon))
     action_stride = max(1, int(action_stride))
-    if num_actions < action_horizon:
-        raise ValueError(
-            f"Episode action count must be at least {action_horizon}, got {num_actions}"
-        )
+    if num_actions <= 0:
+        raise ValueError(f"Episode action count must be positive, got {num_actions}")
 
-    if num_actions == action_horizon:
-        return [0]
+    if num_actions <= action_horizon:
+        start_steps = [0]
+    else:
+        last_full_start = num_actions - action_horizon
+        start_steps = list(range(0, last_full_start + 1, action_stride))
+        if start_steps[-1] != last_full_start:
+            start_steps.append(last_full_start)
 
-    last_full_start = num_actions - action_horizon
-    start_steps = list(range(0, last_full_start + 1, action_stride))
-    if start_steps[-1] != last_full_start:
-        start_steps.append(last_full_start)
-
-    return start_steps
+    suffix_start = max(0, num_actions - action_horizon + 1)
+    start_steps.extend(range(suffix_start, num_actions))
+    return sorted(set(start_steps))
 
 
 def build_action_chunks(

@@ -14,7 +14,7 @@ export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
 INPUT_ROOT="/workspace/code_dir/a_property/dataset/NAVIDA_pano"
-OUTPUT_PATH="/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history.jsonl"
+OUTPUT_PATH="/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history_word.jsonl"
 DATASET_NAMES=(r2r rxr)
 MAX_EPISODES_PER_SUBSET=""
 

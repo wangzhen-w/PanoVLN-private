@@ -80,7 +80,6 @@ def main():
         image_size=cfg.data.image_size,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
-        add_visual_prompt=cfg.data.add_visual_prompt,
         prompt_format=cfg.data.prompt_format,
     )
 
@@ -96,7 +95,6 @@ def main():
             image_size=cfg.data.image_size,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
-            add_visual_prompt=cfg.data.add_visual_prompt,
             prompt_format=cfg.data.prompt_format,
         )
 

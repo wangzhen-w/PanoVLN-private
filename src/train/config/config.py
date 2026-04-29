@@ -28,7 +28,6 @@ class DataConfig:
     image_size: Optional[List[int]] = None
     action_vocab: Optional[List[str]] = None
     f1_action_weight: Optional[List[float]] = None
-    add_visual_prompt: bool = True
     prompt_format: str = "chat_template"
 
 

@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/code_dir/a_property/model/4-action/linear_erp_memory_100_10"
+OUTPUT_DIR="/workspace/code_dir/a_property/model/4-action/word_space_balanced_subset_100_10"
 GPU_DEVICES="0,1,2,3"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"

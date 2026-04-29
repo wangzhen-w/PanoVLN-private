@@ -4,7 +4,7 @@ import random
 from typing import Any, Dict, List, Optional
 
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from torch.utils.data import Dataset
 
 try:
@@ -20,32 +20,28 @@ DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
-VLN_ACTIONS = {"move_forward", "turn_left", "turn_right", "stop"}
+VLN_ACTION_WORDS = {"forward", "left", "right", "stop"}
+VLN_ACTION_ALIASES = {
+    "move_forward": "forward",
+    "move forward": "forward",
+    "move-forward": "forward",
+    "turn_left": "left",
+    "turn left": "left",
+    "turn-left": "left",
+    "turn_right": "right",
+    "turn right": "right",
+    "turn-right": "right",
+    "stop": "stop",
+}
 VLN_ACTION_SEQUENCE_LENGTH = 4
 VLN_SYSTEM_PROMPT = (
-    "You are a visual language navigation agent. "
-    "Given a navigation instruction, your recent panoramic observations, and your current panoramic observation, "
-    "predict the next 4 navigation actions. "
-    "Action space: move_forward (0.25 meters), turn_left (15 degrees), turn_right (15 degrees), stop. "
-    "Use stop only when you think the goal has been reached. "
-    "Return exactly 4 actions from the action space in execution order."
+    "You are an autonomous navigation assistant. "
+    "Your task is to follow the navigation instruction. "
+    "Given the instruction, your recent observations, and your current observation, "
+    "devise an action sequence using the four actions: left or right by 15 degrees, "
+    "forward by 25 centimeters, or stop once the task is complete. "
+    "Return only the action words in execution order, separated by spaces."
 )
-LONGITUDE_PROMPT_STEP_DEG = 15
-LONGITUDE_PROMPT_LABEL_STEP_DEG = 15
-LONGITUDE_PROMPT_LINE_WIDTH_PX = 1
-LONGITUDE_PROMPT_COLOR = (0, 255, 80)
-LONGITUDE_PROMPT_ALPHA = 72
-LONGITUDE_PROMPT_LABEL_BOTTOM_MARGIN_PX = 4
-LONGITUDE_PROMPT_LABEL_FONT_SIZE = 7
-LONGITUDE_PROMPT_LABEL_PADDING_PX = 0
-LONGITUDE_PROMPT_LABEL_SHADOW_ALPHA = 80
-LONGITUDE_PROMPT_FONT_PATHS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-)
-
-
 def resolve_runtime_image_size(image_size):
     if image_size is None:
         return DEFAULT_IMAGE_SIZE
@@ -81,15 +77,9 @@ def preprocess_vln_memory_image(image: Image.Image) -> Image.Image:
     return crop_erp_latitude(processed_image)
 
 
-def preprocess_vln_current_image(
-    image: Image.Image,
-    add_visual_prompt: bool = False,
-) -> Image.Image:
+def preprocess_vln_current_image(image: Image.Image) -> Image.Image:
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
-    processed_image = crop_erp_latitude(processed_image)
-    if add_visual_prompt:
-        processed_image = add_longitude_visual_prompt(processed_image)
-    return processed_image
+    return crop_erp_latitude(processed_image)
 
 
 def build_vln_image_selection(
@@ -161,79 +151,12 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
 
     content.extend(
         [
-            text_content(
-                "\nCurrent observation (360-degree panoramic view centered on the robot's current forward direction):"
-            ),
+            text_content("\nCurrent observation (panoramic view):"),
             image_content(),
-            text_content("\nPredict the next 4 actions."),
+            text_content("\nDevise the next action sequence."),
         ]
     )
     return content
-
-
-def resolve_longitude_prompt_font():
-    for font_path in LONGITUDE_PROMPT_FONT_PATHS:
-        if os.path.exists(font_path):
-            return ImageFont.truetype(font_path, LONGITUDE_PROMPT_LABEL_FONT_SIZE)
-    return ImageFont.load_default()
-
-
-def format_longitude_label(longitude_deg: int) -> str:
-    if longitude_deg > 0:
-        return f"+{longitude_deg}°"
-    return f"{longitude_deg}°"
-
-
-def add_longitude_visual_prompt(
-    image: Image.Image,
-    line_step_deg: int = LONGITUDE_PROMPT_STEP_DEG,
-) -> Image.Image:
-    width, height = image.size
-    if width <= 1 or height <= 0:
-        return image
-
-    base = image.convert("RGBA")
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    font = resolve_longitude_prompt_font()
-
-    longitude_deg = -180
-    while longitude_deg <= 180:
-        x_position = round((longitude_deg + 180) / 360 * (width - 1))
-        draw.line(
-            ((x_position, 0), (x_position, height - 1)),
-            fill=(*LONGITUDE_PROMPT_COLOR, LONGITUDE_PROMPT_ALPHA),
-            width=LONGITUDE_PROMPT_LINE_WIDTH_PX,
-        )
-        if longitude_deg % LONGITUDE_PROMPT_LABEL_STEP_DEG == 0 and abs(longitude_deg) != 180:
-            label_text = format_longitude_label(longitude_deg)
-            text_bbox = draw.textbbox((0, 0), label_text, font=font)
-            text_width = text_bbox[2] - text_bbox[0]
-            text_height = text_bbox[3] - text_bbox[1]
-            box_width = text_width + 2 * LONGITUDE_PROMPT_LABEL_PADDING_PX
-            box_height = text_height + 2 * LONGITUDE_PROMPT_LABEL_PADDING_PX
-            box_left = x_position - box_width // 2
-            box_left = min(max(0, box_left), max(0, width - box_width - 1))
-            box_top = height - box_height - LONGITUDE_PROMPT_LABEL_BOTTOM_MARGIN_PX
-            box_top = max(0, box_top)
-            box_right = box_left + box_width
-            box_bottom = box_top + box_height
-            draw.rounded_rectangle(
-                ((box_left, box_top), (box_right, box_bottom)),
-                radius=2,
-                fill=(0, 0, 0, LONGITUDE_PROMPT_LABEL_SHADOW_ALPHA),
-            )
-            text_x = box_left + (box_width - text_width) / 2 - text_bbox[0]
-            text_y = box_top + (box_height - text_height) / 2 - text_bbox[1]
-            draw.text(
-                (text_x, text_y),
-                label_text,
-                font=font,
-                fill=LONGITUDE_PROMPT_COLOR,
-            )
-        longitude_deg += line_step_deg
-
-    return Image.alpha_composite(base, overlay).convert("RGB")
 
 
 def _resolve_image_path(path: str, image_root: Optional[str]) -> str:
@@ -295,26 +218,37 @@ def _extract_vln_instruction(example: Dict[str, Any]) -> str:
     raise ValueError("VLN example is missing an instruction")
 
 
+def _normalize_vln_action(action: Any) -> Optional[str]:
+    if not isinstance(action, str):
+        return None
+    stripped_action = action.strip()
+    if stripped_action in VLN_ACTION_WORDS:
+        return stripped_action
+    return VLN_ACTION_ALIASES.get(stripped_action.lower())
+
+
 def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
     action_sequence = example.get("action_sequence")
     if not isinstance(action_sequence, list):
         raise ValueError("VLN example field 'action_sequence' must be a list")
-    if len(action_sequence) != VLN_ACTION_SEQUENCE_LENGTH:
+    if not (1 <= len(action_sequence) <= VLN_ACTION_SEQUENCE_LENGTH):
         raise ValueError(
-            "VLN example field 'action_sequence' must contain exactly "
+            "VLN example field 'action_sequence' must contain between 1 and "
             f"{VLN_ACTION_SEQUENCE_LENGTH} actions, got {len(action_sequence)}"
         )
 
     normalized_actions = []
     for action_index, action in enumerate(action_sequence):
-        if isinstance(action, str):
-            action = action.strip()
-        if action not in VLN_ACTIONS:
+        normalized_action = _normalize_vln_action(action)
+        if normalized_action is None:
             raise ValueError(
-                "VLN example field 'action_sequence' must contain only "
-                f"{sorted(VLN_ACTIONS)}, got {action!r} at index {action_index}"
+                "VLN example field 'action_sequence' must contain only action words "
+                f"{sorted(VLN_ACTION_WORDS)} or legacy action names, got "
+                f"{action!r} at index {action_index}"
             )
-        normalized_actions.append(action)
+        normalized_actions.append(normalized_action)
+    if "stop" in normalized_actions and normalized_actions[-1] != "stop":
+        raise ValueError("VLN action sequence must end immediately after stop")
     return normalized_actions
 
 
@@ -346,7 +280,7 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
         },
         {
             "role": "assistant",
-            "content": [text_content(", ".join(action_sequence))],
+            "content": [text_content(" ".join(action_sequence))],
         },
     ]
     return normalized
@@ -417,7 +351,6 @@ class SupervisedDataset(Dataset):
         image_size: Optional[List[int]] = None,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
-        add_visual_prompt: bool = True,
         prompt_format: str = "chat_template",
     ):
         self.jsonl_path = jsonl_path
@@ -431,7 +364,6 @@ class SupervisedDataset(Dataset):
             self.image_token = image_token
         self.model_max_length = model_max_length
         self.image_size = resolve_runtime_image_size(image_size)
-        self.add_visual_prompt = add_visual_prompt
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -478,10 +410,7 @@ class SupervisedDataset(Dataset):
             with Image.open(image_path) as image:
                 is_current_observation = image_index == num_images - 1
                 if is_current_observation:
-                    processed_image = preprocess_vln_current_image(
-                        image=image,
-                        add_visual_prompt=self.add_visual_prompt,
-                    )
+                    processed_image = preprocess_vln_current_image(image)
                 else:
                     processed_image = preprocess_vln_memory_image(image)
                 images.append(processed_image)

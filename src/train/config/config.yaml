@@ -12,21 +12,20 @@ model:
     language_model: true
 
 data:
-  train_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history.jsonl"
-  eval_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval/val_unseen_r2r_4action_pano_full_history.jsonl"
+  train_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history_word_balanced_subset_v2.jsonl"
+  eval_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval/val_unseen_r2r_4action_pano_full_history_word.jsonl"
   train_image_root: "/workspace/code_dir/a_property/dataset/NAVIDA_pano"
   eval_image_root: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval"
   train_max_samples: null
   eval_max_samples: 3000
   shuffle: true
   image_size: [640, 320]
-  action_vocab: ["stop", "move_forward", "turn_left", "turn_right"]
+  action_vocab: ["stop", "forward", "left", "right"]
   f1_action_weight: [1.0, 1.0, 1.0, 1.0]
-  add_visual_prompt: false
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/linear_erp_memory_100_10"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/word_space_balanced_subset_100_10"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -51,7 +50,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "pano_mem_448_960_window100_atom_think"
+  run_name: "word_space_balanced_subset_window100_4action"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -60,15 +59,15 @@ training:
 
 run:
   do_eval: true
-  resume_from_checkpoint: true
+  resume_from_checkpoint: false
 
 wandb:
   project: "NAVIDA_pano"
   entity: null
-  name: "pano_mem_448_960_window100_atom_4_action"
-  tags: ["qwen3.5", "panorama", "r2r", "rxr"]
+  name: "word_space_balanced_subset_window100_4action"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "balanced-prefix"]
   mode: "offline"
   group: null
-  notes: "10 linear recent-window panoramic memory + 1 panoramic current; resize before 20-degree top/bottom crop"
+  notes: "Space-separated action-word targets with up to 4 future actions; no-replacement prefix-balanced subset from stride-4 chunks."
   id: null
-  resume: "allow"
+  resume: "never"

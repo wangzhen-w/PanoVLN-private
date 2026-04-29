@@ -289,16 +289,45 @@ def _normalize_action_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+ACTION_PATTERN_VARIANTS = {
+    "forward": ("forward", "move_forward", "move forward", "move-forward"),
+    "left": ("left", "turn_left", "turn left", "turn-left"),
+    "right": ("right", "turn_right", "turn right", "turn-right"),
+    "stop": ("stop",),
+    "move_forward": ("forward", "move_forward", "move forward", "move-forward"),
+    "turn_left": ("left", "turn_left", "turn left", "turn-left"),
+    "turn_right": ("right", "turn_right", "turn right", "turn-right"),
+}
+ACTION_METRIC_NAMES = {
+    "forward": "forward",
+    "left": "left",
+    "right": "right",
+    "move_forward": "forward",
+    "turn_left": "left",
+    "turn_right": "right",
+}
+
+
 def _action_metric_name(action: str) -> str:
-    return re.sub(r"[^0-9a-z]+", "_", action.lower()).strip("_")
+    metric_action = ACTION_METRIC_NAMES.get(action, action)
+    return re.sub(r"[^0-9a-z]+", "_", metric_action.lower()).strip("_")
 
 
 def _build_action_patterns(action_vocab: List[str]) -> List[tuple]:
     patterns = []
     for action in action_vocab:
-        variants = {action, action.replace("_", " "), action.replace("_", "-")}
-        variant_patterns = [re.escape(variant) for variant in variants]
-        pattern = r"(?:^|\b)" + r"(?:" + "|".join(variant_patterns) + r")" + r"(?:\b|$)"
+        variants = ACTION_PATTERN_VARIANTS.get(
+            action,
+            (action, action.replace("_", " "), action.replace("_", "-")),
+        )
+        variant_patterns = []
+        for variant in variants:
+            normalized_variant = _normalize_action_text(variant)
+            escaped_variant = re.escape(normalized_variant)
+            variant_patterns.append(
+                r"(?<![0-9a-z_])" + escaped_variant + r"(?![0-9a-z_])"
+            )
+        pattern = r"(?:" + "|".join(variant_patterns) + r")"
         patterns.append((action, re.compile(pattern)))
     return patterns
 
@@ -325,6 +354,12 @@ def _extract_action_sequence(
         if max_actions is not None and len(actions) >= max_actions:
             break
     return actions
+
+
+def _trim_padded_stop_actions(actions: List[str]) -> List[str]:
+    if "stop" not in actions:
+        return actions
+    return actions[:actions.index("stop") + 1]
 
 
 def _build_action_weights(
@@ -370,7 +405,7 @@ def build_action_accuracy(
     f1_action_weight: Optional[List[float]] = None,
 ):
     if action_vocab is None:
-        action_vocab = ["stop", "move_forward", "turn_left", "turn_right"]
+        action_vocab = ["stop", "forward", "left", "right"]
 
     patterns = _build_action_patterns(action_vocab)
     action_weights = _build_action_weights(action_vocab, f1_action_weight)
@@ -437,7 +472,9 @@ def build_action_accuracy(
         per_action_fn = {action: 0 for action in action_vocab}
 
         for pred_text, label_text in zip(pred_texts, label_texts):
-            label_actions = _extract_action_sequence(label_text, patterns)
+            label_actions = _trim_padded_stop_actions(
+                _extract_action_sequence(label_text, patterns)
+            )
 
             if not label_actions:
                 continue
