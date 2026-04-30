@@ -40,7 +40,8 @@ VLN_SYSTEM_PROMPT = (
     "Given the instruction, your recent observations, and your current observation, "
     "devise an action sequence using the four actions: left or right by 15 degrees, "
     "forward by 25 centimeters, or stop once the task is complete. "
-    "Return only the action words in execution order, separated by spaces."
+    "Return exactly four action words in execution order, separated by spaces. "
+    "If the task is complete before four actions, fill the remaining positions with stop."
 )
 def resolve_runtime_image_size(image_size):
     if image_size is None:
@@ -231,9 +232,9 @@ def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
     action_sequence = example.get("action_sequence")
     if not isinstance(action_sequence, list):
         raise ValueError("VLN example field 'action_sequence' must be a list")
-    if not (1 <= len(action_sequence) <= VLN_ACTION_SEQUENCE_LENGTH):
+    if len(action_sequence) != VLN_ACTION_SEQUENCE_LENGTH:
         raise ValueError(
-            "VLN example field 'action_sequence' must contain between 1 and "
+            "VLN example field 'action_sequence' must contain exactly "
             f"{VLN_ACTION_SEQUENCE_LENGTH} actions, got {len(action_sequence)}"
         )
 

@@ -8,6 +8,9 @@ from tqdm import tqdm
 
 DEFAULT_ACTION_HORIZON = 4
 DEFAULT_ACTION_STRIDE = 4
+STOP_ACTION_ID = 0
+
+
 def action_id_to_str(action_id: int) -> str:
     # id: 0-stop, 1 move forward, 2 turn left, 3 turn right
     if action_id == 0:
@@ -103,6 +106,7 @@ def build_action_chunks(
     actions: List[int],
     action_horizon: int = DEFAULT_ACTION_HORIZON,
     action_stride: int = DEFAULT_ACTION_STRIDE,
+    pad_stop_to_horizon: bool = False,
 ) -> List[Dict[str, Any]]:
     action_chunks = []
     for start_step in build_action_chunk_starts(
@@ -111,11 +115,20 @@ def build_action_chunks(
         action_stride=action_stride,
     ):
         action_ids = actions[start_step:start_step + action_horizon]
+        real_action_count = len(action_ids)
+        if pad_stop_to_horizon and len(action_ids) < action_horizon:
+            if not action_ids or action_ids[-1] != STOP_ACTION_ID:
+                raise ValueError(
+                    "Only terminal chunks ending in stop can be padded to "
+                    f"{action_horizon} actions, got {action_ids}"
+                )
+            action_ids = action_ids + [STOP_ACTION_ID] * (action_horizon - len(action_ids))
         action_chunks.append(
             {
                 "action_ids": action_ids,
                 "start_step": start_step,
-                "end_step": start_step + len(action_ids) - 1,
+                "end_step": start_step + real_action_count - 1,
+                "real_action_count": real_action_count,
                 "texts": [action_id_to_str(action_id) for action_id in action_ids],
             }
         )
@@ -135,6 +148,7 @@ def process_dataset(
     dataset_config: Dict[str, Dict[str, str]],
     input_root: str,
     max_episodes_per_subset: int = None,
+    pad_stop_to_horizon: bool = False,
     output_handle=None,
 ):
     data2save = []
@@ -172,7 +186,10 @@ def process_dataset(
                 num_actions=len(actions),
             )
 
-            action_chunks = build_action_chunks(actions)
+            action_chunks = build_action_chunks(
+                actions,
+                pad_stop_to_horizon=pad_stop_to_horizon,
+            )
 
             for action_chunk in action_chunks:
                 user_images = build_vln_images(
@@ -188,6 +205,7 @@ def process_dataset(
                     "dataset": subset,
                     "step_index": action_chunk["start_step"],
                     "end_step": action_chunk["end_step"],
+                    "real_action_count": action_chunk["real_action_count"],
                 }
                 if output_handle is None:
                     data2save.append(sample)
@@ -210,6 +228,7 @@ def main(
     input_root: str,
     output_path: str,
     max_episodes_per_subset: int = None,
+    pad_stop_to_horizon: bool = False,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
     output_dir = os.path.dirname(output_path)
@@ -223,6 +242,7 @@ def main(
             dataset_config=dataset_config,
             input_root=input_root,
             max_episodes_per_subset=max_episodes_per_subset,
+            pad_stop_to_horizon=pad_stop_to_horizon,
             output_handle=output_handle,
         )
 
@@ -251,6 +271,11 @@ if __name__ == "__main__":
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--pad_stop_to_horizon",
+        action="store_true",
+        help="Pad terminal chunks ending in stop to the action horizon with stop.",
+    )
     args = parser.parse_args()
 
     main(
@@ -258,4 +283,5 @@ if __name__ == "__main__":
         input_root=args.input_root,
         output_path=args.output_path,
         max_episodes_per_subset=args.max_episodes_per_subset,
+        pad_stop_to_horizon=args.pad_stop_to_horizon,
     )
