@@ -12,7 +12,7 @@ model:
     language_model: true
 
 data:
-  train_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history_word_stop_pad_balanced_subset_v2.jsonl"
+  train_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_pano_full_history_word_stop_pad_probskip.jsonl"
   eval_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code_dir/a_property/dataset/NAVIDA_pano"
   eval_image_root: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval"
@@ -25,7 +25,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/word_space_stop_pad_balanced_subset_100_10"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/uni-naivid_balanced_subset_100_10-probability"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -50,7 +50,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "word_space_stop_pad_balanced_subset_window100_4action"
+  run_name: "word_space_stop_pad_probskip_window100_4action"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -64,10 +64,10 @@ run:
 wandb:
   project: "NAVIDA_pano"
   entity: null
-  name: "word_space_stop_pad_balanced_subset_window100_4action"
-  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "balanced-prefix"]
+  name: "word_space_stop_pad_probskip_window100_4action"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "probskip"]
   mode: "offline"
   group: null
-  notes: "Space-separated fixed 4-action word targets; terminal chunks padded with stop and sampled as a no-replacement prefix-balanced subset."
+  notes: "Space-separated fixed 4-action word targets; terminal chunks padded with stop and sampled with probability-skip chunk selection."
   id: null
   resume: "never"

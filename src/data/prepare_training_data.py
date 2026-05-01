@@ -1,14 +1,18 @@
 import argparse
 import json
 import os
-from typing import Any, Dict, List
+import random
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
 
 
 DEFAULT_ACTION_HORIZON = 4
-DEFAULT_ACTION_STRIDE = 4
+DEFAULT_SEED = 42
+DEFAULT_TURN_CHUNK_KEEP_PROB = 0.50
+DEFAULT_FORWARD_CHUNK_KEEP_PROB = 0.05
 STOP_ACTION_ID = 0
+TURN_ACTION_IDS = {2, 3}
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -79,40 +83,84 @@ def load_episode_images(
     return episode_image_list
 
 
+def validate_keep_probability(value: float, name: str) -> float:
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value}")
+    return value
+
+
+def action_chunk_keep_probability(
+    action_ids: List[int],
+    turn_chunk_keep_prob: float = DEFAULT_TURN_CHUNK_KEEP_PROB,
+    forward_chunk_keep_prob: float = DEFAULT_FORWARD_CHUNK_KEEP_PROB,
+) -> float:
+    if STOP_ACTION_ID in action_ids:
+        return 1.0
+    if any(action_id in TURN_ACTION_IDS for action_id in action_ids):
+        return turn_chunk_keep_prob
+    return forward_chunk_keep_prob
+
+
 def build_action_chunk_starts(
-    num_actions: int,
+    actions: List[int],
     action_horizon: int = DEFAULT_ACTION_HORIZON,
-    action_stride: int = DEFAULT_ACTION_STRIDE,
+    turn_chunk_keep_prob: float = DEFAULT_TURN_CHUNK_KEEP_PROB,
+    forward_chunk_keep_prob: float = DEFAULT_FORWARD_CHUNK_KEEP_PROB,
+    rng: Optional[random.Random] = None,
 ) -> List[int]:
     action_horizon = max(1, int(action_horizon))
-    action_stride = max(1, int(action_stride))
+    turn_chunk_keep_prob = validate_keep_probability(
+        turn_chunk_keep_prob,
+        "turn_chunk_keep_prob",
+    )
+    forward_chunk_keep_prob = validate_keep_probability(
+        forward_chunk_keep_prob,
+        "forward_chunk_keep_prob",
+    )
+    if rng is None:
+        rng = random.Random(DEFAULT_SEED)
+
+    num_actions = len(actions)
     if num_actions <= 0:
         raise ValueError(f"Episode action count must be positive, got {num_actions}")
 
-    if num_actions <= action_horizon:
-        start_steps = [0]
-    else:
-        last_full_start = num_actions - action_horizon
-        start_steps = list(range(0, last_full_start + 1, action_stride))
-        if start_steps[-1] != last_full_start:
-            start_steps.append(last_full_start)
+    dense_start = max(0, num_actions - action_horizon)
+    body_stop = max(0, dense_start - action_horizon + 1)
+    start_steps = set(range(dense_start, num_actions))
 
-    suffix_start = max(0, num_actions - action_horizon + 1)
-    start_steps.extend(range(suffix_start, num_actions))
-    return sorted(set(start_steps))
+    start_step = 0
+    while start_step < body_stop:
+        action_ids = actions[start_step:start_step + action_horizon]
+        keep_prob = action_chunk_keep_probability(
+            action_ids=action_ids,
+            turn_chunk_keep_prob=turn_chunk_keep_prob,
+            forward_chunk_keep_prob=forward_chunk_keep_prob,
+        )
+        if rng.random() < keep_prob:
+            start_steps.add(start_step)
+            start_step += action_horizon
+        else:
+            start_step += 1
+
+    return sorted(start_steps)
 
 
 def build_action_chunks(
     actions: List[int],
     action_horizon: int = DEFAULT_ACTION_HORIZON,
-    action_stride: int = DEFAULT_ACTION_STRIDE,
+    turn_chunk_keep_prob: float = DEFAULT_TURN_CHUNK_KEEP_PROB,
+    forward_chunk_keep_prob: float = DEFAULT_FORWARD_CHUNK_KEEP_PROB,
     pad_stop_to_horizon: bool = False,
+    rng: Optional[random.Random] = None,
 ) -> List[Dict[str, Any]]:
     action_chunks = []
     for start_step in build_action_chunk_starts(
-        num_actions=len(actions),
+        actions=actions,
         action_horizon=action_horizon,
-        action_stride=action_stride,
+        turn_chunk_keep_prob=turn_chunk_keep_prob,
+        forward_chunk_keep_prob=forward_chunk_keep_prob,
+        rng=rng,
     ):
         action_ids = actions[start_step:start_step + action_horizon]
         real_action_count = len(action_ids)
@@ -149,10 +197,15 @@ def process_dataset(
     input_root: str,
     max_episodes_per_subset: int = None,
     pad_stop_to_horizon: bool = False,
+    seed: int = DEFAULT_SEED,
+    turn_chunk_keep_prob: float = DEFAULT_TURN_CHUNK_KEEP_PROB,
+    forward_chunk_keep_prob: float = DEFAULT_FORWARD_CHUNK_KEEP_PROB,
     output_handle=None,
 ):
     data2save = []
     total_samples = 0
+    rng = random.Random(seed)
+    seen_sample_keys: Set[Tuple[str, str, int]] = set()
     for subset in selected_subset_list:
         subset_config = dataset_config[subset]
         image_path = subset_config["image_path"]
@@ -188,10 +241,22 @@ def process_dataset(
 
             action_chunks = build_action_chunks(
                 actions,
+                turn_chunk_keep_prob=turn_chunk_keep_prob,
+                forward_chunk_keep_prob=forward_chunk_keep_prob,
                 pad_stop_to_horizon=pad_stop_to_horizon,
+                rng=rng,
             )
 
             for action_chunk in action_chunks:
+                sample_key = (subset, str(episode_id), action_chunk["start_step"])
+                if sample_key in seen_sample_keys:
+                    raise ValueError(
+                        "Duplicate training sample key generated: "
+                        f"dataset={sample_key[0]} episode_id={sample_key[1]} "
+                        f"step_index={sample_key[2]}"
+                    )
+                seen_sample_keys.add(sample_key)
+
                 user_images = build_vln_images(
                     episode_image_list=episode_image_list,
                     current_step=action_chunk["start_step"],
@@ -229,7 +294,18 @@ def main(
     output_path: str,
     max_episodes_per_subset: int = None,
     pad_stop_to_horizon: bool = False,
+    seed: int = DEFAULT_SEED,
+    turn_chunk_keep_prob: float = DEFAULT_TURN_CHUNK_KEEP_PROB,
+    forward_chunk_keep_prob: float = DEFAULT_FORWARD_CHUNK_KEEP_PROB,
 ) -> None:
+    turn_chunk_keep_prob = validate_keep_probability(
+        turn_chunk_keep_prob,
+        "turn_chunk_keep_prob",
+    )
+    forward_chunk_keep_prob = validate_keep_probability(
+        forward_chunk_keep_prob,
+        "forward_chunk_keep_prob",
+    )
     dataset_config = build_dataset_config(input_root)
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -243,6 +319,9 @@ def main(
             input_root=input_root,
             max_episodes_per_subset=max_episodes_per_subset,
             pad_stop_to_horizon=pad_stop_to_horizon,
+            seed=seed,
+            turn_chunk_keep_prob=turn_chunk_keep_prob,
+            forward_chunk_keep_prob=forward_chunk_keep_prob,
             output_handle=output_handle,
         )
 
@@ -276,6 +355,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Pad terminal chunks ending in stop to the action horizon with stop.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Random seed for probability skip chunk sampling.",
+    )
+    parser.add_argument(
+        "--turn_chunk_keep_prob",
+        type=float,
+        default=DEFAULT_TURN_CHUNK_KEEP_PROB,
+        help="Keep probability for chunks containing left/right but no stop.",
+    )
+    parser.add_argument(
+        "--forward_chunk_keep_prob",
+        type=float,
+        default=DEFAULT_FORWARD_CHUNK_KEEP_PROB,
+        help="Keep probability for chunks containing only forward actions.",
+    )
     args = parser.parse_args()
 
     main(
@@ -284,4 +381,7 @@ if __name__ == "__main__":
         output_path=args.output_path,
         max_episodes_per_subset=args.max_episodes_per_subset,
         pad_stop_to_horizon=args.pad_stop_to_horizon,
+        seed=args.seed,
+        turn_chunk_keep_prob=args.turn_chunk_keep_prob,
+        forward_chunk_keep_prob=args.forward_chunk_keep_prob,
     )
