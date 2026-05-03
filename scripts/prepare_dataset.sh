@@ -12,18 +12,17 @@ export GLOG_minloglevel="3"
 export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
-PYTHON_BIN="${PYTHON_BIN:-python}"
-INPUT_ROOT="${INPUT_ROOT:-/workspace/code_dir/a_property/dataset/NAVIDA_pano}"
-OUTPUT_PATH="${OUTPUT_PATH:-/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl}"
-DATASET_NAMES_STRING="${DATASET_NAMES:-r2r rxr}"
-MAX_EPISODES_PER_SUBSET="${MAX_EPISODES_PER_SUBSET:-}"
-PAD_STOP_TO_HORIZON="${PAD_STOP_TO_HORIZON:-true}"
-SEED="${SEED:-42}"
+PYTHON_BIN="python"
+INPUT_ROOT="/workspace/code_dir/a_property/dataset/NAVIDA_pano"
+OUTPUT_PATH="/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
+DATASET_NAMES=("r2r" "rxr")
+MAX_EPISODES_PER_SUBSET=""
+PAD_STOP_TO_HORIZON="true"
+SEED="42"
 
-EVENT_KEEP_PROB="${EVENT_KEEP_PROB:-0.50}"
-BACKGROUND_KEEP_PROB="${BACKGROUND_KEEP_PROB:-0.05}"
+EVENT_KEEP_PROB="0.50"
+BACKGROUND_KEEP_PROB="0.05"
 
-read -r -a DATASET_NAMES <<< "${DATASET_NAMES_STRING}"
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
 
 echo "INPUT_ROOT: ${INPUT_ROOT}"

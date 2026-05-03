@@ -12,7 +12,14 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from src.qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
+
+try:
+    from src.qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
+except ModuleNotFoundError:
+    src_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if src_root not in sys.path:
+        sys.path.insert(0, src_root)
+    from qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
 
 
 DEFAULT_TRAINABLE_MODULES = {

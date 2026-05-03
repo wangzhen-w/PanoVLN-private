@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
@@ -22,6 +23,7 @@ fi
 export NCCL_NVLS_ENABLE=0
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 export PYTHONUNBUFFERED=1
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/src:${PYTHONPATH:-}"
 
 CUDA_VISIBLE_DEVICES="$GPU_DEVICES" torchrun \
     --nproc_per_node="$GPU_NUM" \
