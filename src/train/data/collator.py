@@ -6,6 +6,9 @@ import torch
 STACKABLE_KEYS = (
     "pixel_values",
     "image_grid_thw",
+    "image_erp_geometry",
+    "image_num_images",
+    "image_current_index",
     "pixel_values_videos",
     "video_grid_thw",
 )

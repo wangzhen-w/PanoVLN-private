@@ -11,9 +11,9 @@ export HABITAT_SIM_LOG=quiet
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-MODEL_PATH="/workspace/data/wz_data/model/Trained/erp_linear_mem_100_10"
+MODEL_PATH="/workspace/code_dir/a_property/model/4-action/uni-naivid_ebs_event0p50_bg0p05_taildense4_erp"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/data/wz_data/vln_result/erp_linear_mem_100_10"
+SAVE_PATH="/workspace/code_dir/a_property/result/4-action/uni-naivid_ebs_event0p50_bg0p05_taildense4_erp"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100

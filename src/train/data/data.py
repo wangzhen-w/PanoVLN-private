@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 from typing import Any, Dict, List, Optional
@@ -71,6 +72,52 @@ def crop_erp_latitude(
         return image
 
     return image.crop((0, top_crop_pixels, width, crop_bottom))
+
+
+def build_erp_image_geometry(
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+) -> torch.Tensor:
+    top_crop_degrees = max(0.0, float(top_crop_degrees))
+    bottom_crop_degrees = max(0.0, float(bottom_crop_degrees))
+    vertical_fov_degrees = 180.0 - top_crop_degrees - bottom_crop_degrees
+    if vertical_fov_degrees <= 0.0:
+        raise ValueError(
+            "ERP crop removes the full vertical field of view: "
+            f"top={top_crop_degrees}, bottom={bottom_crop_degrees}"
+        )
+
+    center_latitude_degrees = 0.5 * (top_crop_degrees - bottom_crop_degrees)
+    return torch.tensor(
+        [
+            math.radians(vertical_fov_degrees),
+            math.radians(center_latitude_degrees),
+        ],
+        dtype=torch.float32,
+    )
+
+
+def build_erp_image_geometry_batch(
+    num_images: int,
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+) -> torch.Tensor:
+    num_images = max(0, int(num_images))
+    if num_images == 0:
+        return torch.zeros((0, 2), dtype=torch.float32)
+
+    geometry = build_erp_image_geometry(
+        top_crop_degrees=top_crop_degrees,
+        bottom_crop_degrees=bottom_crop_degrees,
+    )
+    return geometry.unsqueeze(0).repeat(num_images, 1)
+
+
+def resolve_current_image_index(num_images: int) -> int:
+    num_images = int(num_images)
+    if num_images <= 0:
+        return -1
+    return num_images - 1
 
 
 def preprocess_vln_memory_image(image: Image.Image) -> Image.Image:
@@ -477,6 +524,13 @@ class SupervisedDataset(Dataset):
             "attention_mask": attention_mask,
             "labels": labels,
         }
+        image_count = len(vision_paths)
+        item["image_erp_geometry"] = build_erp_image_geometry_batch(image_count)
+        item["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
+        item["image_current_index"] = torch.tensor(
+            [resolve_current_image_index(image_count)],
+            dtype=torch.long,
+        )
 
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
@@ -491,6 +545,9 @@ class SupervisedDataset(Dataset):
 STACKABLE_KEYS = (
     "pixel_values",
     "image_grid_thw",
+    "image_erp_geometry",
+    "image_num_images",
+    "image_current_index",
     "pixel_values_videos",
     "video_grid_thw",
 )

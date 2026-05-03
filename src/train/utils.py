@@ -12,7 +12,7 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from transformers.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+from src.qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
 
 
 DEFAULT_TRAINABLE_MODULES = {
@@ -58,6 +58,12 @@ def _get_language_model(model):
     return None
 
 
+def _get_erp_module(model):
+    if hasattr(model, "erp_position_mlp"):
+        return model.erp_position_mlp
+    return None
+
+
 def set_model(cfg, model):
     trainable_modules = dict(DEFAULT_TRAINABLE_MODULES)
     if cfg.model.trainable_modules:
@@ -70,6 +76,10 @@ def set_model(cfg, model):
     if trainable_modules.get("visual") and visual_model is not None:
         for _, param in visual_model.named_parameters():
             param.requires_grad = True
+        erp_module = _get_erp_module(model)
+        if erp_module is not None:
+            for _, param in erp_module.named_parameters():
+                param.requires_grad = True
 
     if trainable_modules.get("visual_merger") and visual_model is not None and hasattr(visual_model, "merger"):
         for _, param in visual_model.merger.named_parameters():
@@ -99,7 +109,7 @@ def _load_model_config(cfg):
 
 def load_model(cfg):
     torch_dtype = _get_dtype(cfg.model.torch_dtype)
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    model = Qwen3_5ForConditionalGenerationForPanoVLN.from_pretrained(
         cfg.model.name_or_path,
         config=_load_model_config(cfg),
         torch_dtype=torch_dtype,

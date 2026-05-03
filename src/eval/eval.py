@@ -14,7 +14,6 @@ from habitat.utils.visualizations import maps
 from habitat.utils.visualizations.utils import images_to_video
 import random
 from transformers import AutoProcessor
-from transformers.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 import argparse, habitat
 from habitat_extensions import measures, task
 from habitat_baselines.config.default import get_config
@@ -29,11 +28,14 @@ from src.train.data.data import (
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
     VLN_SYSTEM_PROMPT,
+    build_erp_image_geometry_batch,
     build_vln_image_selection,
     build_vln_user_content,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
+    resolve_current_image_index,
 )
+from src.qwen_vl import Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.utils import build_prompt_and_target
 
 SYSTEM_PROMPT = VLN_SYSTEM_PROMPT
@@ -399,7 +401,10 @@ class NaVIDA_Agent(Agent):
         model_init_kwargs["attn_implementation"] = self.attn_implementation
         model_init_kwargs['torch_dtype'] = torch.bfloat16
 
-        self.model = Qwen3_5ForConditionalGeneration.from_pretrained(model_path, **model_init_kwargs)
+        self.model = Qwen3_5ForConditionalGenerationForPanoVLN.from_pretrained(
+            model_path,
+            **model_init_kwargs,
+        )
 
         if lora_path is not None and lora_path!= '':
             print('Loading LoRA weights...')
@@ -469,6 +474,13 @@ class NaVIDA_Agent(Agent):
             images=self.current_images if self.current_images else None,
             return_tensors="pt",
             padding=True,
+        )
+        image_count = len(self.current_images)
+        prompt_inputs["image_erp_geometry"] = build_erp_image_geometry_batch(image_count)
+        prompt_inputs["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
+        prompt_inputs["image_current_index"] = torch.tensor(
+            [resolve_current_image_index(image_count)],
+            dtype=torch.long,
         )
 
         prompt_inputs = prompt_inputs.to(self.device)

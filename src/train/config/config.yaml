@@ -25,7 +25,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/uni-naivid_ebs_event0p50_bg0p05_taildense4"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/uni-naivid_ebs_event0p50_bg0p05_taildense4_erp"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -50,7 +50,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "word_space_stop_pad_ebs_event0p50_bg0p05_taildense4_4action"
+  run_name: "word_space_stop_pad_ebs_event0p50_bg0p05_taildense4_erp_4action"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -64,10 +64,10 @@ run:
 wandb:
   project: "NAVIDA_pano"
   entity: null
-  name: "word_space_stop_pad_ebs_event0p50_bg0p05_taildense4_4action"
-  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4"]
+  name: "word_space_stop_pad_ebs_event0p50_bg0p05_taildense4_erp_4action"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "erp-position-embedding"]
   mode: "offline"
   group: null
-  notes: "Space-separated fixed 4-action word targets; terminal chunks padded with stop and selected by EBS (Event-Balanced Sampling) with event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts."
+  notes: "Space-separated fixed 4-action word targets; terminal chunks padded with stop and selected by EBS (Event-Balanced Sampling) with event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. The Qwen vision patch stream uses a top-level PanoVGGT-style ERP position MLP on all panoramic image patch tokens."
   id: null
   resume: "never"
