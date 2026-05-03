@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import os
 import random
 from collections import Counter
@@ -11,19 +10,11 @@ from tqdm import tqdm
 
 DEFAULT_ACTION_HORIZON = 4
 DEFAULT_SEED = 42
-SBS_SAMPLER = "sbs"
-DEFAULT_SBS_TAU = 1.35
-DEFAULT_SBS_BETA = 0.40
+EBS_SAMPLER = "ebs"
+DEFAULT_EVENT_KEEP_PROB = 0.50
+DEFAULT_BACKGROUND_KEEP_PROB = 0.05
 STOP_ACTION_ID = 0
-BALANCE_CLASSES = [
-    "stop_pos_1",
-    "stop_pos_2",
-    "stop_pos_3",
-    "stop_pos_4",
-    "first_forward",
-    "first_left",
-    "first_right",
-]
+EVENT_ACTION_IDS = {2, 3}
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -108,16 +99,6 @@ def pad_terminal_action_ids(
     return action_ids + [STOP_ACTION_ID] * (action_horizon - len(action_ids))
 
 
-def action_chunk_balance_class(action_ids: List[int]) -> str:
-    for action_index, action_id in enumerate(action_ids):
-        if action_id == STOP_ACTION_ID:
-            return f"stop_pos_{action_index + 1}"
-    first_action = action_id_to_str(action_ids[0])
-    if first_action not in {"forward", "left", "right"}:
-        raise ValueError(f"Unsupported first action for balance class: {first_action}")
-    return f"first_{first_action}"
-
-
 def load_subset_annotations(
     selected_subset_list: List[str],
     dataset_config: Dict[str, Dict[str, str]],
@@ -136,127 +117,81 @@ def load_subset_annotations(
     return annotations_by_subset
 
 
-def compute_action_information(
-    annotations_by_subset: Dict[str, List[Dict[str, Any]]],
-) -> Tuple[Counter, Dict[int, float]]:
-    action_counts = Counter()
-    for annotation in annotations_by_subset.values():
-        for episode_item in annotation:
-            action_counts.update(int(action_id) for action_id in episode_item["actions"])
-
-    total_actions = sum(action_counts.values())
-    if total_actions <= 0:
-        raise ValueError("No actions found in selected annotations")
-
-    action_information = {}
-    for action_id in range(4):
-        count = action_counts[action_id]
-        if count <= 0:
-            raise ValueError(f"Action id {action_id} is absent from selected data")
-        action_information[action_id] = -math.log(count / total_actions)
-    return action_counts, action_information
+def validate_keep_probability(value: float, name: str) -> float:
+    value = float(value)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {value}")
+    return value
 
 
-def compute_candidate_class_counts(
+def action_chunk_contains_event(action_ids: List[int]) -> bool:
+    return any(action_id in EVENT_ACTION_IDS for action_id in action_ids)
+
+
+def ebs_action_chunk_keep_probability(
+    action_ids: List[int],
+    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
+    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+) -> float:
+    if action_chunk_contains_event(action_ids):
+        return event_keep_prob
+    return background_keep_prob
+
+
+def compute_ebs_candidate_counts(
     annotations_by_subset: Dict[str, List[Dict[str, Any]]],
     action_horizon: int = DEFAULT_ACTION_HORIZON,
 ) -> Counter:
-    class_counts = Counter()
+    candidate_counts = Counter()
     for annotation in annotations_by_subset.values():
         for episode_item in annotation:
             actions = [int(action_id) for action_id in episode_item["actions"]]
-            for start_step in range(len(actions)):
-                action_ids = pad_terminal_action_ids(
-                    actions[start_step:start_step + action_horizon],
-                    action_horizon=action_horizon,
-                )
-                class_counts[action_chunk_balance_class(action_ids)] += 1
-
-    for class_name in BALANCE_CLASSES:
-        class_counts.setdefault(class_name, 0)
-    return class_counts
-
-
-def compute_balance_factors(
-    class_counts: Counter,
-    beta: float = DEFAULT_SBS_BETA,
-) -> Dict[str, float]:
-    beta = float(beta)
-    if beta < 0:
-        raise ValueError(f"sbs_beta must be non-negative, got {beta}")
-
-    raw_factors = {}
-    for class_name in BALANCE_CLASSES:
-        count = class_counts[class_name]
-        if count <= 0:
-            raise ValueError(f"Balance class {class_name} has no candidates")
-        raw_factors[class_name] = count ** (-beta)
-    mean_factor = sum(raw_factors.values()) / len(raw_factors)
-    return {
-        class_name: raw_factors[class_name] / mean_factor
-        for class_name in BALANCE_CLASSES
-    }
+            num_actions = len(actions)
+            dense_start = max(0, num_actions - action_horizon)
+            body_stop = max(0, dense_start - action_horizon + 1)
+            candidate_counts["terminal_dense"] += num_actions - dense_start
+            for start_step in range(body_stop):
+                action_ids = actions[start_step:start_step + action_horizon]
+                if action_chunk_contains_event(action_ids):
+                    candidate_counts["event_body"] += 1
+                else:
+                    candidate_counts["background_body"] += 1
+    return candidate_counts
 
 
-def action_chunk_information_value(
-    action_ids: List[int],
-    action_information: Dict[int, float],
-) -> float:
-    return sum(action_information[action_id] for action_id in action_ids) / len(action_ids)
-
-
-def sbs_action_chunk_keep_probability(
-    action_ids: List[int],
-    action_information: Dict[int, float],
-    balance_factors: Dict[str, float],
-    tau: float = DEFAULT_SBS_TAU,
-) -> float:
-    if tau <= 0:
-        raise ValueError(f"sbs_tau must be positive, got {tau}")
-    class_name = action_chunk_balance_class(action_ids)
-    value = action_chunk_information_value(action_ids, action_information)
-    balanced_value = value * balance_factors[class_name]
-    return 1.0 - math.exp(-tau * balanced_value)
-
-
-def print_sbs_sampling_summary(
-    action_counts: Counter,
-    action_information: Dict[int, float],
-    class_counts: Counter,
-    balance_factors: Dict[str, float],
-    tau: float,
-    beta: float,
-) -> None:
-    total_actions = sum(action_counts.values())
-    print(
-        f"chunk_sampler={SBS_SAMPLER} "
-        f"tau={tau} beta={beta}"
-    )
-    for action_id in range(4):
-        count = action_counts[action_id]
-        freq = count / total_actions
-        print(
-            "action_info "
-            f"{action_id_to_str(action_id)} count={count} "
-            f"freq={freq:.10f} I={action_information[action_id]:.10f}"
-        )
-    for class_name in BALANCE_CLASSES:
-        print(
-            "balance_class "
-            f"{class_name} candidates={class_counts[class_name]} "
-            f"factor={balance_factors[class_name]:.10f}"
-        )
-
-
-def build_sbs_action_chunk_starts(
-    actions: List[int],
-    action_information: Dict[int, float],
-    balance_factors: Dict[str, float],
+def print_ebs_sampling_summary(
+    candidate_counts: Counter,
+    event_keep_prob: float,
+    background_keep_prob: float,
     action_horizon: int = DEFAULT_ACTION_HORIZON,
-    tau: float = DEFAULT_SBS_TAU,
+) -> None:
+    print(
+        f"chunk_sampler={EBS_SAMPLER} "
+        f"event_keep_prob={event_keep_prob} "
+        f"background_keep_prob={background_keep_prob} "
+        f"tail_dense={action_horizon} "
+        f"terminal_buffer={action_horizon - 1}"
+    )
+    for class_name in ("event_body", "background_body", "terminal_dense"):
+        print(f"candidate_class {class_name} candidates={candidate_counts[class_name]}")
+
+
+def build_ebs_action_chunk_starts(
+    actions: List[int],
+    action_horizon: int = DEFAULT_ACTION_HORIZON,
+    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
+    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
     rng: Optional[random.Random] = None,
 ) -> List[int]:
     action_horizon = max(1, int(action_horizon))
+    event_keep_prob = validate_keep_probability(
+        event_keep_prob,
+        "event_keep_prob",
+    )
+    background_keep_prob = validate_keep_probability(
+        background_keep_prob,
+        "background_keep_prob",
+    )
     if rng is None:
         rng = random.Random(DEFAULT_SEED)
 
@@ -267,19 +202,16 @@ def build_sbs_action_chunk_starts(
         raise ValueError(f"Episode must end with stop, got last action {actions[-1]}")
 
     dense_start = max(0, num_actions - action_horizon)
+    body_stop = max(0, dense_start - action_horizon + 1)
     start_steps = set(range(dense_start, num_actions))
 
     start_step = 0
-    while start_step < dense_start:
-        action_ids = pad_terminal_action_ids(
-            actions[start_step:start_step + action_horizon],
-            action_horizon=action_horizon,
-        )
-        keep_prob = sbs_action_chunk_keep_probability(
+    while start_step < body_stop:
+        action_ids = actions[start_step:start_step + action_horizon]
+        keep_prob = ebs_action_chunk_keep_probability(
             action_ids=action_ids,
-            action_information=action_information,
-            balance_factors=balance_factors,
-            tau=tau,
+            event_keep_prob=event_keep_prob,
+            background_keep_prob=background_keep_prob,
         )
         if rng.random() < keep_prob:
             start_steps.add(start_step)
@@ -293,23 +225,16 @@ def build_sbs_action_chunk_starts(
 def build_action_chunks(
     actions: List[int],
     action_horizon: int = DEFAULT_ACTION_HORIZON,
-    sbs_tau: float = DEFAULT_SBS_TAU,
-    action_information: Optional[Dict[int, float]] = None,
-    balance_factors: Optional[Dict[str, float]] = None,
+    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
+    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
     pad_stop_to_horizon: bool = False,
     rng: Optional[random.Random] = None,
 ) -> List[Dict[str, Any]]:
-    if action_information is None or balance_factors is None:
-        raise ValueError(
-            "SBS sampling requires action_information "
-            "and balance_factors"
-        )
-    start_steps = build_sbs_action_chunk_starts(
+    start_steps = build_ebs_action_chunk_starts(
         actions=actions,
-        action_information=action_information,
-        balance_factors=balance_factors,
         action_horizon=action_horizon,
-        tau=sbs_tau,
+        event_keep_prob=event_keep_prob,
+        background_keep_prob=background_keep_prob,
         rng=rng,
     )
 
@@ -349,9 +274,8 @@ def process_dataset(
     input_root: str,
     pad_stop_to_horizon: bool = False,
     seed: int = DEFAULT_SEED,
-    sbs_tau: float = DEFAULT_SBS_TAU,
-    action_information: Optional[Dict[int, float]] = None,
-    balance_factors: Optional[Dict[str, float]] = None,
+    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
+    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
     output_handle=None,
 ):
     data2save = []
@@ -385,9 +309,8 @@ def process_dataset(
 
             action_chunks = build_action_chunks(
                 actions,
-                sbs_tau=sbs_tau,
-                action_information=action_information,
-                balance_factors=balance_factors,
+                event_keep_prob=event_keep_prob,
+                background_keep_prob=background_keep_prob,
                 pad_stop_to_horizon=pad_stop_to_horizon,
                 rng=rng,
             )
@@ -440,8 +363,8 @@ def main(
     max_episodes_per_subset: int = None,
     pad_stop_to_horizon: bool = False,
     seed: int = DEFAULT_SEED,
-    sbs_tau: float = DEFAULT_SBS_TAU,
-    sbs_beta: float = DEFAULT_SBS_BETA,
+    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
+    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
     annotations_by_subset = load_subset_annotations(
@@ -450,23 +373,21 @@ def main(
         max_episodes_per_subset=max_episodes_per_subset,
     )
 
-    if sbs_tau <= 0:
-        raise ValueError(f"sbs_tau must be positive, got {sbs_tau}")
-    action_counts, action_information = compute_action_information(
-        annotations_by_subset
+    event_keep_prob = validate_keep_probability(
+        event_keep_prob,
+        "event_keep_prob",
     )
-    class_counts = compute_candidate_class_counts(annotations_by_subset)
-    balance_factors = compute_balance_factors(
-        class_counts=class_counts,
-        beta=sbs_beta,
+    background_keep_prob = validate_keep_probability(
+        background_keep_prob,
+        "background_keep_prob",
     )
-    print_sbs_sampling_summary(
-        action_counts=action_counts,
-        action_information=action_information,
-        class_counts=class_counts,
-        balance_factors=balance_factors,
-        tau=sbs_tau,
-        beta=sbs_beta,
+    candidate_counts = compute_ebs_candidate_counts(
+        annotations_by_subset=annotations_by_subset,
+    )
+    print_ebs_sampling_summary(
+        candidate_counts=candidate_counts,
+        event_keep_prob=event_keep_prob,
+        background_keep_prob=background_keep_prob,
     )
 
     output_dir = os.path.dirname(output_path)
@@ -482,9 +403,8 @@ def main(
             input_root=input_root,
             pad_stop_to_horizon=pad_stop_to_horizon,
             seed=seed,
-            sbs_tau=sbs_tau,
-            action_information=action_information,
-            balance_factors=balance_factors,
+            event_keep_prob=event_keep_prob,
+            background_keep_prob=background_keep_prob,
             output_handle=output_handle,
         )
 
@@ -522,24 +442,22 @@ if __name__ == "__main__":
         "--seed",
         type=int,
         default=DEFAULT_SEED,
-        help="Random seed for SBS chunk sampling.",
+        help="Random seed for EBS chunk sampling.",
     )
     parser.add_argument(
-        "--sbs_tau",
+        "--event_keep_prob",
         type=float,
-        default=DEFAULT_SBS_TAU,
+        default=DEFAULT_EVENT_KEEP_PROB,
         help=(
-            "Scale parameter for SBS (Surprisal-Balanced Sampling): "
-            "p_keep = 1 - exp(-tau * V(chunk) * B(class))."
+            "EBS keep probability for body chunks containing left/right events."
         ),
     )
     parser.add_argument(
-        "--sbs_beta",
+        "--background_keep_prob",
         type=float,
-        default=DEFAULT_SBS_BETA,
+        default=DEFAULT_BACKGROUND_KEEP_PROB,
         help=(
-            "Candidate-class balance strength for SBS. "
-            "B(class) is proportional to candidate_count^(-beta)."
+            "EBS keep probability for all-forward body chunks."
         ),
     )
     args = parser.parse_args()
@@ -551,6 +469,6 @@ if __name__ == "__main__":
         max_episodes_per_subset=args.max_episodes_per_subset,
         pad_stop_to_horizon=args.pad_stop_to_horizon,
         seed=args.seed,
-        sbs_tau=args.sbs_tau,
-        sbs_beta=args.sbs_beta,
+        event_keep_prob=args.event_keep_prob,
+        background_keep_prob=args.background_keep_prob,
     )
