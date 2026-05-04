@@ -9,13 +9,22 @@ model:
   trainable_modules:
     visual: true
     visual_merger: true
+    erp_position_mlp: true
     language_model: true
+    panovggt_mlp: true
+  erp_pos_enabled: true
+  erp_pos_alpha_init: 0.005
+  erp_pos_alpha_max: 0.05
+  panovggt_enabled: true
+  panovggt_checkpoint_path: "/workspace/code_dir/a_property/model/PanoVGGT/model.pt"
+  panovggt_alpha_init: 0.2
+  panovggt_alpha_max: 0.4
 
 data:
-  train_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
-  eval_jsonl: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
-  train_image_root: "/workspace/code_dir/a_property/dataset/NAVIDA_pano"
-  eval_image_root: "/workspace/code_dir/a_property/dataset/NAVIDA_pano_eval"
+  train_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
+  eval_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
+  train_image_root: "/workspace/code_dir/a_property/dataset/PanoVLN"
+  eval_image_root: "/workspace/code_dir/a_property/dataset/PanoVLN_eval"
   train_max_samples: null
   eval_max_samples: 3000
   shuffle: true
@@ -25,7 +34,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/uni-naivid_ebs_event0p50_bg0p05_taildense4_erp"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -50,7 +59,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "word_space_stop_pad_ebs_event0p50_bg0p05_taildense4_erp_4action"
+  run_name: "panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -62,12 +71,12 @@ run:
   resume_from_checkpoint: true
 
 wandb:
-  project: "NAVIDA_pano"
+  project: "PanoVLN"
   entity: null
-  name: "word_space_stop_pad_ebs_event0p50_bg0p05_taildense4_erp_4action"
-  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "erp-position-embedding"]
+  name: "panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "erp-position-embedding", "erp-current-only", "panovggt-geometry"]
   mode: "offline"
   group: null
-  notes: "Space-separated fixed 4-action word targets; terminal chunks padded with stop and selected by EBS (Event-Balanced Sampling) with event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. The Qwen vision patch stream uses a top-level PanoVGGT-style ERP position MLP on all panoramic image patch tokens."
+  notes: "PanoVLN 4-action training with EBS event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. The Qwen vision patch stream uses a normalized gated ERP position MLP on the current observation only, plus a current-frame PanoVGGT latent-token residual."
   id: null
   resume: "never"

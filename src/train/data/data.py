@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.transforms import functional as TF
 
 try:
     from src.train.utils import build_prompt_and_target
@@ -17,6 +18,7 @@ except ModuleNotFoundError:
 DEFAULT_IMAGE_SIZE = (640, 320)
 DEFAULT_VLN_MEMORY_IMAGE_SIZE = (448, 224)
 DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (960, 480)
+DEFAULT_PANOVGGT_IMAGE_SIZE = (1036, 518)
 DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
@@ -128,6 +130,14 @@ def preprocess_vln_memory_image(image: Image.Image) -> Image.Image:
 def preprocess_vln_current_image(image: Image.Image) -> Image.Image:
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
     return crop_erp_latitude(processed_image)
+
+
+def preprocess_panovggt_current_image(image: Image.Image) -> torch.Tensor:
+    processed_image = image.convert("RGB").resize(
+        DEFAULT_PANOVGGT_IMAGE_SIZE,
+        Image.Resampling.LANCZOS,
+    )
+    return TF.to_tensor(processed_image)
 
 
 def build_vln_image_selection(
@@ -397,6 +407,7 @@ class SupervisedDataset(Dataset):
         image_token: str,
         model_max_length: Optional[int],
         image_size: Optional[List[int]] = None,
+        panovggt_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -412,6 +423,7 @@ class SupervisedDataset(Dataset):
             self.image_token = image_token
         self.model_max_length = model_max_length
         self.image_size = resolve_runtime_image_size(image_size)
+        self.panovggt_enabled = bool(panovggt_enabled)
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -535,6 +547,10 @@ class SupervisedDataset(Dataset):
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
 
+        if self.panovggt_enabled and vision_paths:
+            with Image.open(vision_paths[-1]) as image:
+                item["panovggt_pixel_values"] = preprocess_panovggt_current_image(image).unsqueeze(0)
+
         for key in STACKABLE_KEYS:
             if key in encoded:
                 item[key] = encoded[key]
@@ -548,6 +564,7 @@ STACKABLE_KEYS = (
     "image_erp_geometry",
     "image_num_images",
     "image_current_index",
+    "panovggt_pixel_values",
     "pixel_values_videos",
     "video_grid_thw",
 )

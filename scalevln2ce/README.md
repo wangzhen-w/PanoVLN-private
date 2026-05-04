@@ -3,19 +3,19 @@
 最简单的入口：
 
 ```bash
-bash /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/run_scalevln_ce.sh
+bash /workspace/code_dir/VLN/scalevln2ce/run_scalevln_ce.sh
 ```
 
 脚本顶部变量已经改成了直接赋值形式，直接编辑
-[run_scalevln_ce.sh](/workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/run_scalevln_ce.sh)
+[run_scalevln_ce.sh](/workspace/code_dir/VLN/scalevln2ce/run_scalevln_ce.sh)
 里的参数块即可，不需要再传环境变量。
 
 也支持：
 
 ```bash
-bash /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/run_scalevln_ce.sh smoke
-bash /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/run_scalevln_ce.sh build
-bash /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/run_scalevln_ce.sh gt
+bash /workspace/code_dir/VLN/scalevln2ce/run_scalevln_ce.sh smoke
+bash /workspace/code_dir/VLN/scalevln2ce/run_scalevln_ce.sh build
+bash /workspace/code_dir/VLN/scalevln2ce/run_scalevln_ce.sh gt
 ```
 
 三种核心模式说明：
@@ -59,9 +59,9 @@ bash /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/run_scalevln_ce.sh gt
 ## Build 10 subsets
 
 ```bash
-python /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/generate_scalevln_ce.py \
+python /workspace/code_dir/VLN/scalevln2ce/generate_scalevln_ce.py \
   build-subsets \
-  --output-root /workspace/data_dir/dataset/general_VLN_data/ScaleVLN_CE \
+  --output-root /workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_CE \
   --num-subsets 10 \
   --subset-size 150000 \
   --overwrite \
@@ -71,9 +71,9 @@ python /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/generate_scalevln_ce
 ## Generate GT for one subset
 
 ```bash
-python /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/generate_scalevln_ce.py \
+python /workspace/code_dir/VLN/scalevln2ce/generate_scalevln_ce.py \
   generate-gt \
-  --output-root /workspace/data_dir/dataset/general_VLN_data/ScaleVLN_CE \
+  --output-root /workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_CE \
   --subset-indices 0 \
   --minimal-observations \
   --gt-log-every 200 \
@@ -84,9 +84,9 @@ python /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/generate_scalevln_ce
 
 ```bash
 for idx in $(seq 0 9); do
-  python /workspace/data_dir/code_dir/NAVIDA_pano/scalevln2ce/generate_scalevln_ce.py \
+  python /workspace/code_dir/VLN/scalevln2ce/generate_scalevln_ce.py \
     generate-gt \
-    --output-root /workspace/data_dir/dataset/general_VLN_data/ScaleVLN_CE \
+    --output-root /workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_CE \
     --subset-indices "${idx}" \
     --minimal-observations \
     --gt-log-every 200 \

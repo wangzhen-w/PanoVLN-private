@@ -421,12 +421,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input_root",
         type=str,
-        default="/workspace/code_dir/a_property/dataset/NAVIDA_pano",
+        default="/workspace/code_dir/a_property/dataset/PanoVLN",
     )
     parser.add_argument(
         "--output_path",
         type=str,
-        default="navida_train_data.jsonl",
+        default="panovln_train_data.jsonl",
     )
     parser.add_argument(
         "--max_episodes_per_subset",

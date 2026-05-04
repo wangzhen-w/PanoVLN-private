@@ -13,8 +13,8 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-INPUT_ROOT="/workspace/code_dir/a_property/dataset/NAVIDA_pano"
-OUTPUT_PATH="/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
+INPUT_ROOT="/workspace/code_dir/a_property/dataset/PanoVLN"
+OUTPUT_PATH="/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
 DATASET_NAMES=("r2r" "rxr")
 MAX_EPISODES_PER_SUBSET=""
 PAD_STOP_TO_HORIZON="true"

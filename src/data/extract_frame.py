@@ -521,7 +521,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_root",
         type=str,
-        default="/workspace/data_dir/dataset/train/NAVIDA_pano",
+        default="/workspace/code_dir/a_property/dataset/PanoVLN",
     )
     parser.add_argument(
         "--gpu_ids",

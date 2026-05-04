@@ -2,7 +2,6 @@
 import argparse
 import gzip
 import hashlib
-import ijson
 import json
 import math
 import os
@@ -14,31 +13,36 @@ from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 try:
+    import ijson
+except Exception:  # pragma: no cover
+    ijson = None
+
+try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
     tqdm = None
 
 
 DEFAULT_RAW_ANNOTATIONS = (
-    "/workspace/data_dir/dataset/general_VLN_data/ScaleVLN_total/annotations/"
+    "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_total/annotations/"
     "R2R_scalevln_ft_aug_enc.json"
 )
 DEFAULT_EXISTING_SUBSET = (
-    "/workspace/data_dir/dataset/general_VLN_data/ScaleVLN_150k/"
+    "/workspace/code_dir/a_property/dataset/janusvln_data/datasets/scalevln/"
     "scalevln_subset_150k.json.gz"
 )
 DEFAULT_CONNECTIVITY_DIR = (
-    "/workspace/data_dir/dataset/general_VLN_data/ScaleVLN_total/connectivity"
+    "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_total/connectivity"
 )
 DEFAULT_CONNECTIVITY_MP3D_DIR = (
-    "/workspace/data_dir/dataset/general_VLN_data/ScaleVLN_total/connectivity_mp3d"
+    "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_total/connectivity_mp3d"
 )
-DEFAULT_OUTPUT_ROOT = "/workspace/data_dir/dataset/general_VLN_data/ScaleVLN_CE"
-DEFAULT_SCENES_DIR = "/workspace/data_dir/dataset/janusvln_data/scene_datasets"
+DEFAULT_OUTPUT_ROOT = "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_CE"
+DEFAULT_SCENES_DIR = "/workspace/code_dir/a_property/dataset/janusvln_data/scene_datasets"
 DEFAULT_CONFIG_PATH = (
-    "/workspace/data_dir/code_dir/NAVIDA_pano/config/vln_scalevln.yaml"
+    "/workspace/code_dir/VLN/config/vln_scalevln.yaml"
 )
-DEFAULT_REPO_ROOT = "/workspace/data_dir/code_dir/NAVIDA_pano"
+DEFAULT_REPO_ROOT = "/workspace/code_dir/VLN"
 DEFAULT_DATASET_FILENAME = "scalevln_subset_150k.json.gz"
 DEFAULT_DATASET_JSONL_FILENAME = "scalevln_subset_150k.jsonl"
 DEFAULT_GT_FILENAME = "scalevln_subset_150k_gt.json.gz"
@@ -308,6 +312,12 @@ def add_gt_args(
 
 
 def iter_raw_annotations(path: str) -> Iterator[Dict]:
+    if ijson is None:
+        raise RuntimeError(
+            "The ScaleVLN converter needs the optional `ijson` package to "
+            "stream the raw annotation JSON. Install ijson before running "
+            "`build-subsets` or `full`."
+        )
     with open(path, "r", encoding="utf-8") as handle:
         yield from ijson.items(handle, "item")
 

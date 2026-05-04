@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/code_dir/a_property/model/4-action/uni-naivid_ebs_event0p50_bg0p05_taildense4_erp"
+OUTPUT_DIR="/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
 GPU_DEVICES="0,1,2,3"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"

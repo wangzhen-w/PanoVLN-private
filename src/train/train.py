@@ -25,6 +25,21 @@ from utils import (
 RANK = int(os.environ.get("RANK", "0"))
 
 
+class PanoVLNTrainer(Trainer):
+    RAW_ALPHA_NO_DECAY_SUFFIXES = (
+        "erp_position_mlp.raw_alpha",
+        "panovggt_mlp.raw_alpha",
+    )
+
+    def get_decay_parameter_names(self, model):
+        decay_parameter_names = super().get_decay_parameter_names(model)
+        return [
+            name
+            for name in decay_parameter_names
+            if not name.endswith(self.RAW_ALPHA_NO_DECAY_SUFFIXES)
+        ]
+
+
 def copy_chat_template_files(source_dir: str, output_dir: str):
     for template_name in ("chat_template.json", "chat_template.jinja"):
         source_path = os.path.join(source_dir, template_name)
@@ -78,6 +93,7 @@ def main():
         image_token=cfg.model.image_token,
         model_max_length=cfg.model.model_max_length,
         image_size=cfg.data.image_size,
+        panovggt_enabled=cfg.model.panovggt_enabled,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
         prompt_format=cfg.data.prompt_format,
@@ -93,6 +109,7 @@ def main():
             image_token=cfg.model.image_token,
             model_max_length=cfg.model.model_max_length,
             image_size=cfg.data.image_size,
+            panovggt_enabled=cfg.model.panovggt_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
@@ -143,7 +160,7 @@ def main():
 
     init_wandb(cfg.wandb, training_args, RANK)
 
-    trainer = Trainer(
+    trainer = PanoVLNTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

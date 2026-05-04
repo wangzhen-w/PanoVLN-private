@@ -31,6 +31,7 @@ from src.train.data.data import (
     build_erp_image_geometry_batch,
     build_vln_image_selection,
     build_vln_user_content,
+    preprocess_panovggt_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
@@ -316,7 +317,7 @@ def evaluate_agent(
         return
 
     env = Env(config.habitat, dataset)
-    agent = NaVIDA_Agent(
+    agent = PanoVLN_Agent(
         model_path,
         lora_path,
         result_path,
@@ -370,7 +371,7 @@ def evaluate_agent(
     finally:
         env.close()
 
-class NaVIDA_Agent(Agent):
+class PanoVLN_Agent(Agent):
     def __init__(
         self,
         model_path,
@@ -384,7 +385,7 @@ class NaVIDA_Agent(Agent):
         attn_implementation="sdpa",
     ):
         
-        print("Initialize NaVIDA")
+        print("Initialize PanoVLN")
         
         self.result_path = result_path
         self.save_topdown = save_topdown
@@ -482,6 +483,10 @@ class NaVIDA_Agent(Agent):
             [resolve_current_image_index(image_count)],
             dtype=torch.long,
         )
+        if bool(getattr(self.model.config, "panovggt_enabled", False)) and self.rgb_history:
+            prompt_inputs["panovggt_pixel_values"] = preprocess_panovggt_current_image(
+                self.rgb_history[-1]
+            ).unsqueeze(0)
 
         prompt_inputs = prompt_inputs.to(self.device)
         with torch.inference_mode():

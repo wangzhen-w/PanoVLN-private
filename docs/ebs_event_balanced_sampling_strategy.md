@@ -146,9 +146,9 @@ EBS 与 probskip 的比例一致，但方法描述从“概率跳过”整理为
 
 ```bash
 python src/data/prepare_training_data.py \
-  --input_root /workspace/code_dir/a_property/dataset/NAVIDA_pano \
+  --input_root /workspace/code_dir/a_property/dataset/PanoVLN \
   --dataset_name r2r rxr \
-  --output_path /workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl \
+  --output_path /workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl \
   --pad_stop_to_horizon \
   --seed 42 \
   --event_keep_prob 0.50 \
@@ -160,7 +160,7 @@ python src/data/prepare_training_data.py \
 ```bash
 EVENT_KEEP_PROB=0.60 \
 BACKGROUND_KEEP_PROB=0.05 \
-OUTPUT_PATH=/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p60_bg0p05_taildense4.jsonl \
+OUTPUT_PATH=/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p60_bg0p05_taildense4.jsonl \
 ./scripts/prepare_dataset.sh
 ```
 
@@ -169,6 +169,6 @@ OUTPUT_PATH=/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4ac
 ```bash
 EVENT_KEEP_PROB=0.50 \
 BACKGROUND_KEEP_PROB=0.03 \
-OUTPUT_PATH=/workspace/code_dir/a_property/dataset/NAVIDA_pano/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p03_taildense4.jsonl \
+OUTPUT_PATH=/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p03_taildense4.jsonl \
 ./scripts/prepare_dataset.sh
 ```

@@ -723,7 +723,7 @@ def main():
     parser.add_argument(
         "--output_root",
         type=str,
-        default="/workspace/data_dir/dataset/train/NAVIDA_pano",
+        default="/workspace/code_dir/a_property/dataset/PanoVLN",
         help="Root directory used to write generated sub_dataset jsonl files.",
     )
     parser.add_argument(

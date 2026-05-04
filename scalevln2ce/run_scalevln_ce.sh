@@ -16,7 +16,7 @@ PY_SCRIPT="generate_scalevln_ce.py"
 MODE="${1:-full}"
 
 # 主输出配置
-OUTPUT_ROOT="/workspace/data_dir/dataset/general_VLN_data/ScaleVLN_CE"
+OUTPUT_ROOT="/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_CE"
 SUBSET_PREFIX="subset"
 NUM_SUBSETS=10
 SUBSET_SIZE=150000

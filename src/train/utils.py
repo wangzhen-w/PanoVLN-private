@@ -25,7 +25,9 @@ except ModuleNotFoundError:
 DEFAULT_TRAINABLE_MODULES = {
     "visual": True,
     "visual_merger": True,
+    "erp_position_mlp": True,
     "language_model": True,
+    "panovggt_mlp": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -49,28 +51,6 @@ def _get_dtype(dtype_str: Optional[str]):
     return None
 
 
-def _get_visual_module(model):
-    if hasattr(model, "visual"):
-        return model.visual
-    if hasattr(model, "model") and hasattr(model.model, "visual"):
-        return model.model.visual
-    return None
-
-
-def _get_language_model(model):
-    if hasattr(model, "language_model"):
-        return model.language_model
-    if hasattr(model, "model") and hasattr(model.model, "language_model"):
-        return model.model.language_model
-    return None
-
-
-def _get_erp_module(model):
-    if hasattr(model, "erp_position_mlp"):
-        return model.erp_position_mlp
-    return None
-
-
 def set_model(cfg, model):
     trainable_modules = dict(DEFAULT_TRAINABLE_MODULES)
     if cfg.model.trainable_modules:
@@ -79,23 +59,34 @@ def set_model(cfg, model):
     for param in model.parameters():
         param.requires_grad = False
 
-    visual_model = _get_visual_module(model)
-    if trainable_modules.get("visual") and visual_model is not None:
-        for _, param in visual_model.named_parameters():
-            param.requires_grad = True
-        erp_module = _get_erp_module(model)
-        if erp_module is not None:
-            for _, param in erp_module.named_parameters():
-                param.requires_grad = True
+    visual_model = getattr(model, "visual", None)
+    if visual_model is None and hasattr(model, "model"):
+        visual_model = getattr(model.model, "visual", None)
 
-    if trainable_modules.get("visual_merger") and visual_model is not None and hasattr(visual_model, "merger"):
-        for _, param in visual_model.merger.named_parameters():
+    language_model = getattr(model, "language_model", None)
+    if language_model is None and hasattr(model, "model"):
+        language_model = getattr(model.model, "language_model", None)
+
+    named_modules = {
+        "visual": visual_model,
+        "visual_merger": (
+            getattr(visual_model, "merger", None)
+            if visual_model is not None else None
+        ),
+        "erp_position_mlp": getattr(model, "erp_position_mlp", None),
+        "panovggt_mlp": getattr(model, "panovggt_mlp", None),
+        "language_model": language_model,
+    }
+
+    for module_name, module in named_modules.items():
+        if not trainable_modules.get(module_name) or module is None:
+            continue
+        if hasattr(module, "enabled") and not getattr(module, "enabled"):
+            continue
+        for _, param in module.named_parameters():
             param.requires_grad = True
 
-    language_model = _get_language_model(model)
-    if trainable_modules.get("language_model") and language_model is not None:
-        for _, param in language_model.named_parameters():
-            param.requires_grad = True
+    if trainable_modules.get("language_model"):
         if hasattr(model, "lm_head"):
             for _, param in model.lm_head.named_parameters():
                 param.requires_grad = True
@@ -111,6 +102,19 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
+    if hasattr(config, "vision_config") and config.vision_config is not None:
+        setattr(config.vision_config, "erp_pos_enabled", cfg.model.erp_pos_enabled)
+        setattr(config.vision_config, "erp_pos_alpha_init", cfg.model.erp_pos_alpha_init)
+        setattr(config.vision_config, "erp_pos_alpha_max", cfg.model.erp_pos_alpha_max)
+
+    panovggt_fields = (
+        "panovggt_enabled",
+        "panovggt_checkpoint_path",
+        "panovggt_alpha_init",
+        "panovggt_alpha_max",
+    )
+    for field_name in panovggt_fields:
+        setattr(config, field_name, getattr(cfg.model, field_name))
     return config
 
 
