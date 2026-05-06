@@ -222,7 +222,7 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_enabled": False,
         "panovggt_checkpoint_path": "/workspace/code_dir/a_property/model/PanoVGGT/model.pt",
         "panovggt_alpha_init": 0.1,
-        "panovggt_alpha_max": 0.3,
+        "panovggt_alpha_max": 0.2,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
     for field_name, default_value in defaults.items():
@@ -327,7 +327,7 @@ class PanoVGGTGeometryMLP(nn.Module):
         self.output_dim = int(getattr(config, "panovggt_output_dim", config.text_config.hidden_size))
         self.hidden_dim = PANOVGGT_MLP_HIDDEN_SIZE
         self.alpha_init = float(getattr(config, "panovggt_alpha_init", 0.1))
-        self.alpha_max = float(getattr(config, "panovggt_alpha_max", 0.3))
+        self.alpha_max = float(getattr(config, "panovggt_alpha_max", 0.2))
         self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
 
         self.input_norm = nn.RMSNorm(self.context_dim, eps=1e-6)
@@ -336,7 +336,6 @@ class PanoVGGTGeometryMLP(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.output_dim),
         )
-        self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
         self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
         self.reset_parameters()
 
@@ -346,7 +345,6 @@ class PanoVGGTGeometryMLP(nn.Module):
 
     def reset_parameters(self) -> None:
         self.input_norm.reset_parameters()
-        self.output_norm.reset_parameters()
         for module in self.mlp:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -514,7 +512,7 @@ class PanoVGGTGeometryMLP(nn.Module):
                     "PanoVGGT sampled geometry length mismatch: "
                     f"sampled_len={geo.shape[0]}, qwen_len={int(target_len)}"
                 )
-            projected = self.output_norm(self.mlp(self.input_norm(geo.to(dtype=param.dtype))))
+            projected = self.mlp(self.input_norm(geo.to(dtype=param.dtype)))
             projected = self.alpha.to(dtype=projected.dtype) * projected
             deltas.append(projected.to(device=output_device, dtype=output_dtype))
 
@@ -576,7 +574,9 @@ def build_current_image_mask(
 
 
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
-    _keys_to_ignore_on_load_unexpected = [r"panovggt\..*"]
+    _keys_to_ignore_on_load_unexpected = list(
+        getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
+    ) + [r"panovggt\..*"]
 
     ERP_STATE_KEYS = (
         "erp_position_mlp.raw_alpha",
@@ -593,7 +593,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.mlp.0.bias",
         "panovggt_mlp.mlp.2.weight",
         "panovggt_mlp.mlp.2.bias",
-        "panovggt_mlp.output_norm.weight",
     )
 
     def __init__(self, config):

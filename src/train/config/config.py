@@ -20,7 +20,7 @@ class ModelConfig:
     panovggt_enabled: bool = False
     panovggt_checkpoint_path: str = "/workspace/code_dir/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_init: float = 0.1
-    panovggt_alpha_max: float = 0.3
+    panovggt_alpha_max: float = 0.2
 
 
 @dataclass

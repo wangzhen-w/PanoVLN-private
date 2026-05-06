@@ -47,6 +47,35 @@ def copy_chat_template_files(source_dir: str, output_dir: str):
             shutil.copy(source_path, os.path.join(output_dir, template_name))
 
 
+def _config_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "null"
+    return str(value)
+
+
+def print_training_config(cfg) -> None:
+    rank0_print(RANK, "===== Ablation config =====")
+    rank0_print(RANK, f"torch_dtype: {_config_value(cfg.model.torch_dtype)}")
+    rank0_print(RANK, f"attn_implementation: {_config_value(cfg.model.attn_implementation)}")
+    rank0_print(RANK, "trainable_modules:")
+    for name, enabled in (cfg.model.trainable_modules or {}).items():
+        rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
+    rank0_print(RANK, f"erp_pos_enabled: {_config_value(cfg.model.erp_pos_enabled)}")
+    rank0_print(RANK, f"erp_pos_alpha_init: {_config_value(cfg.model.erp_pos_alpha_init)}")
+    rank0_print(RANK, f"erp_pos_alpha_max: {_config_value(cfg.model.erp_pos_alpha_max)}")
+    rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
+    rank0_print(RANK, f"panovggt_alpha_init: {_config_value(cfg.model.panovggt_alpha_init)}")
+    rank0_print(RANK, f"panovggt_alpha_max: {_config_value(cfg.model.panovggt_alpha_max)}")
+    rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
+    rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
+    rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
+    rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
+    rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
+    rank0_print(RANK, "===========================")
+
+
 def safe_save_model_for_hf_trainer(
     trainer: Trainer,
     output_dir: str,
@@ -79,6 +108,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if RANK == 0:
+        print_training_config(cfg)
     set_seed(cfg.training.seed)
 
     processor, tokenizer = load_processor_and_tokenizer(cfg)
