@@ -11,9 +11,9 @@ export HABITAT_SIM_LOG=quiet
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-MODEL_PATH="/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
+MODEL_PATH="/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_panovggt_current_only"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/code_dir/a_property/result/4-action/panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
+SAVE_PATH="/workspace/code_dir/a_property/vln_result/4-action/panovln_ebs_event0p50_bg0p05_panovggt_current_only"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100

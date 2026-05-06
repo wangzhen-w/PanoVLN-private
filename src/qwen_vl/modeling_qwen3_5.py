@@ -449,9 +449,10 @@ class PanoVGGTGeometryMLP(nn.Module):
                 f"or [B, 3, H, W], got {tuple(panovggt_pixel_values.shape)}"
             )
 
-        param = next(self.mlp.parameters())
         encoder = panovggt_model
-        images = panovggt_pixel_values.to(device=param.device, dtype=param.dtype)
+        encoder_param = next(encoder.parameters())
+        param = next(self.mlp.parameters())
+        images = panovggt_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
 
         with torch.no_grad():
             aggregated = encoder.aggregator(images)
@@ -575,6 +576,8 @@ def build_current_image_mask(
 
 
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
+    _keys_to_ignore_on_load_unexpected = [r"panovggt\..*"]
+
     ERP_STATE_KEYS = (
         "erp_position_mlp.raw_alpha",
         "erp_position_mlp.mlp.0.weight",
@@ -603,11 +606,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ensure_panovggt_config(config)
         self.erp_position_mlp = ERPPositionMLP(visual_config)
         self.panovggt_mlp = PanoVGGTGeometryMLP(config)
-        self.panovggt = (
-            build_panovggt_model_from_vendored_config()
-            if self.panovggt_mlp.enabled
-            else None
-        )
+        self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
         self._panovggt_device = None
@@ -631,7 +630,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         def patch_embed_with_erp(this, hidden_states):
             outputs = this._pano_origin_forward(hidden_states)
             grid_thw = owner._pano_runtime_grid_thw
-            if grid_thw is None or outputs.numel() == 0:
+            if (
+                not owner.erp_position_mlp.enabled
+                or grid_thw is None
+                or outputs.numel() == 0
+            ):
                 return outputs
 
             image_apply_mask = None
@@ -760,6 +763,93 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._panovggt_device = None
         self._panovggt_dtype = None
 
+    @staticmethod
+    def _load_prefixed_checkpoint_tensors(checkpoint_dir: Path, prefix: str) -> dict[str, torch.Tensor]:
+        if not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
+            return {}
+
+        state_dict: dict[str, torch.Tensor] = {}
+
+        def add_tensor(key: str, tensor: torch.Tensor) -> None:
+            if key.startswith(prefix):
+                state_dict[key[len(prefix) :]] = tensor
+
+        safetensors_index = checkpoint_dir / "model.safetensors.index.json"
+        if safetensors_index.exists():
+            from safetensors import safe_open
+
+            weight_map = json.loads(safetensors_index.read_text()).get("weight_map", {})
+            files_to_keys: dict[str, list[str]] = {}
+            for key, filename in weight_map.items():
+                if key.startswith(prefix):
+                    files_to_keys.setdefault(filename, []).append(key)
+            for filename, keys in files_to_keys.items():
+                with safe_open(str(checkpoint_dir / filename), framework="pt", device="cpu") as handle:
+                    for key in keys:
+                        add_tensor(key, handle.get_tensor(key))
+            return state_dict
+
+        safetensors_path = checkpoint_dir / "model.safetensors"
+        if safetensors_path.exists():
+            from safetensors import safe_open
+
+            with safe_open(str(safetensors_path), framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    add_tensor(key, handle.get_tensor(key))
+            return state_dict
+
+        def add_from_torch_file(path: Path, keys: set[str] | None = None) -> None:
+            loaded = torch.load(str(path), map_location="cpu")
+            if isinstance(loaded, dict) and "state_dict" in loaded and isinstance(loaded["state_dict"], dict):
+                loaded = loaded["state_dict"]
+            if not isinstance(loaded, dict):
+                return
+            for key, tensor in loaded.items():
+                if keys is not None and key not in keys:
+                    continue
+                add_tensor(key, tensor)
+
+        torch_index = checkpoint_dir / "pytorch_model.bin.index.json"
+        if torch_index.exists():
+            weight_map = json.loads(torch_index.read_text()).get("weight_map", {})
+            files_to_keys: dict[str, set[str]] = {}
+            for key, filename in weight_map.items():
+                if key.startswith(prefix):
+                    files_to_keys.setdefault(filename, set()).add(key)
+            for filename, keys in files_to_keys.items():
+                add_from_torch_file(checkpoint_dir / filename, keys)
+            return state_dict
+
+        torch_path = checkpoint_dir / "pytorch_model.bin"
+        if torch_path.exists():
+            add_from_torch_file(torch_path)
+
+        return state_dict
+
+    def _load_saved_panovggt_weights(self, pretrained_model_name_or_path) -> bool:
+        if not self.panovggt_mlp.enabled:
+            return False
+
+        checkpoint_dir = Path(str(pretrained_model_name_or_path))
+        state_dict = self._load_prefixed_checkpoint_tensors(checkpoint_dir, "panovggt.")
+        if not state_dict:
+            return False
+
+        if self.panovggt is None:
+            self.panovggt = build_panovggt_model_from_vendored_config()
+
+        incompatible = self.panovggt.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Saved PanoVGGT checkpoint keys do not match the vendored PanoVGGT model: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+        freeze_panovggt_model(self.panovggt)
+        self._panovggt_weights_ready = True
+        self._panovggt_device = None
+        self._panovggt_dtype = None
+        return True
+
     def _mark_panovggt_weights_ready(self) -> None:
         if self.panovggt is None:
             return
@@ -769,16 +859,20 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._panovggt_dtype = None
 
     def _ensure_panovggt_model(self, device: torch.device, dtype: torch.dtype):
+        del dtype
         if not self.panovggt_mlp.enabled:
             return None
         if self.panovggt is None:
             self.panovggt = build_panovggt_model_from_vendored_config()
         if not self._panovggt_weights_ready:
             self._load_external_panovggt_weights()
-        if self._panovggt_device != device or self._panovggt_dtype != dtype:
-            self.panovggt.to(device=device, dtype=dtype)
+        # PanoVGGT builds some positional features in fp32 internally; keep the
+        # frozen encoder in fp32 and cast only its output into the trainable MLP.
+        target_dtype = torch.float32
+        if self._panovggt_device != device or self._panovggt_dtype != target_dtype:
+            self.panovggt.to(device=device, dtype=target_dtype)
             self._panovggt_device = device
-            self._panovggt_dtype = dtype
+            self._panovggt_dtype = target_dtype
         freeze_panovggt_model(self.panovggt)
         return self.panovggt
 
@@ -950,6 +1044,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()
+        if model.panovggt_mlp.enabled:
+            loaded_saved_panovggt = (
+                model._load_saved_panovggt_weights(pretrained_model_name_or_path)
+                if has_panovggt_weights is True
+                else False
+            )
+            if not loaded_saved_panovggt and model.panovggt is None:
+                model._load_external_panovggt_weights()
         return model
 
     def prepare_inputs_for_generation(

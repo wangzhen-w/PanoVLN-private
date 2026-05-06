@@ -9,10 +9,10 @@ model:
   trainable_modules:
     visual: true
     visual_merger: true
-    erp_position_mlp: true
+    erp_position_mlp: false
     language_model: true
     panovggt_mlp: true
-  erp_pos_enabled: true
+  erp_pos_enabled: false
   erp_pos_alpha_init: 0.005
   erp_pos_alpha_max: 0.05
   panovggt_enabled: true
@@ -34,7 +34,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_panovggt_current_only"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -59,7 +59,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
+  run_name: "panovln_ebs_event0p50_bg0p05_panovggt_current_only"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -73,10 +73,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovln_ebs_event0p50_bg0p05_erp_current_only_panovggt"
-  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "erp-position-embedding", "erp-current-only", "panovggt-geometry"]
+  name: "panovln_ebs_event0p50_bg0p05_panovggt_current_only"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "panovggt-geometry", "panovggt-current-only"]
   mode: "offline"
   group: null
-  notes: "PanoVLN 4-action training with EBS event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. The Qwen vision patch stream uses a normalized gated ERP position MLP on the current observation only, plus a current-frame PanoVGGT latent-token residual."
+  notes: "PanoVLN 4-action training with EBS event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. ERP position MLP is disabled. A frozen current-frame PanoVGGT geometry encoder injects a gated residual after Qwen visual merging."
   id: null
   resume: "never"
