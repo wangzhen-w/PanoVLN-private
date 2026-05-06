@@ -9,16 +9,16 @@ model:
   trainable_modules:
     visual: true
     visual_merger: true
-    erp_position_mlp: false
+    erp_position_mlp: true
     language_model: true
-    panovggt_mlp: true
-  erp_pos_enabled: false
-  erp_pos_alpha_init: 0.005
+    panovggt_mlp: false
+  erp_pos_enabled: true
+  erp_pos_alpha_init: 0.02
   erp_pos_alpha_max: 0.05
-  panovggt_enabled: true
+  panovggt_enabled: false
   panovggt_checkpoint_path: "/workspace/code_dir/a_property/model/PanoVGGT/model.pt"
-  panovggt_alpha_init: 0.1
-  panovggt_alpha_max: 0.2
+  panovggt_alpha_init: 0.2
+  panovggt_alpha_max: 0.4
 
 data:
   train_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
@@ -34,11 +34,11 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_panovggt_no_outnorm_alpha0p10_0p20"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_erp_mlp_start002_max005"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   learning_rate: 2.0e-5
   weight_decay: 0.01
   num_train_epochs: 1
@@ -59,7 +59,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovln_ebs_event0p50_bg0p05_panovggt_no_outnorm_alpha0p10_0p20"
+  run_name: "panovln_ebs_erp_mlp_start002_max005"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -73,10 +73,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovln_ebs_event0p50_bg0p05_panovggt_no_outnorm_alpha0p10_0p20"
-  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "panovggt-geometry", "panovggt-current-only", "panovggt-no-output-norm", "panovggt-alpha0p10-0p20"]
+  name: "panovln_ebs_erp_mlp_start002_max005"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "erp-position-mlp", "erp-alpha0p005-0p05", "4gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "PanoVLN 4-action training with EBS event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. ERP position MLP is disabled. A frozen current-frame PanoVGGT geometry encoder injects a gated residual after Qwen visual merging. PanoVGGT adapter keeps input RMSNorm, removes output RMSNorm, and uses alpha_init=0.1 alpha_max=0.2."
+  notes: "PanoVLN 4-action training with EBS event_keep_prob=0.50, background_keep_prob=0.05, terminal buffer, and dense terminal starts. ERP position MLP is enabled and trainable with alpha_init=0.005 alpha_max=0.05. PanoVGGT is disabled. Uses GPUs 0-3 with per_device_train_batch_size=4 and gradient_accumulation_steps=8 for global batch 128."
   id: null
   resume: "never"
