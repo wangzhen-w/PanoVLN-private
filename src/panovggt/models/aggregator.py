@@ -277,7 +277,11 @@ class Aggregator(nn.Module):
                 dim=-1,
             ).reshape(Hp * Wp, 4)
 
+            pos_param = next(self.pano_pos_mlp.parameters(), None)
+            pos_dtype = hidden.dtype if pos_param is None else pos_param.dtype
+            pos_feats = pos_feats.to(dtype=pos_dtype)
             pos_embed_patch = self.pano_pos_mlp(pos_feats)
+            pos_embed_patch = pos_embed_patch.to(dtype=hidden.dtype)
 
             # Register tokens get zero positional encoding
             zeros_reg = torch.zeros(self.patch_start_idx, C, device=device, dtype=hidden.dtype)

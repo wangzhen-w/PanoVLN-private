@@ -859,16 +859,16 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._panovggt_dtype = None
 
     def _ensure_panovggt_model(self, device: torch.device, dtype: torch.dtype):
-        del dtype
         if not self.panovggt_mlp.enabled:
             return None
         if self.panovggt is None:
             self.panovggt = build_panovggt_model_from_vendored_config()
         if not self._panovggt_weights_ready:
             self._load_external_panovggt_weights()
-        # PanoVGGT builds some positional features in fp32 internally; keep the
-        # frozen encoder in fp32 and cast only its output into the trainable MLP.
-        target_dtype = torch.float32
+        # Keep the frozen encoder in Qwen's low-precision vision dtype when
+        # possible. PanoVGGT's attention has a bf16 flash path; forcing fp32
+        # makes its 36-layer panorama encoder much slower.
+        target_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.float32
         if self._panovggt_device != device or self._panovggt_dtype != target_dtype:
             self.panovggt.to(device=device, dtype=target_dtype)
             self._panovggt_device = device
