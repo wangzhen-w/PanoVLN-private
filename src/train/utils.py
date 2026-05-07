@@ -25,9 +25,9 @@ except ModuleNotFoundError:
 DEFAULT_TRAINABLE_MODULES = {
     "visual": True,
     "visual_merger": True,
-    "erp_position_mlp": True,
     "language_model": True,
     "panovggt_mlp": True,
+    "action_bearing_residual": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -73,8 +73,8 @@ def set_model(cfg, model):
             getattr(visual_model, "merger", None)
             if visual_model is not None else None
         ),
-        "erp_position_mlp": getattr(model, "erp_position_mlp", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
+        "action_bearing_residual": getattr(model, "action_bearing_residual", None),
         "language_model": language_model,
     }
 
@@ -102,18 +102,16 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
-    if hasattr(config, "vision_config") and config.vision_config is not None:
-        setattr(config.vision_config, "erp_pos_enabled", cfg.model.erp_pos_enabled)
-        setattr(config.vision_config, "erp_pos_alpha_init", cfg.model.erp_pos_alpha_init)
-        setattr(config.vision_config, "erp_pos_alpha_max", cfg.model.erp_pos_alpha_max)
-
-    panovggt_fields = (
+    model_fields = (
         "panovggt_enabled",
         "panovggt_checkpoint_path",
         "panovggt_alpha_init",
         "panovggt_alpha_max",
+        "action_bearing_enabled",
+        "action_bearing_alpha_init",
+        "action_bearing_alpha_max",
     )
-    for field_name in panovggt_fields:
+    for field_name in model_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
     return config
 

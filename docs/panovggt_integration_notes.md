@@ -1,73 +1,74 @@
-# PanoVGGT Integration Notes
+# PanoVGGT 集成说明
 
 ## Efficient-VLN
 
-- Efficient-VLN uses StreamVGGT as a streaming 3D geometry encoder on top of Qwen2.5-VL.
-- The useful signal is StreamVGGT's 3D geometry latent tokens, not a rendered depth map.
-- The paper maps these geometry latent tokens through a 2-layer MLP so their channel dimension matches the Qwen visual representation.
-- Fusion is residual and simple: the aligned geometry representation is added element-wise to the 2D visual representation before the LLM consumes it.
-- This is the pattern used for the current implementation: geometry latent tokens -> MLP -> weighted residual addition.
+- Efficient-VLN 在 Qwen2.5-VL 之上使用 StreamVGGT 作为流式 3D 几何编码器。
+- 真正有用的信号是 StreamVGGT 的 3D geometry latent tokens，而不是渲染出来的 depth map。
+- 论文把这些几何 latent tokens 通过 2 层 MLP 映射到与 Qwen visual representation 一致的通道维度。
+- 融合方式很简单：对齐后的 geometry representation 在进入 LLM 前，按元素加到 2D visual representation 上。
+- 当前实现沿用这个模式：`geometry latent tokens -> MLP -> weighted residual addition`。
 
-Source: https://arxiv.org/pdf/2512.10310
+来源：https://arxiv.org/pdf/2512.10310
 
 ## JanusVLN
 
-- JanusVLN uses VGGT as a spatial geometry encoder alongside Qwen2.5-VL's visual semantic encoder.
-- The relevant feature for this integration is the VGGT encoder / fusion latent representation, not explicit depth, point cloud, or camera-pose losses.
-- JanusVLN's dual implicit memory stores spatial-geometry and visual-semantic KV caches with initial and sliding windows.
-- That memory design is intentionally not copied in this v1 integration. It would require cross-step state, cache reset semantics, sequence-aware training, and more invasive generation/evaluation changes.
-- The current VLN code already feeds Qwen historical panoramic observations. PanoVGGT is therefore used only as a current-frame geometry enhancer.
+- JanusVLN 使用 VGGT 作为空间几何编码器，与 Qwen2.5-VL 的视觉语义编码器并行。
+- 对当前集成最相关的是 VGGT encoder / fusion latent representation，而不是显式 depth、point cloud 或 camera-pose loss。
+- JanusVLN 的 dual implicit memory 会保存 spatial-geometry 和 visual-semantic 两类 KV cache，并使用 initial window 和 sliding window。
+- 当前 v1 集成不复制这套 memory 设计。它需要跨 step 状态、cache reset 语义、序列化训练，以及更侵入式的 generation/evaluation 改动。
+- 当前 VLN 代码已经把历史 panoramic observations 喂给 Qwen，所以 PanoVGGT 只作为 current-frame geometry enhancer 使用。
 
-Sources:
+来源：
+
 - https://openreview.net/forum?id=RnuB0Nlbd5
 - `/workspace/library/JanusVLN`
 
-## PanoVGGT Local Findings
+## PanoVGGT 本地结论
 
-- Official repository: https://github.com/YijingGuo-June/PanoVGGT
-- Vendored code for this project: `src/panovggt`
-- Local checkpoint: `/workspace/code_dir/a_property/model/PanoVGGT/model.pt`
-- Official preprocessing in `panovggt.utils.basic.load_images_as_tensor` resizes panoramic images to `518 x 1036`, preserving the 2:1 equirectangular aspect ratio.
-- Default config uses `patch_size=14`, `embed_dim=1024`, `num_register_tokens=5`, and aggregator depth `36`.
-- `PanoVGGTModel.aggregator(images)` returns `([output], patch_start_idx, pos_2d)`.
-- For the official input size, the raw patch grid is `37 x 74`, and the returned token count is `5 + 37 * 74 = 2743`.
-- The integration must not hardcode this grid. It should infer patch-grid shape from the input tensor and aggregator metadata, then verify it matches the returned token count.
+- 官方仓库：https://github.com/YijingGuo-June/PanoVGGT
+- 本项目内置代码：`src/panovggt`
+- 本地 checkpoint：`/workspace/code_dir/a_property/model/PanoVGGT/model.pt`
+- 官方预处理 `panovggt.utils.basic.load_images_as_tensor` 会把全景图 resize 到 `518 x 1036`，保持 2:1 equirectangular aspect ratio。
+- 默认配置使用 `patch_size=14`、`embed_dim=1024`、`num_register_tokens=5`，aggregator depth 为 `36`。
+- `PanoVGGTModel.aggregator(images)` 返回 `([output], patch_start_idx, pos_2d)`。
+- 对官方输入尺寸，原始 patch grid 是 `37 x 74`，返回 token 数是 `5 + 37 * 74 = 2743`。
+- 集成时不能硬编码这个 grid。实现应该根据输入 tensor 和 aggregator metadata 推断 patch-grid shape，并校验它与返回 token 数一致。
 
-## Integration Decision
+## 集成决策
 
-- Use PanoVGGT current frame only.
-- Freeze PanoVGGT and train only a small geometry MLP plus a bounded gate.
-- Remove PanoVGGT register tokens, resample the raw PanoVGGT latent grid to the current Qwen merged visual grid, and add the projected residual only to the current image's Qwen visual tokens.
-- Resolve PanoVGGT's roughly 28-pixel geometry scale versus Qwen3.5-VL's roughly 32-pixel merged visual scale by token-space resampling, not by hard pixel-grid alignment.
-- Keep the existing Qwen history-image prompt path unchanged.
-- Keep structural PanoVGGT integration constants in code, not YAML:
+- 只使用 PanoVGGT current frame。
+- 冻结 PanoVGGT，只训练一个小的 geometry MLP 和一个 bounded gate。
+- 去掉 PanoVGGT register tokens，把原始 PanoVGGT latent grid 重采样到当前 Qwen merged visual grid，只把投影后的 residual 加到当前图像的 Qwen visual tokens 上。
+- PanoVGGT 的 geometry scale 约为 28 pixels，Qwen3.5-VL merged visual scale 约为 32 pixels。这里通过 token-space resampling 对齐，而不是硬做 pixel-grid alignment。
+- 保持现有 Qwen history-image prompt path 不变。
+- 结构性 PanoVGGT 集成常量保留在代码里，不放进 YAML：
   - `PANOVGGT_AGGREGATOR_LAYER = -1`
   - `PANOVGGT_CONTEXT_DIM = 2048`
   - `PANOVGGT_MLP_HIDDEN_SIZE = 4096`
-- Keep only clear runtime controls in config: `panovggt_enabled`, `panovggt_checkpoint_path`, `panovggt_alpha_init`, and `panovggt_alpha_max`.
-- The PanoVGGT Python package and official default config are vendored under `src/panovggt`, so no external source path is required when opening this VLN repo.
-- The frozen PanoVGGT encoder is registered as `model.panovggt`, so it is saved inside the final Hugging Face model directory. The trainable geometry adapter is registered separately as `model.panovggt_mlp`.
+- config 里只保留清晰的运行时控制项：`panovggt_enabled`、`panovggt_checkpoint_path`、`panovggt_alpha_init`、`panovggt_alpha_max`。
+- PanoVGGT Python package 和官方默认配置已经内置在 `src/panovggt` 下，所以打开 VLN repo 时不需要额外外部源码路径。
+- 冻结的 PanoVGGT encoder 注册为 `model.panovggt`，因此会保存在最终 Hugging Face model 目录中。可训练的 geometry adapter 单独注册为 `model.panovggt_mlp`。
 
-## Token Alignment
+## Token 对齐
 
-- PanoVGGT and Qwen do not produce the same token grid.
-- PanoVGGT receives the current raw panorama resized to `[3, 518, 1036]`. With the local official config this gives a raw geometry grid of `37 x 74` after removing register tokens, but the implementation still infers this from the returned tensor shape.
-- Qwen receives its normal selected history images plus the cropped/resized current image. Its visual output length is derived from `image_grid_thw` after Qwen's `spatial_merge_size`.
-- At fusion time, the implementation builds the target Qwen merged grid from the actual current image's `image_grid_thw`, samples the PanoVGGT latent grid onto that target grid in ERP latitude/longitude space, projects channels from `2048` to Qwen visual hidden size, and adds the result element-wise.
-- This means a PanoVGGT `37 x 74` grid can be fused into a Qwen target such as `12 x 30` without assuming either model's patch size.
+- PanoVGGT 和 Qwen 产生的 token grid 不一致。
+- PanoVGGT 接收当前 raw panorama，resize 到 `[3, 518, 1036]`。在本地官方配置下，去掉 register tokens 后得到 `37 x 74` 的原始 geometry grid，但实现仍然从返回 tensor shape 动态推断。
+- Qwen 接收正常选择的 history images 加上裁剪和 resize 后的当前图像。它的 visual output length 由 `image_grid_thw` 和 Qwen 的 `spatial_merge_size` 决定。
+- 融合时，实现会从当前图像真实的 `image_grid_thw` 构建目标 Qwen merged grid，在 ERP latitude/longitude 空间把 PanoVGGT latent grid 采样到目标 grid，再把通道从 `2048` 投影到 Qwen visual hidden size，并按元素相加。
+- 因此，PanoVGGT 的 `37 x 74` grid 可以融合到 Qwen 的目标 grid，例如 `12 x 30`，不需要假设两个模型的 patch size 相同。
 
-## Gate And Normalization
+## Gate 与归一化
 
-- PanoVGGT latent tokens and Qwen visual tokens come from different hidden spaces, so the geometry MLP uses RMSNorm before and after the 2-layer MLP.
-- The residual gate is bounded and positive:
+- PanoVGGT latent tokens 和 Qwen visual tokens 来自不同 hidden space，所以 geometry MLP 在 2 层 MLP 前后都使用 RMSNorm。
+- residual gate 是有界且为正的：
 
 ```python
 alpha = alpha_max * sigmoid(raw_alpha)
 ```
 
-- The parameter is still `raw_alpha`; `alpha_init` controls the starting residual weight and `alpha_max` caps the maximum.
-- `raw_alpha` is initialized with the inverse sigmoid of `alpha_init / alpha_max`. This is only to make the actual forward-time value equal the requested initial alpha. For example, with `alpha_init=0.1` and `alpha_max=0.3`, the desired sigmoid value is `1/3`, so `raw_alpha` starts at `logit(1/3)`. If `raw_alpha` were initialized directly to `0.1`, the actual alpha would be `0.3 * sigmoid(0.1)`, about `0.157`, not `0.1`.
-- Current experiment settings:
-  - PanoVGGT: `alpha_init=0.2`, `alpha_max=0.4`
-  - ERP position MLP: `alpha_init=0.005`, `alpha_max=0.05`
-- ERP uses a smaller gate because it is injected near the visual patch embedding and affects the full vision tower. PanoVGGT is injected after Qwen visual encoding, so its residual can be larger.
+- 参数名仍然是 `raw_alpha`；`alpha_init` 控制初始 residual weight，`alpha_max` 控制最大值。
+- `raw_alpha` 使用 `alpha_init / alpha_max` 的 inverse sigmoid 初始化。这样做只是为了让 forward 时的实际值等于请求的初始 alpha。例如 `alpha_init=0.1`、`alpha_max=0.3` 时，目标 sigmoid 值是 `1/3`，所以 `raw_alpha` 初始化为 `logit(1/3)`。如果直接把 `raw_alpha` 初始化为 `0.1`，实际 alpha 会变成 `0.3 * sigmoid(0.1)`，约为 `0.157`，并不是 `0.1`。
+- 当前实验设置：
+  - PanoVGGT：`alpha_init=0.2`，`alpha_max=0.4`
+  - ERP position MLP：`alpha_init=0.005`，`alpha_max=0.05`
+- ERP 使用更小的 gate，因为它注入在 visual patch embedding 附近，会影响完整 vision tower。PanoVGGT 注入在 Qwen visual encoding 之后，所以 residual 可以更大。

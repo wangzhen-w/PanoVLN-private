@@ -56,7 +56,7 @@ ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
 STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
 ACTION_SEQUENCE_LENGTH = 4
-REPLAN_ACTION_COUNT_WITHOUT_STOP = 2
+REPLAN_ACTION_COUNT_WITHOUT_STOP = 4
 ATOMIC_ACTION_VARIANTS = {
     "stop": ("stop",),
     "forward": ("forward", "move_forward", "move forward", "move-forward"),

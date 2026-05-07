@@ -1,8 +1,8 @@
-# EBS: Event-Balanced Sampling
+# EBS：事件均衡采样
 
 ## 目标
 
-当前训练数据构造默认且唯一使用 **EBS: Event-Balanced Sampling**。EBS 保留 probability-skip 实验中表现最好的采样行为，但把方法表述为基于 VLN 动作语义的 event/background 采样，而不是手写 7 个 bucket 的目标比例。
+当前训练数据构造默认且唯一使用 **EBS：Event-Balanced Sampling，事件均衡采样**。EBS 保留 probability-skip 实验中表现最好的采样行为，但把方法表述为基于 VLN 动作语义的 event/background 采样，而不是手写 7 个 bucket 的目标比例。
 
 当前实验结论：
 
@@ -22,13 +22,13 @@ event: left, right
 background: forward
 ```
 
-直观上：
+直观理解：
 
-- `forward` 是高频背景动作，连续纯 forward chunk 信息密度低。
-- `left/right` 是路径决策事件，应该比纯 forward chunk 更高概率保留。
+- `forward` 是高频背景动作，连续纯 forward chunk 的信息密度低。
+- `left/right` 是路径决策事件，应该比纯 forward chunk 有更高概率被保留。
 - `stop` 是任务完成信号，通过 terminal coverage 单独保证。
 
-## Terminal Coverage
+## 终止覆盖
 
 每条 episode 的最后 4 个起点固定保留：
 
@@ -45,7 +45,7 @@ S -> S S S S
 
 `real_action_count` 保留 padding 前的真实动作数。保留最后 4 个 terminal start 的原因是 online 测试时如果模型输出 action sequence 包含 `stop`，会执行完整 sequence；dense terminal coverage 能覆盖不同剩余 horizon 下的完成动作。
 
-## Terminal Buffer
+## 终止缓冲
 
 body 区域不扫描紧邻 terminal dense 前的 3 个 overlap 起点：
 
@@ -62,7 +62,7 @@ s < body_stop
 
 这样可以避免采到 `T-7, T-6, T-5, T-4` 这一类 near-goal non-stop chunk。它们离完成点很近，但标签仍然不是 `stop`，会削弱模型学习 stop 的信号。
 
-## Body Sampling
+## 主体区间采样
 
 设 action horizon：
 
@@ -100,7 +100,7 @@ seed = 42
 tail_dense = 4
 ```
 
-接受后跳过 4 个 step，减少高度重叠的 body chunk；拒绝后只移动 1 个 step，避免漏掉后续事件 chunk：
+接受后跳过 4 个 step，减少高度重叠的 body chunk；拒绝后只移动 1 个 step，避免漏掉后续 event chunk：
 
 ```text
 s = 0
@@ -125,7 +125,7 @@ while s < body_stop:
 
 关键比例：
 
-| dataset | rows | r2r % | stop % | FFFF % | turn % | first-F % | first-L % | first-R % | stop@1 % | stop@2 % | stop@3 % | stop@4 % |
+| 数据集 | 行数 | r2r % | stop % | FFFF % | turn % | first-F % | first-L % | first-R % | stop@1 % | stop@2 % | stop@3 % | stop@4 % |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | subset_v2 | 355100 | 28.26 | 22.00 | 12.56 | 65.44 | 33.00 | 22.50 | 22.50 | 8.00 | 8.00 | 3.00 | 3.00 |
 | probskip | 495081 | 27.50 | 22.95 | 3.72 | 73.33 | 45.86 | 15.90 | 15.28 | 5.74 | 5.74 | 5.74 | 5.74 |
