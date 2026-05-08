@@ -27,7 +27,7 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "panovggt_mlp": True,
-    "action_bearing_residual": True,
+    "action_bearing_kv": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,7 +74,7 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
-        "action_bearing_residual": getattr(model, "action_bearing_residual", None),
+        "action_bearing_kv": getattr(model, "action_bearing_kv", None),
         "language_model": language_model,
     }
 
@@ -108,8 +108,10 @@ def _load_model_config(cfg):
         "panovggt_alpha_init",
         "panovggt_alpha_max",
         "action_bearing_enabled",
-        "action_bearing_alpha_init",
-        "action_bearing_alpha_max",
+        "action_bearing_key_alpha_init",
+        "action_bearing_key_alpha_max",
+        "action_bearing_value_alpha_init",
+        "action_bearing_value_alpha_max",
     )
     for field_name in model_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))

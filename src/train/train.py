@@ -28,7 +28,8 @@ RANK = int(os.environ.get("RANK", "0"))
 class PanoVLNTrainer(Trainer):
     RAW_ALPHA_NO_DECAY_SUFFIXES = (
         "panovggt_mlp.raw_alpha",
-        "action_bearing_residual.raw_alpha",
+        "action_bearing_kv.raw_key_alpha",
+        "action_bearing_kv.raw_value_alpha",
     )
 
     def get_decay_parameter_names(self, model):
@@ -66,8 +67,10 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_alpha_init: {_config_value(cfg.model.panovggt_alpha_init)}")
     rank0_print(RANK, f"panovggt_alpha_max: {_config_value(cfg.model.panovggt_alpha_max)}")
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
-    rank0_print(RANK, f"action_bearing_alpha_init: {_config_value(cfg.model.action_bearing_alpha_init)}")
-    rank0_print(RANK, f"action_bearing_alpha_max: {_config_value(cfg.model.action_bearing_alpha_max)}")
+    rank0_print(RANK, f"action_bearing_key_alpha_init: {_config_value(cfg.model.action_bearing_key_alpha_init)}")
+    rank0_print(RANK, f"action_bearing_key_alpha_max: {_config_value(cfg.model.action_bearing_key_alpha_max)}")
+    rank0_print(RANK, f"action_bearing_value_alpha_init: {_config_value(cfg.model.action_bearing_value_alpha_init)}")
+    rank0_print(RANK, f"action_bearing_value_alpha_max: {_config_value(cfg.model.action_bearing_value_alpha_max)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")

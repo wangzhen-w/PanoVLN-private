@@ -19,8 +19,10 @@ class ModelConfig:
     panovggt_alpha_init: float = 0.1
     panovggt_alpha_max: float = 0.2
     action_bearing_enabled: bool = True
-    action_bearing_alpha_init: float = 0.02
-    action_bearing_alpha_max: float = 0.1
+    action_bearing_key_alpha_init: float = 0.02
+    action_bearing_key_alpha_max: float = 0.05
+    action_bearing_value_alpha_init: float = 0.05
+    action_bearing_value_alpha_max: float = 0.1
 
 
 @dataclass

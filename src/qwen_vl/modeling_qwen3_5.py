@@ -7,7 +7,12 @@ from types import MethodType
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    ALL_ATTENTION_FUNCTIONS,
+    Qwen3_5ForConditionalGeneration,
+    apply_rotary_pos_emb,
+    eager_attention_forward,
+)
 
 
 PANOVGGT_AGGREGATOR_LAYER = -1
@@ -369,8 +374,10 @@ def ensure_action_bearing_config(config) -> None:
     output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
     defaults = {
         "action_bearing_enabled": True,
-        "action_bearing_alpha_init": 0.02,
-        "action_bearing_alpha_max": 0.1,
+        "action_bearing_key_alpha_init": 0.02,
+        "action_bearing_key_alpha_max": 0.05,
+        "action_bearing_value_alpha_init": 0.05,
+        "action_bearing_value_alpha_max": 0.1,
         "action_bearing_output_dim": output_dim,
     }
     for field_name, default_value in defaults.items():
@@ -378,7 +385,7 @@ def ensure_action_bearing_config(config) -> None:
             setattr(config, field_name, default_value)
 
 
-class ActionBearingResidual(nn.Module):
+class ActionBearingKV(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         ensure_action_bearing_config(config)
@@ -386,8 +393,10 @@ class ActionBearingResidual(nn.Module):
         self.enabled = bool(getattr(config, "action_bearing_enabled", True))
         self.output_dim = int(getattr(config, "action_bearing_output_dim", config.text_config.hidden_size))
         self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
-        self.alpha_init = float(getattr(config, "action_bearing_alpha_init", 0.02))
-        self.alpha_max = float(getattr(config, "action_bearing_alpha_max", 0.1))
+        self.key_alpha_init = float(getattr(config, "action_bearing_key_alpha_init", 0.02))
+        self.key_alpha_max = float(getattr(config, "action_bearing_key_alpha_max", 0.05))
+        self.value_alpha_init = float(getattr(config, "action_bearing_value_alpha_init", 0.05))
+        self.value_alpha_max = float(getattr(config, "action_bearing_value_alpha_max", 0.1))
         self.turn_angle_deg = ACTION_BEARING_TURN_ANGLE_DEG
         self.max_steps = ACTION_BEARING_MAX_STEPS
         self.sigma_steps = ACTION_BEARING_SIGMA_STEPS
@@ -408,18 +417,23 @@ class ActionBearingResidual(nn.Module):
             )
         self.bin_embeddings = nn.Parameter(torch.empty(self.num_bins, self.output_dim))
         self.input_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.mlp = nn.Sequential(
+        self.adapter = nn.Sequential(
             nn.Linear(self.output_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.output_dim),
         )
         self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+        self.raw_key_alpha = nn.Parameter(_bounded_raw_alpha(self.key_alpha_init, self.key_alpha_max))
+        self.raw_value_alpha = nn.Parameter(_bounded_raw_alpha(self.value_alpha_init, self.value_alpha_max))
         self.reset_parameters(float(getattr(config.vision_config, "initializer_range", 0.02)))
 
     @property
-    def alpha(self) -> torch.Tensor:
-        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
+    def key_alpha(self) -> torch.Tensor:
+        return float(self.key_alpha_max) * torch.sigmoid(self.raw_key_alpha)
+
+    @property
+    def value_alpha(self) -> torch.Tensor:
+        return float(self.value_alpha_max) * torch.sigmoid(self.raw_value_alpha)
 
     @property
     def turn_angle_radians(self) -> float:
@@ -429,13 +443,14 @@ class ActionBearingResidual(nn.Module):
         nn.init.normal_(self.bin_embeddings, mean=0.0, std=float(init_std))
         self.input_norm.reset_parameters()
         self.output_norm.reset_parameters()
-        for module in self.mlp:
+        for module in self.adapter:
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=float(init_std))
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         with torch.no_grad():
-            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+            self.raw_key_alpha.copy_(_bounded_raw_alpha(self.key_alpha_init, self.key_alpha_max))
+            self.raw_value_alpha.copy_(_bounded_raw_alpha(self.value_alpha_init, self.value_alpha_max))
 
     def initialize_bin_embeddings_from_text(self, input_embeddings: nn.Embedding | None) -> bool:
         if input_embeddings is None or not hasattr(input_embeddings, "weight"):
@@ -495,7 +510,7 @@ class ActionBearingResidual(nn.Module):
         num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
         if num_frames != 1:
             raise AssertionError(
-                "Action-Bearing residual expects a single current panorama per Qwen image, "
+                "Action-Bearing KV expects a single current panorama per Qwen image, "
                 f"got image_grid_thw={grid_thw}"
             )
         target_h = max(1, grid_h // self.spatial_merge_size)
@@ -509,21 +524,26 @@ class ActionBearingResidual(nn.Module):
             )
         return target_h, target_w
 
-    def forward(self, image_tokens: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
-        if not self.enabled or image_tokens.numel() == 0:
-            return image_tokens
-
+    def build_image_hidden(
+        self,
+        grid_thw: torch.Tensor,
+        target_len: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if not self.enabled or int(target_len) <= 0:
+            return torch.empty((0, self.output_dim), device=device, dtype=dtype)
         target_h, target_w = self._target_grid_hw(
             grid_thw.detach().to(device="cpu", dtype=torch.long).tolist(),
-            target_len=int(image_tokens.shape[0]),
+            target_len=int(target_len),
         )
-        param = self.bin_embeddings
-        yaw = self._build_grid_yaw(target_h, target_w, device=param.device).expand(target_h, target_w)
-        scores = self.compute_soft_action_scores(yaw.reshape(-1)).to(dtype=param.dtype)
+        yaw = self._build_grid_yaw(target_h, target_w, device=device).expand(target_h, target_w)
+        scores = self.compute_soft_action_scores(yaw.reshape(-1)).to(dtype=self.bin_embeddings.dtype)
         action_prior = scores @ self.bin_embeddings
-        delta = self.output_norm(self.mlp(self.input_norm(action_prior)))
-        delta = self.alpha.to(dtype=delta.dtype) * delta
-        return image_tokens + delta.to(device=image_tokens.device, dtype=image_tokens.dtype)
+        base = self.input_norm(action_prior)
+        hidden = self.output_norm(base + self.adapter(base))
+        return hidden.to(device=device, dtype=dtype)
 
 
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
@@ -541,7 +561,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.output_norm.weight",
     )
     ACTION_BEARING_STATE_KEYS = (
-        "action_bearing_residual.bin_embeddings",
+        "action_bearing_kv.bin_embeddings",
+        "action_bearing_kv.raw_key_alpha",
+        "action_bearing_kv.raw_value_alpha",
     )
 
     def __init__(self, config):
@@ -552,8 +574,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ensure_panovggt_config(config)
         ensure_action_bearing_config(config)
         self.panovggt_mlp = PanoVGGTGeometryMLP(config)
-        self.action_bearing_residual = ActionBearingResidual(config)
-        self.action_bearing_residual.initialize_bin_embeddings_from_text(self.get_input_embeddings())
+        self.action_bearing_kv = ActionBearingKV(config)
+        self.action_bearing_kv.initialize_bin_embeddings_from_text(self.get_input_embeddings())
         self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
@@ -564,6 +586,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
         self._install_image_feature_hook()
+        self._install_action_bearing_kv_hook()
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
     def _install_image_feature_hook(self) -> None:
@@ -640,17 +663,96 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                             )
                         image_embeds[image_index] = image_embeds[image_index] + delta
 
-            if owner.action_bearing_residual.enabled:
-                for _, image_index in current_items:
-                    image_embeds[image_index] = owner.action_bearing_residual(
-                        image_embeds[image_index],
-                        image_grid_thw[image_index],
-                    )
-
             vision_output.pooler_output = tuple(image_embeds)
             return vision_output
 
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
+
+    def _install_action_bearing_kv_hook(self) -> None:
+        language_model = getattr(self.model, "language_model", None)
+        layers = getattr(language_model, "layers", None)
+        if layers is None:
+            return
+
+        owner = self
+        for decoder_layer in layers:
+            attention = getattr(decoder_layer, "self_attn", None)
+            if attention is None or hasattr(attention, "_pano_origin_forward"):
+                continue
+
+            attention._pano_origin_forward = attention.forward
+
+            def forward_with_action_bearing_kv(
+                this,
+                hidden_states: torch.Tensor,
+                position_embeddings: tuple[torch.Tensor, torch.Tensor],
+                attention_mask: torch.Tensor | None,
+                past_key_values=None,
+                **kwargs,
+            ):
+                action_hidden = kwargs.pop("action_bearing_hidden", None)
+                action_batch_indices = kwargs.pop("action_bearing_batch_indices", None)
+                action_token_indices = kwargs.pop("action_bearing_token_indices", None)
+
+                input_shape = hidden_states.shape[:-1]
+                hidden_shape = (*input_shape, -1, this.head_dim)
+
+                query_states, gate = torch.chunk(
+                    this.q_proj(hidden_states).view(*input_shape, -1, this.head_dim * 2),
+                    2,
+                    dim=-1,
+                )
+                gate = gate.reshape(*input_shape, -1)
+
+                query_states = this.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+                key_states = this.k_norm(this.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+                value_states = this.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+                if (
+                    owner.action_bearing_kv.enabled
+                    and action_hidden is not None
+                    and action_batch_indices is not None
+                    and action_token_indices is not None
+                    and action_hidden.numel() > 0
+                ):
+                    key_states, value_states = owner._apply_action_bearing_to_kv(
+                        attention_module=this,
+                        key_states=key_states,
+                        value_states=value_states,
+                        action_hidden=action_hidden,
+                        action_batch_indices=action_batch_indices,
+                        action_token_indices=action_token_indices,
+                    )
+
+                cos, sin = position_embeddings
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+                if past_key_values is not None:
+                    key_states, value_states = past_key_values.update(key_states, value_states, this.layer_idx)
+
+                attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                    this.config._attn_implementation,
+                    eager_attention_forward,
+                )
+
+                attn_output, attn_weights = attention_interface(
+                    this,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    dropout=0.0 if not this.training else this.attention_dropout,
+                    scaling=this.scaling,
+                    **kwargs,
+                )
+
+                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+                attn_output = attn_output * torch.sigmoid(gate)
+
+                attn_output = this.o_proj(attn_output)
+                return attn_output, attn_weights
+
+            attention.forward = MethodType(forward_with_action_bearing_kv, attention)
 
     def _set_runtime_pano_context(
         self,
@@ -841,6 +943,176 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if bool(valid[batch_index].item())
         ]
 
+    def _build_action_bearing_context(
+        self,
+        input_ids: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        if (
+            not self.action_bearing_kv.enabled
+            or input_ids is None
+            or image_grid_thw is None
+            or image_grid_thw.numel() == 0
+        ):
+            return {}
+
+        if input_ids.ndim != 2:
+            raise AssertionError(f"Expected input_ids shape [B, L], got {tuple(input_ids.shape)}")
+
+        input_device = input_ids.device
+        image_token_id = int(self.config.image_token_id)
+        if not bool(torch.any(input_ids == image_token_id).item()):
+            return {}
+
+        image_grid_thw = image_grid_thw.to(device=input_device, dtype=torch.long)
+        num_images = int(image_grid_thw.shape[0])
+        split_sizes = (image_grid_thw.prod(-1) // self.model.visual.spatial_merge_size**2).to(
+            device=input_device,
+            dtype=torch.long,
+        )
+
+        image_num_images = self._pano_runtime_image_num_images
+        if image_num_images is None:
+            batch_size = int(input_ids.shape[0])
+            if batch_size == 1:
+                image_num_images = torch.tensor([num_images], device=input_device, dtype=torch.long)
+            elif num_images == batch_size:
+                image_num_images = torch.ones(batch_size, device=input_device, dtype=torch.long)
+            else:
+                raise AssertionError(
+                    "image_num_images is required for batched multi-image action-bearing KV inputs: "
+                    f"input_batch={batch_size}, image_grid_rows={num_images}"
+                )
+        else:
+            image_num_images = image_num_images.to(device=input_device, dtype=torch.long)
+        if int(image_num_images.shape[0]) != int(input_ids.shape[0]):
+            raise AssertionError(
+                "image_num_images batch size does not match input_ids for action-bearing KV: "
+                f"counts_batch={int(image_num_images.shape[0])}, input_batch={int(input_ids.shape[0])}"
+            )
+        if int(image_num_images.sum().item()) != num_images:
+            raise AssertionError(
+                "image_num_images does not sum to image_grid_thw rows: "
+                f"counts={image_num_images.tolist()}, grids={num_images}"
+            )
+
+        image_current_index = self._pano_runtime_image_current_index
+        if image_current_index is None:
+            image_current_index = image_num_images - 1
+        else:
+            image_current_index = image_current_index.to(device=input_device, dtype=torch.long)
+
+        offsets = image_num_images.cumsum(0) - image_num_images
+        action_hidden_chunks = []
+        batch_index_chunks = []
+        token_index_chunks = []
+        param = self.action_bearing_kv.bin_embeddings
+
+        for batch_index in range(int(input_ids.shape[0])):
+            image_count = int(image_num_images[batch_index].item())
+            if image_count <= 0:
+                continue
+            current_index = int(image_current_index[batch_index].item())
+            if current_index < 0 or current_index >= image_count:
+                raise AssertionError(
+                    "image_current_index is out of range for at least one sample: "
+                    f"indices={image_current_index.tolist()}, counts={image_num_images.tolist()}"
+                )
+
+            image_offset = int(offsets[batch_index].item())
+            sample_lengths = split_sizes[image_offset:image_offset + image_count]
+            image_token_positions = torch.nonzero(
+                input_ids[batch_index] == image_token_id,
+                as_tuple=False,
+            ).flatten()
+            expected_tokens = int(sample_lengths.sum().item())
+            if int(image_token_positions.numel()) != expected_tokens:
+                raise AssertionError(
+                    "Image placeholder count does not match image_grid_thw for action-bearing KV: "
+                    f"batch={batch_index}, placeholders={int(image_token_positions.numel())}, "
+                    f"expected={expected_tokens}"
+                )
+
+            current_token_start = int(sample_lengths[:current_index].sum().item())
+            current_token_len = int(sample_lengths[current_index].item())
+            current_positions = image_token_positions[current_token_start:current_token_start + current_token_len]
+            if int(current_positions.numel()) != current_token_len:
+                raise AssertionError(
+                    "Current image token span is shorter than expected for action-bearing KV: "
+                    f"batch={batch_index}, span={int(current_positions.numel())}, expected={current_token_len}"
+                )
+
+            flat_image_index = image_offset + current_index
+            action_hidden = self.action_bearing_kv.build_image_hidden(
+                image_grid_thw[flat_image_index],
+                target_len=current_token_len,
+                device=param.device,
+                dtype=param.dtype,
+            )
+            action_hidden_chunks.append(action_hidden)
+            batch_index_chunks.append(
+                torch.full(
+                    (current_token_len,),
+                    batch_index,
+                    device=input_device,
+                    dtype=torch.long,
+                )
+            )
+            token_index_chunks.append(current_positions.to(device=input_device, dtype=torch.long))
+
+        if not action_hidden_chunks:
+            return {}
+
+        return {
+            "action_bearing_hidden": torch.cat(action_hidden_chunks, dim=0),
+            "action_bearing_batch_indices": torch.cat(batch_index_chunks, dim=0),
+            "action_bearing_token_indices": torch.cat(token_index_chunks, dim=0),
+        }
+
+    def _apply_action_bearing_to_kv(
+        self,
+        *,
+        attention_module: nn.Module,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        action_hidden: torch.Tensor,
+        action_batch_indices: torch.Tensor,
+        action_token_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len = int(key_states.shape[2])
+        action_batch_indices = action_batch_indices.to(device=key_states.device, dtype=torch.long)
+        action_token_indices = action_token_indices.to(device=key_states.device, dtype=torch.long)
+        valid = (
+            (action_batch_indices >= 0)
+            & (action_batch_indices < int(key_states.shape[0]))
+            & (action_token_indices >= 0)
+            & (action_token_indices < seq_len)
+        )
+        if not bool(torch.all(valid).item()):
+            action_batch_indices = action_batch_indices[valid]
+            action_token_indices = action_token_indices[valid]
+            action_hidden = action_hidden[valid.to(device=action_hidden.device)]
+        if int(action_token_indices.numel()) == 0:
+            return key_states, value_states
+
+        action_hidden = action_hidden.to(device=key_states.device, dtype=key_states.dtype)
+        selected_count = int(action_hidden.shape[0])
+        key_delta = attention_module.k_norm(
+            attention_module.k_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
+        )
+        value_delta = attention_module.v_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
+
+        key_delta = key_delta.to(dtype=key_states.dtype)
+        value_delta = value_delta.to(dtype=value_states.dtype)
+        full_key_delta = torch.zeros_like(key_states)
+        full_value_delta = torch.zeros_like(value_states)
+        full_key_delta[action_batch_indices, :, action_token_indices, :] = key_delta
+        full_value_delta[action_batch_indices, :, action_token_indices, :] = value_delta
+
+        key_alpha = self.action_bearing_kv.key_alpha.to(device=key_states.device, dtype=key_states.dtype)
+        value_alpha = self.action_bearing_kv.value_alpha.to(device=value_states.device, dtype=value_states.dtype)
+        return key_states + key_alpha * full_key_delta, value_states + value_alpha * full_value_delta
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -868,6 +1140,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             image_erp_geometry=image_erp_geometry,
             panovggt_pixel_values=panovggt_pixel_values,
         )
+        action_bearing_context = self._build_action_bearing_context(input_ids, image_grid_thw)
         try:
             return super().forward(
                 input_ids=input_ids,
@@ -882,6 +1155,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 video_grid_thw=video_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
                 logits_to_keep=logits_to_keep,
+                **action_bearing_context,
                 **kwargs,
             )
         finally:
@@ -959,11 +1233,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if not loaded_saved_panovggt and model.panovggt is None:
                 model._load_external_panovggt_weights()
         has_action_bearing_weights = cls._checkpoint_has_action_bearing_weights(pretrained_model_name_or_path)
-        if model.action_bearing_residual.enabled and has_action_bearing_weights is not True:
-            model.action_bearing_residual.reset_parameters(
+        if model.action_bearing_kv.enabled and has_action_bearing_weights is not True:
+            model.action_bearing_kv.reset_parameters(
                 float(getattr(model.config.vision_config, "initializer_range", 0.02))
             )
-            model.action_bearing_residual.initialize_bin_embeddings_from_text(model.get_input_embeddings())
+            model.action_bearing_kv.initialize_bin_embeddings_from_text(model.get_input_embeddings())
         return model
 
     def prepare_inputs_for_generation(
