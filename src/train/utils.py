@@ -86,6 +86,13 @@ def set_model(cfg, model):
         for _, param in module.named_parameters():
             param.requires_grad = True
 
+    action_bearing_kv = named_modules.get("action_bearing_kv")
+    if action_bearing_kv is not None:
+        if float(getattr(action_bearing_kv, "key_alpha_max", 0.0)) <= 0.0:
+            action_bearing_kv.raw_key_alpha.requires_grad = False
+        if float(getattr(action_bearing_kv, "value_alpha_max", 0.0)) <= 0.0:
+            action_bearing_kv.raw_value_alpha.requires_grad = False
+
     if trainable_modules.get("language_model"):
         if hasattr(model, "lm_head"):
             for _, param in model.lm_head.named_parameters():

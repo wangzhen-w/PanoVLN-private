@@ -55,7 +55,7 @@ def _bounded_raw_alpha(alpha_init: float, alpha_max: float) -> torch.Tensor:
     alpha_max = float(alpha_max)
     alpha_init = float(alpha_init)
     if alpha_max <= 0.0:
-        raise ValueError(f"alpha_max must be positive, got {alpha_max}")
+        return torch.tensor(0.0, dtype=torch.float32)
     alpha_init = min(max(alpha_init, 1e-6), alpha_max * (1.0 - 1e-6))
     return torch.tensor(_inverse_sigmoid(alpha_init / alpha_max), dtype=torch.float32)
 
@@ -374,10 +374,10 @@ def ensure_action_bearing_config(config) -> None:
     output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
     defaults = {
         "action_bearing_enabled": True,
-        "action_bearing_key_alpha_init": 0.02,
-        "action_bearing_key_alpha_max": 0.05,
-        "action_bearing_value_alpha_init": 0.05,
-        "action_bearing_value_alpha_max": 0.1,
+        "action_bearing_key_alpha_init": 0.0,
+        "action_bearing_key_alpha_max": 0.0,
+        "action_bearing_value_alpha_init": 0.03,
+        "action_bearing_value_alpha_max": 0.06,
         "action_bearing_output_dim": output_dim,
     }
     for field_name, default_value in defaults.items():
@@ -539,10 +539,16 @@ class ActionBearingKV(nn.Module):
             target_len=int(target_len),
         )
         yaw = self._build_grid_yaw(target_h, target_w, device=device).expand(target_h, target_w)
-        scores = self.compute_soft_action_scores(yaw.reshape(-1)).to(dtype=self.bin_embeddings.dtype)
+        yaw_flat = yaw.reshape(-1)
+        within_action_horizon = yaw_flat.abs() <= (
+            float(self.max_steps) * float(self.turn_angle_radians) + 1e-6
+        )
+        scores = self.compute_soft_action_scores(yaw_flat).to(dtype=self.bin_embeddings.dtype)
+        scores = scores * within_action_horizon.to(dtype=scores.dtype).unsqueeze(-1)
         action_prior = scores @ self.bin_embeddings
         base = self.input_norm(action_prior)
-        hidden = self.output_norm(base + self.adapter(base))
+        hidden = self.output_norm(self.adapter(base))
+        hidden = hidden * within_action_horizon.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
         return hidden.to(device=device, dtype=dtype)
 
 
@@ -1095,23 +1101,33 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if int(action_token_indices.numel()) == 0:
             return key_states, value_states
 
+        use_key_delta = float(self.action_bearing_kv.key_alpha_max) > 0.0
+        use_value_delta = float(self.action_bearing_kv.value_alpha_max) > 0.0
+        if not use_key_delta and not use_value_delta:
+            return key_states, value_states
+
         action_hidden = action_hidden.to(device=key_states.device, dtype=key_states.dtype)
         selected_count = int(action_hidden.shape[0])
-        key_delta = attention_module.k_norm(
-            attention_module.k_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
-        )
-        value_delta = attention_module.v_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
 
-        key_delta = key_delta.to(dtype=key_states.dtype)
-        value_delta = value_delta.to(dtype=value_states.dtype)
-        full_key_delta = torch.zeros_like(key_states)
-        full_value_delta = torch.zeros_like(value_states)
-        full_key_delta[action_batch_indices, :, action_token_indices, :] = key_delta
-        full_value_delta[action_batch_indices, :, action_token_indices, :] = value_delta
+        if use_key_delta:
+            key_delta = attention_module.k_norm(
+                attention_module.k_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
+            )
+            key_delta = key_delta.to(dtype=key_states.dtype)
+            full_key_delta = torch.zeros_like(key_states)
+            full_key_delta[action_batch_indices, :, action_token_indices, :] = key_delta
+            key_alpha = self.action_bearing_kv.key_alpha.to(device=key_states.device, dtype=key_states.dtype)
+            key_states = key_states + key_alpha * full_key_delta
 
-        key_alpha = self.action_bearing_kv.key_alpha.to(device=key_states.device, dtype=key_states.dtype)
-        value_alpha = self.action_bearing_kv.value_alpha.to(device=value_states.device, dtype=value_states.dtype)
-        return key_states + key_alpha * full_key_delta, value_states + value_alpha * full_value_delta
+        if use_value_delta:
+            value_delta = attention_module.v_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
+            value_delta = value_delta.to(dtype=value_states.dtype)
+            full_value_delta = torch.zeros_like(value_states)
+            full_value_delta[action_batch_indices, :, action_token_indices, :] = value_delta
+            value_alpha = self.action_bearing_kv.value_alpha.to(device=value_states.device, dtype=value_states.dtype)
+            value_states = value_states + value_alpha * full_value_delta
+
+        return key_states, value_states
 
     def forward(
         self,
