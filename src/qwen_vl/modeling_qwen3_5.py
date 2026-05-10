@@ -374,10 +374,11 @@ def ensure_action_bearing_config(config) -> None:
     output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
     defaults = {
         "action_bearing_enabled": True,
-        "action_bearing_key_alpha_init": 0.0,
-        "action_bearing_key_alpha_max": 0.0,
-        "action_bearing_value_alpha_init": 0.03,
-        "action_bearing_value_alpha_max": 0.06,
+        "action_bearing_key_alpha_init": 0.02,
+        "action_bearing_key_alpha_max": 0.05,
+        "action_bearing_value_alpha_init": 0.05,
+        "action_bearing_value_alpha_max": 0.1,
+        "action_bearing_inject_layers": 16,
         "action_bearing_output_dim": output_dim,
     }
     for field_name, default_value in defaults.items():
@@ -397,6 +398,7 @@ class ActionBearingKV(nn.Module):
         self.key_alpha_max = float(getattr(config, "action_bearing_key_alpha_max", 0.05))
         self.value_alpha_init = float(getattr(config, "action_bearing_value_alpha_init", 0.05))
         self.value_alpha_max = float(getattr(config, "action_bearing_value_alpha_max", 0.1))
+        self.inject_layers = int(getattr(config, "action_bearing_inject_layers", 16))
         self.turn_angle_deg = ACTION_BEARING_TURN_ANGLE_DEG
         self.max_steps = ACTION_BEARING_MAX_STEPS
         self.sigma_steps = ACTION_BEARING_SIGMA_STEPS
@@ -408,6 +410,8 @@ class ActionBearingKV(nn.Module):
             raise ValueError(f"action_bearing_max_steps must be >= 1, got {self.max_steps}")
         if self.sigma_steps <= 0.0:
             raise ValueError(f"action_bearing_sigma_steps must be positive, got {self.sigma_steps}")
+        if self.inject_layers < 0:
+            raise ValueError(f"action_bearing_inject_layers must be >= 0, got {self.inject_layers}")
 
         self.num_bins = 2 * self.max_steps + 1
         if len(ACTION_BEARING_BIN_TOKEN_IDS) != self.num_bins:
@@ -438,6 +442,13 @@ class ActionBearingKV(nn.Module):
     @property
     def turn_angle_radians(self) -> float:
         return math.radians(self.turn_angle_deg)
+
+    def should_inject_layer(self, layer_idx: int | None) -> bool:
+        if not self.enabled or self.inject_layers <= 0:
+            return False
+        if layer_idx is None:
+            return False
+        return int(layer_idx) < self.inject_layers
 
     def reset_parameters(self, init_std: float = 0.02) -> None:
         nn.init.normal_(self.bin_embeddings, mean=0.0, std=float(init_std))
@@ -540,15 +551,10 @@ class ActionBearingKV(nn.Module):
         )
         yaw = self._build_grid_yaw(target_h, target_w, device=device).expand(target_h, target_w)
         yaw_flat = yaw.reshape(-1)
-        within_action_horizon = yaw_flat.abs() <= (
-            float(self.max_steps) * float(self.turn_angle_radians) + 1e-6
-        )
         scores = self.compute_soft_action_scores(yaw_flat).to(dtype=self.bin_embeddings.dtype)
-        scores = scores * within_action_horizon.to(dtype=scores.dtype).unsqueeze(-1)
         action_prior = scores @ self.bin_embeddings
         base = self.input_norm(action_prior)
-        hidden = self.output_norm(self.adapter(base))
-        hidden = hidden * within_action_horizon.to(device=hidden.device, dtype=hidden.dtype).unsqueeze(-1)
+        hidden = self.output_norm(base + self.adapter(base))
         return hidden.to(device=device, dtype=dtype)
 
 
@@ -681,12 +687,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return
 
         owner = self
-        for decoder_layer in layers:
+        for layer_index, decoder_layer in enumerate(layers):
             attention = getattr(decoder_layer, "self_attn", None)
             if attention is None or hasattr(attention, "_pano_origin_forward"):
                 continue
 
             attention._pano_origin_forward = attention.forward
+            attention._pano_action_bearing_layer_index = layer_index
 
             def forward_with_action_bearing_kv(
                 this,
@@ -1099,6 +1106,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             action_token_indices = action_token_indices[valid]
             action_hidden = action_hidden[valid.to(device=action_hidden.device)]
         if int(action_token_indices.numel()) == 0:
+            return key_states, value_states
+
+        layer_idx = getattr(
+            attention_module,
+            "_pano_action_bearing_layer_index",
+            getattr(attention_module, "layer_idx", None),
+        )
+        if not self.action_bearing_kv.should_inject_layer(layer_idx):
             return key_states, value_states
 
         use_key_delta = float(self.action_bearing_kv.key_alpha_max) > 0.0

@@ -119,6 +119,7 @@ def _load_model_config(cfg):
         "action_bearing_key_alpha_max",
         "action_bearing_value_alpha_init",
         "action_bearing_value_alpha_max",
+        "action_bearing_inject_layers",
     )
     for field_name in model_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))

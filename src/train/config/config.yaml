@@ -17,10 +17,11 @@ model:
   panovggt_alpha_init: 0.2
   panovggt_alpha_max: 0.4
   action_bearing_enabled: true
-  action_bearing_key_alpha_init: 0.0
-  action_bearing_key_alpha_max: 0.0
-  action_bearing_value_alpha_init: 0.03
-  action_bearing_value_alpha_max: 0.06
+  action_bearing_key_alpha_init: 0.02
+  action_bearing_key_alpha_max: 0.05
+  action_bearing_value_alpha_init: 0.05
+  action_bearing_value_alpha_max: 0.1
+  action_bearing_inject_layers: 16
 
 data:
   train_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_4action_stop_pad_ebs_event0p50_bg0p05_taildense4.jsonl"
@@ -36,7 +37,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_action_bearing_kv_vonly_120degree_inject"
+  output_dir: "/workspace/code_dir/a_property/model/4-action/panovln_ebs_action_bearing_kv_first16_layers"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -61,7 +62,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovln_ebs_action_bearing_kv_vonly_120degree_inject"
+  run_name: "panovln_ebs_action_bearing_kv_first16_layers"
   remove_unused_columns: false
   dataloader_num_workers: 4
   gradient_checkpointing: true
@@ -75,10 +76,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovln_ebs_action_bearing_kv_vonly_120degree_inject"
-  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "action-bearing-kv", "v-only", "low-alpha", "horizon-mask", "no-raw-prior", "4gpu", "global-batch-128"]
+  name: "panovln_ebs_action_bearing_kv_first16_layers"
+  tags: ["qwen3.5", "r2r", "rxr", "word-action", "stop-pad", "EBS", "event-balanced-sampling", "event0p50", "bg0p05", "taildense4", "action-bearing-kv", "first16-layers", "4gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "Single Action-Bearing KV ablation: key injection disabled, value alpha reduced to 0.03/0.06, raw action-prior passthrough removed, and panorama tokens outside the +/-60 degree action horizon are zero-masked. PanoVGGT is disabled. Uses GPUs 0-3 with per_device_train_batch_size=4 and gradient_accumulation_steps=8 for global batch 128."
+  notes: "Single Action-Bearing KV ablation: original all-current-panorama-token K/V injection with base+adapter residual, restricted to the first 16 Qwen decoder layers, which covers the first 4 full-attention blocks in the hybrid decoder. PanoVGGT is disabled. Uses GPUs 0-3 with per_device_train_batch_size=4 and gradient_accumulation_steps=8 for global batch 128."
   id: null
   resume: "never"

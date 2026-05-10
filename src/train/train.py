@@ -71,6 +71,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"action_bearing_key_alpha_max: {_config_value(cfg.model.action_bearing_key_alpha_max)}")
     rank0_print(RANK, f"action_bearing_value_alpha_init: {_config_value(cfg.model.action_bearing_value_alpha_init)}")
     rank0_print(RANK, f"action_bearing_value_alpha_max: {_config_value(cfg.model.action_bearing_value_alpha_max)}")
+    rank0_print(RANK, f"action_bearing_inject_layers: {_config_value(cfg.model.action_bearing_inject_layers)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
