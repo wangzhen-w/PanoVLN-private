@@ -69,6 +69,7 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_checkpoint_path": "/workspace/code_dir/a_property/model/PanoVGGT/model.pt",
         "panovggt_alpha_init": 0.1,
         "panovggt_alpha_max": 0.2,
+        "panovggt_force_fp32": True,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
     for field_name, default_value in defaults.items():
@@ -160,7 +161,6 @@ def load_panovggt_checkpoint(model: nn.Module, checkpoint_path: str) -> None:
             f"first missing key: {missing_aggregator_keys[0]}"
         )
     freeze_panovggt_model(model)
-
 
 class PanoVGGTGeometryMLP(nn.Module):
     def __init__(self, config) -> None:
@@ -373,7 +373,7 @@ def ensure_action_bearing_config(config) -> None:
     text_hidden_size = getattr(text_config, "hidden_size", getattr(vision_config, "out_hidden_size", 3584))
     output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
     defaults = {
-        "action_bearing_enabled": True,
+        "action_bearing_enabled": False,
         "action_bearing_key_alpha_init": 0.02,
         "action_bearing_key_alpha_max": 0.05,
         "action_bearing_value_alpha_init": 0.05,
@@ -391,7 +391,7 @@ class ActionBearingKV(nn.Module):
         super().__init__()
         ensure_action_bearing_config(config)
 
-        self.enabled = bool(getattr(config, "action_bearing_enabled", True))
+        self.enabled = bool(getattr(config, "action_bearing_enabled", False))
         self.output_dim = int(getattr(config, "action_bearing_output_dim", config.text_config.hidden_size))
         self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
         self.key_alpha_init = float(getattr(config, "action_bearing_key_alpha_init", 0.02))
@@ -579,15 +579,23 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     )
 
     def __init__(self, config):
-        ensure_panovggt_config(config)
-        ensure_action_bearing_config(config)
+        panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
+        action_bearing_enabled = bool(getattr(config, "action_bearing_enabled", False))
+        if panovggt_enabled:
+            ensure_panovggt_config(config)
+        if action_bearing_enabled:
+            ensure_action_bearing_config(config)
         super().__init__(config)
 
-        ensure_panovggt_config(config)
-        ensure_action_bearing_config(config)
-        self.panovggt_mlp = PanoVGGTGeometryMLP(config)
-        self.action_bearing_kv = ActionBearingKV(config)
-        self.action_bearing_kv.initialize_bin_embeddings_from_text(self.get_input_embeddings())
+        if panovggt_enabled:
+            ensure_panovggt_config(config)
+        if action_bearing_enabled:
+            ensure_action_bearing_config(config)
+
+        self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
+        self.action_bearing_kv = ActionBearingKV(config) if action_bearing_enabled else None
+        if self.action_bearing_kv is not None:
+            self.action_bearing_kv.initialize_bin_embeddings_from_text(self.get_input_embeddings())
         self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
@@ -601,7 +609,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._install_action_bearing_kv_hook()
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
+    def _panovggt_enabled(self) -> bool:
+        return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
+
+    def _action_bearing_enabled(self) -> bool:
+        return self.action_bearing_kv is not None and bool(getattr(self.action_bearing_kv, "enabled", False))
+
     def _install_image_feature_hook(self) -> None:
+        if not self._panovggt_enabled():
+            return
         if hasattr(self.model, "_pano_origin_get_image_features"):
             return
 
@@ -632,7 +648,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
             panovggt_pixel_values = owner._pano_runtime_panovggt_pixel_values
             if (
-                owner.panovggt_mlp.enabled
+                owner._panovggt_enabled()
                 and panovggt_pixel_values is not None
                 and panovggt_pixel_values.numel() > 0
             ):
@@ -658,6 +674,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                         device=image_embeds[target_indices[0]].device,
                         dtype=image_embeds[target_indices[0]].dtype,
                     )
+                    if panovggt_model is None or owner.panovggt_mlp is None:
+                        return vision_output
                     deltas = owner.panovggt_mlp(
                         panovggt_pixel_values.index_select(0, batch_indices),
                         panovggt_model=panovggt_model,
@@ -681,6 +699,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
 
     def _install_action_bearing_kv_hook(self) -> None:
+        if not self._action_bearing_enabled():
+            return
         language_model = getattr(self.model, "language_model", None)
         layers = getattr(language_model, "layers", None)
         if layers is None:
@@ -722,7 +742,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 value_states = this.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
                 if (
-                    owner.action_bearing_kv.enabled
+                    owner._action_bearing_enabled()
                     and action_hidden is not None
                     and action_batch_indices is not None
                     and action_token_indices is not None
@@ -790,7 +810,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_panovggt_pixel_values = None
 
     def _load_external_panovggt_weights(self) -> None:
-        if not self.panovggt_mlp.enabled:
+        if not self._panovggt_enabled():
             return
         if self.panovggt is None:
             self.panovggt = build_panovggt_model_from_vendored_config()
@@ -866,7 +886,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         return state_dict
 
     def _load_saved_panovggt_weights(self, pretrained_model_name_or_path) -> bool:
-        if not self.panovggt_mlp.enabled:
+        if not self._panovggt_enabled():
             return False
 
         checkpoint_dir = Path(str(pretrained_model_name_or_path))
@@ -898,16 +918,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._panovggt_dtype = None
 
     def _ensure_panovggt_model(self, device: torch.device, dtype: torch.dtype):
-        if not self.panovggt_mlp.enabled:
+        if not self._panovggt_enabled():
             return None
         if self.panovggt is None:
             self.panovggt = build_panovggt_model_from_vendored_config()
         if not self._panovggt_weights_ready:
             self._load_external_panovggt_weights()
-        # Keep the frozen encoder in Qwen's low-precision vision dtype when
-        # possible. PanoVGGT's attention has a bf16 flash path; forcing fp32
-        # makes its 36-layer panorama encoder much slower.
-        target_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.float32
+        if bool(getattr(self.config, "panovggt_force_fp32", True)):
+            target_dtype = torch.float32
+        else:
+            # Keep the frozen encoder in Qwen's low-precision vision dtype when
+            # possible. PanoVGGT's attention has a bf16 flash path; forcing fp32
+            # makes its 36-layer panorama encoder much slower.
+            target_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.float32
         if self._panovggt_device != device or self._panovggt_dtype != target_dtype:
             self.panovggt.to(device=device, dtype=target_dtype)
             self._panovggt_device = device
@@ -961,8 +984,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         input_ids: torch.Tensor | None,
         image_grid_thw: torch.Tensor | None,
     ) -> dict[str, torch.Tensor]:
+        action_bearing_kv = self.action_bearing_kv
         if (
-            not self.action_bearing_kv.enabled
+            not self._action_bearing_enabled()
+            or action_bearing_kv is None
             or input_ids is None
             or image_grid_thw is None
             or image_grid_thw.numel() == 0
@@ -1019,7 +1044,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         action_hidden_chunks = []
         batch_index_chunks = []
         token_index_chunks = []
-        param = self.action_bearing_kv.bin_embeddings
+        param = action_bearing_kv.bin_embeddings
 
         for batch_index in range(int(input_ids.shape[0])):
             image_count = int(image_num_images[batch_index].item())
@@ -1056,7 +1081,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 )
 
             flat_image_index = image_offset + current_index
-            action_hidden = self.action_bearing_kv.build_image_hidden(
+            action_hidden = action_bearing_kv.build_image_hidden(
                 image_grid_thw[flat_image_index],
                 target_len=current_token_len,
                 device=param.device,
@@ -1092,6 +1117,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         action_batch_indices: torch.Tensor,
         action_token_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        action_bearing_kv = self.action_bearing_kv
+        if not self._action_bearing_enabled() or action_bearing_kv is None:
+            return key_states, value_states
+
         seq_len = int(key_states.shape[2])
         action_batch_indices = action_batch_indices.to(device=key_states.device, dtype=torch.long)
         action_token_indices = action_token_indices.to(device=key_states.device, dtype=torch.long)
@@ -1113,11 +1142,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             "_pano_action_bearing_layer_index",
             getattr(attention_module, "layer_idx", None),
         )
-        if not self.action_bearing_kv.should_inject_layer(layer_idx):
+        if not action_bearing_kv.should_inject_layer(layer_idx):
             return key_states, value_states
 
-        use_key_delta = float(self.action_bearing_kv.key_alpha_max) > 0.0
-        use_value_delta = float(self.action_bearing_kv.value_alpha_max) > 0.0
+        use_key_delta = float(action_bearing_kv.key_alpha_max) > 0.0
+        use_value_delta = float(action_bearing_kv.value_alpha_max) > 0.0
         if not use_key_delta and not use_value_delta:
             return key_states, value_states
 
@@ -1131,7 +1160,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             key_delta = key_delta.to(dtype=key_states.dtype)
             full_key_delta = torch.zeros_like(key_states)
             full_key_delta[action_batch_indices, :, action_token_indices, :] = key_delta
-            key_alpha = self.action_bearing_kv.key_alpha.to(device=key_states.device, dtype=key_states.dtype)
+            key_alpha = action_bearing_kv.key_alpha.to(device=key_states.device, dtype=key_states.dtype)
             key_states = key_states + key_alpha * full_key_delta
 
         if use_value_delta:
@@ -1139,7 +1168,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             value_delta = value_delta.to(dtype=value_states.dtype)
             full_value_delta = torch.zeros_like(value_states)
             full_value_delta[action_batch_indices, :, action_token_indices, :] = value_delta
-            value_alpha = self.action_bearing_kv.value_alpha.to(device=value_states.device, dtype=value_states.dtype)
+            value_alpha = action_bearing_kv.value_alpha.to(device=value_states.device, dtype=value_states.dtype)
             value_states = value_states + value_alpha * full_value_delta
 
         return key_states, value_states
@@ -1164,13 +1193,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
-        self._set_runtime_pano_context(
-            image_grid_thw=image_grid_thw,
-            image_num_images=image_num_images,
-            image_current_index=image_current_index,
-            image_erp_geometry=image_erp_geometry,
-            panovggt_pixel_values=panovggt_pixel_values,
-        )
+        if self._panovggt_enabled():
+            self._set_runtime_pano_context(
+                image_grid_thw=image_grid_thw,
+                image_num_images=image_num_images,
+                image_current_index=image_current_index,
+                image_erp_geometry=image_erp_geometry,
+                panovggt_pixel_values=panovggt_pixel_values,
+            )
         action_bearing_context = self._build_action_bearing_context(input_ids, image_grid_thw)
         try:
             return super().forward(
@@ -1197,16 +1227,20 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         missing_keys = set(incompatible_keys.missing_keys)
 
         panovggt_module = self.panovggt_mlp
-        if panovggt_module.enabled and any(key.startswith("panovggt_mlp.") for key in missing_keys):
+        if (
+            panovggt_module is not None
+            and panovggt_module.enabled
+            and any(key.startswith("panovggt_mlp.") for key in missing_keys)
+        ):
             panovggt_module.reset_parameters()
-        if panovggt_module.enabled:
+        if panovggt_module is not None and panovggt_module.enabled:
             if any(key.startswith("panovggt.") for key in missing_keys):
                 self._load_external_panovggt_weights()
             else:
                 self._mark_panovggt_weights_ready()
 
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
-        if self.panovggt_mlp.enabled:
+        if self._panovggt_enabled() and self.panovggt_mlp is not None:
             self.panovggt_mlp.reset_parameters()
 
     @classmethod
@@ -1255,7 +1289,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()
-        if model.panovggt_mlp.enabled:
+        if model._panovggt_enabled():
             loaded_saved_panovggt = (
                 model._load_saved_panovggt_weights(pretrained_model_name_or_path)
                 if has_panovggt_weights is True
@@ -1264,7 +1298,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if not loaded_saved_panovggt and model.panovggt is None:
                 model._load_external_panovggt_weights()
         has_action_bearing_weights = cls._checkpoint_has_action_bearing_weights(pretrained_model_name_or_path)
-        if model.action_bearing_kv.enabled and has_action_bearing_weights is not True:
+        if (
+            model._action_bearing_enabled()
+            and model.action_bearing_kv is not None
+            and has_action_bearing_weights is not True
+        ):
             model.action_bearing_kv.reset_parameters(
                 float(getattr(model.config.vision_config, "initializer_range", 0.02))
             )

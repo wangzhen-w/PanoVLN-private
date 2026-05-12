@@ -79,7 +79,7 @@ ATOMIC_ACTION_PATTERNS = [
 ]
 
 
-def seed_all(seed=41):
+def seed_all(seed=42):
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
@@ -646,7 +646,7 @@ def main():
                         help="attention backend used to load the model")
     parser.add_argument("--early-stop-max-steps", type=int, default=0,
                         help="optional hard cap on env steps per episode; 0 relies on habitat.environment.max_episode_steps")
-    parser.add_argument("--seed", type=int, default=41, help="random seed for python, numpy, and torch")
+    parser.add_argument("--seed", type=int, default=42, help="random seed for python, numpy, and torch")
     args = parser.parse_args()
 
     seed_all(args.seed)

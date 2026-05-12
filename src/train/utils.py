@@ -109,11 +109,14 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
-    model_fields = (
+    panovggt_fields = (
         "panovggt_enabled",
         "panovggt_checkpoint_path",
         "panovggt_alpha_init",
         "panovggt_alpha_max",
+        "panovggt_force_fp32",
+    )
+    action_bearing_fields = (
         "action_bearing_enabled",
         "action_bearing_key_alpha_init",
         "action_bearing_key_alpha_max",
@@ -121,8 +124,18 @@ def _load_model_config(cfg):
         "action_bearing_value_alpha_max",
         "action_bearing_inject_layers",
     )
-    for field_name in model_fields:
-        setattr(config, field_name, getattr(cfg.model, field_name))
+
+    def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
+        if enabled:
+            for field_name in field_names:
+                setattr(config, field_name, getattr(cfg.model, field_name))
+            return
+        for field_name in field_names:
+            if hasattr(config, field_name):
+                delattr(config, field_name)
+
+    apply_module_fields(bool(cfg.model.panovggt_enabled), panovggt_fields)
+    apply_module_fields(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config
 
 

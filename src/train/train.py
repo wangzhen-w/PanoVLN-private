@@ -66,6 +66,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_init: {_config_value(cfg.model.panovggt_alpha_init)}")
     rank0_print(RANK, f"panovggt_alpha_max: {_config_value(cfg.model.panovggt_alpha_max)}")
+    rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_key_alpha_init: {_config_value(cfg.model.action_bearing_key_alpha_init)}")
     rank0_print(RANK, f"action_bearing_key_alpha_max: {_config_value(cfg.model.action_bearing_key_alpha_max)}")
