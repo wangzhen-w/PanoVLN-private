@@ -18,7 +18,7 @@ class ModelConfig:
     panovggt_checkpoint_path: str = "/workspace/code_dir/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_init: float = 0.1
     panovggt_alpha_max: float = 0.2
-    panovggt_force_fp32: bool = True
+    panovggt_force_fp32: bool = False
     action_bearing_enabled: bool = False
     action_bearing_key_alpha_init: float = 0.02
     action_bearing_key_alpha_max: float = 0.05

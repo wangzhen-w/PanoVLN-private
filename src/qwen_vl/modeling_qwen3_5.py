@@ -69,7 +69,7 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_checkpoint_path": "/workspace/code_dir/a_property/model/PanoVGGT/model.pt",
         "panovggt_alpha_init": 0.1,
         "panovggt_alpha_max": 0.2,
-        "panovggt_force_fp32": True,
+        "panovggt_force_fp32": False,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
     for field_name, default_value in defaults.items():
@@ -924,7 +924,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             self.panovggt = build_panovggt_model_from_vendored_config()
         if not self._panovggt_weights_ready:
             self._load_external_panovggt_weights()
-        if bool(getattr(self.config, "panovggt_force_fp32", True)):
+        if bool(getattr(self.config, "panovggt_force_fp32", False)):
             target_dtype = torch.float32
         else:
             # Keep the frozen encoder in Qwen's low-precision vision dtype when

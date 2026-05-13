@@ -16,7 +16,7 @@ model:
   panovggt_checkpoint_path: "/workspace/code_dir/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_init: 0.2
   panovggt_alpha_max: 0.4
-  panovggt_force_fp32: true
+  panovggt_force_fp32: false
   action_bearing_enabled: false
   action_bearing_key_alpha_init: 0.02
   action_bearing_key_alpha_max: 0.05
