@@ -49,6 +49,11 @@ class TrainingConfig:
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     learning_rate: float = 2e-5
+    language_model_lr: Optional[float] = None
+    visual_lr: Optional[float] = None
+    visual_merger_lr: Optional[float] = None
+    panovggt_mlp_lr: Optional[float] = None
+    action_bearing_kv_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10
@@ -57,6 +62,7 @@ class TrainingConfig:
     max_steps: int = -1
     eval_strategy: str = "no"
     save_strategy: str = "no"
+    save_model_at_end: bool = True
     max_shard_size: str = "5GB"
     load_best_model_at_end: bool = False
     metric_for_best_model: Optional[str] = None

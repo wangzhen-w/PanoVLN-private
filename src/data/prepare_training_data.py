@@ -13,6 +13,7 @@ DEFAULT_SEED = 42
 EBS_SAMPLER = "ebs"
 DEFAULT_EVENT_KEEP_PROB = 0.50
 DEFAULT_BACKGROUND_KEEP_PROB = 0.05
+DEFAULT_BODY_KEEP_ADVANCE = DEFAULT_ACTION_HORIZON
 STOP_ACTION_ID = 0
 EVENT_ACTION_IDS = {2, 3}
 
@@ -163,6 +164,7 @@ def print_ebs_sampling_summary(
     candidate_counts: Counter,
     event_keep_prob: float,
     background_keep_prob: float,
+    body_keep_advance: int,
     action_horizon: int = DEFAULT_ACTION_HORIZON,
 ) -> None:
     print(
@@ -170,7 +172,8 @@ def print_ebs_sampling_summary(
         f"event_keep_prob={event_keep_prob} "
         f"background_keep_prob={background_keep_prob} "
         f"tail_dense={action_horizon} "
-        f"terminal_buffer={action_horizon - 1}"
+        f"terminal_buffer={action_horizon - 1} "
+        f"body_keep_advance={body_keep_advance}"
     )
     for class_name in ("event_body", "background_body", "terminal_dense"):
         print(f"candidate_class {class_name} candidates={candidate_counts[class_name]}")
@@ -181,9 +184,11 @@ def build_ebs_action_chunk_starts(
     action_horizon: int = DEFAULT_ACTION_HORIZON,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
     rng: Optional[random.Random] = None,
 ) -> List[int]:
     action_horizon = max(1, int(action_horizon))
+    body_keep_advance = max(1, int(body_keep_advance))
     event_keep_prob = validate_keep_probability(
         event_keep_prob,
         "event_keep_prob",
@@ -215,7 +220,7 @@ def build_ebs_action_chunk_starts(
         )
         if rng.random() < keep_prob:
             start_steps.add(start_step)
-            start_step += action_horizon
+            start_step += body_keep_advance
         else:
             start_step += 1
 
@@ -227,6 +232,7 @@ def build_action_chunks(
     action_horizon: int = DEFAULT_ACTION_HORIZON,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
     pad_stop_to_horizon: bool = False,
     rng: Optional[random.Random] = None,
 ) -> List[Dict[str, Any]]:
@@ -235,6 +241,7 @@ def build_action_chunks(
         action_horizon=action_horizon,
         event_keep_prob=event_keep_prob,
         background_keep_prob=background_keep_prob,
+        body_keep_advance=body_keep_advance,
         rng=rng,
     )
 
@@ -276,6 +283,7 @@ def process_dataset(
     seed: int = DEFAULT_SEED,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
     output_handle=None,
 ):
     data2save = []
@@ -311,6 +319,7 @@ def process_dataset(
                 actions,
                 event_keep_prob=event_keep_prob,
                 background_keep_prob=background_keep_prob,
+                body_keep_advance=body_keep_advance,
                 pad_stop_to_horizon=pad_stop_to_horizon,
                 rng=rng,
             )
@@ -365,6 +374,7 @@ def main(
     seed: int = DEFAULT_SEED,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
     annotations_by_subset = load_subset_annotations(
@@ -388,6 +398,7 @@ def main(
         candidate_counts=candidate_counts,
         event_keep_prob=event_keep_prob,
         background_keep_prob=background_keep_prob,
+        body_keep_advance=body_keep_advance,
     )
 
     output_dir = os.path.dirname(output_path)
@@ -405,6 +416,7 @@ def main(
             seed=seed,
             event_keep_prob=event_keep_prob,
             background_keep_prob=background_keep_prob,
+            body_keep_advance=body_keep_advance,
             output_handle=output_handle,
         )
 
@@ -460,6 +472,16 @@ if __name__ == "__main__":
             "EBS keep probability for all-forward body chunks."
         ),
     )
+    parser.add_argument(
+        "--body_keep_advance",
+        type=int,
+        default=DEFAULT_BODY_KEEP_ADVANCE,
+        help=(
+            "Number of start steps to advance after keeping a body chunk. "
+            "Defaults to the action horizon, preserving the original "
+            "non-overlapping body sampling behavior."
+        ),
+    )
     args = parser.parse_args()
 
     main(
@@ -471,4 +493,5 @@ if __name__ == "__main__":
         seed=args.seed,
         event_keep_prob=args.event_keep_prob,
         background_keep_prob=args.background_keep_prob,
+        body_keep_advance=args.body_keep_advance,
     )

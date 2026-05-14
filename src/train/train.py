@@ -4,6 +4,7 @@ import shutil
 
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
+import yaml
 
 from config.config import load_config
 from data.collator import MultiModalDataCollator
@@ -31,6 +32,21 @@ class PanoVLNTrainer(Trainer):
         "action_bearing_kv.raw_key_alpha",
         "action_bearing_kv.raw_value_alpha",
     )
+    MODULE_LR_KEYS = (
+        "language_model",
+        "visual",
+        "visual_merger",
+        "panovggt_mlp",
+        "action_bearing_kv",
+    )
+
+    def __init__(self, *args, module_learning_rates=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.module_learning_rates = {
+            name: float(lr)
+            for name, lr in (module_learning_rates or {}).items()
+            if lr is not None
+        }
 
     def get_decay_parameter_names(self, model):
         decay_parameter_names = super().get_decay_parameter_names(model)
@@ -39,6 +55,58 @@ class PanoVLNTrainer(Trainer):
             for name in decay_parameter_names
             if not name.endswith(self.RAW_ALPHA_NO_DECAY_SUFFIXES)
         ]
+
+    @staticmethod
+    def _name_has_module(name: str, module_name: str) -> bool:
+        return name == module_name or name.startswith(f"{module_name}.") or f".{module_name}." in name
+
+    def _module_lr_key_for_parameter(self, name: str):
+        if self._name_has_module(name, "action_bearing_kv"):
+            return "action_bearing_kv"
+        if name.startswith("visual.merger.") or ".visual.merger." in name:
+            return "visual_merger"
+        if self._name_has_module(name, "panovggt_mlp"):
+            return "panovggt_mlp"
+        if self._name_has_module(name, "visual"):
+            return "visual"
+        if (
+            self._name_has_module(name, "language_model")
+            or self._name_has_module(name, "model")
+            or self._name_has_module(name, "lm_head")
+        ):
+            return "language_model"
+        return None
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        opt_model = self.model
+        decay_parameters = set(self.get_decay_parameter_names(opt_model))
+        grouped_parameters = {}
+
+        for name, param in opt_model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            module_key = self._module_lr_key_for_parameter(name)
+            lr = self.module_learning_rates.get(module_key, self.args.learning_rate)
+            weight_decay = self.args.weight_decay if name in decay_parameters else 0.0
+            group_key = (module_key or "base", float(lr), float(weight_decay))
+            if group_key not in grouped_parameters:
+                group = {
+                    "params": [],
+                    "weight_decay": weight_decay,
+                    "lr": lr,
+                }
+                grouped_parameters[group_key] = group
+            grouped_parameters[group_key]["params"].append(param)
+
+        optimizer_grouped_parameters = list(grouped_parameters.values())
+        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        return self.optimizer
 
 
 def copy_chat_template_files(source_dir: str, output_dir: str):
@@ -54,6 +122,25 @@ def _config_value(value) -> str:
     if value is None:
         return "null"
     return str(value)
+
+
+def apply_config_overrides(cfg, overrides):
+    for override in overrides or []:
+        if "=" not in override:
+            raise ValueError(f"Config override must use key=value format, got: {override}")
+        key, raw_value = override.split("=", 1)
+        target = cfg
+        parts = key.split(".")
+        if len(parts) < 2:
+            raise ValueError(f"Config override key must be dotted, got: {key}")
+        for part in parts[:-1]:
+            if not hasattr(target, part):
+                raise ValueError(f"Unknown config section in override: {key}")
+            target = getattr(target, part)
+        field_name = parts[-1]
+        if not hasattr(target, field_name):
+            raise ValueError(f"Unknown config field in override: {key}")
+        setattr(target, field_name, yaml.safe_load(raw_value))
 
 
 def print_training_config(cfg) -> None:
@@ -76,6 +163,11 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
+    rank0_print(RANK, f"language_model_lr: {_config_value(cfg.training.language_model_lr)}")
+    rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
+    rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
+    rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
+    rank0_print(RANK, f"action_bearing_kv_lr: {_config_value(cfg.training.action_bearing_kv_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -110,9 +202,16 @@ def safe_save_model_for_hf_trainer(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="Override config values, e.g. --set training.max_steps=30",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    apply_config_overrides(cfg, args.set)
     if RANK == 0:
         print_training_config(cfg)
     set_seed(cfg.training.seed)
@@ -203,6 +302,13 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=MultiModalDataCollator(tokenizer),
         processing_class=tokenizer,
+        module_learning_rates={
+            "language_model": cfg.training.language_model_lr,
+            "visual": cfg.training.visual_lr,
+            "visual_merger": cfg.training.visual_merger_lr,
+            "panovggt_mlp": cfg.training.panovggt_mlp_lr,
+            "action_bearing_kv": cfg.training.action_bearing_kv_lr,
+        },
         compute_metrics=(
             build_action_accuracy(
                 tokenizer,
@@ -233,24 +339,29 @@ def main():
 
     trainer.save_state()
 
-    copy_chat_template_files(
-        source_dir=cfg.model.name_or_path,
-        output_dir=training_args.output_dir,
-    )
+    if cfg.training.save_model_at_end:
+        copy_chat_template_files(
+            source_dir=cfg.model.name_or_path,
+            output_dir=training_args.output_dir,
+        )
 
-    model.config.use_cache = True
-    if hasattr(model.config, "text_config") and model.config.text_config is not None:
-        model.config.text_config.use_cache = True
+        model.config.use_cache = True
+        if hasattr(model.config, "text_config") and model.config.text_config is not None:
+            model.config.text_config.use_cache = True
 
-    safe_save_model_for_hf_trainer(
-        trainer=trainer,
-        output_dir=training_args.output_dir,
-        max_shard_size=cfg.training.max_shard_size,
-    )
+        safe_save_model_for_hf_trainer(
+            trainer=trainer,
+            output_dir=training_args.output_dir,
+            max_shard_size=cfg.training.max_shard_size,
+        )
+
+        if RANK == 0:
+            processor.save_pretrained(cfg.training.output_dir)
+            tokenizer.save_pretrained(cfg.training.output_dir)
+    else:
+        rank0_print(RANK, "save_model_at_end=false, skipping final model/processor/tokenizer save")
 
     if RANK == 0:
-        processor.save_pretrained(cfg.training.output_dir)
-        tokenizer.save_pretrained(cfg.training.output_dir)
         wandb = load_wandb_module(required=False)
         if wandb is not None and hasattr(wandb, "finish"):
             wandb.finish()
