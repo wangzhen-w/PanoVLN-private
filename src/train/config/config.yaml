@@ -25,7 +25,7 @@ model:
   action_bearing_inject_layers: 32
 
 data:
-  train_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN/train_scalevln_r2rrxr_maxtch_nooverlap_447623.jsonl"
+  train_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN/train_r2r_rxr_ebs_event050_bg005_tail100_taildense4.jsonl"
   eval_jsonl: "/workspace/code_dir/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code_dir/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code_dir/a_property/dataset/PanoVLN_eval"
@@ -38,7 +38,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code_dir/a_property/model/abaltion/action_kv/panovggt_actionkv_inj32_akv1e5_other2e6_scalevln447623"
+  output_dir: "/workspace/code_dir/a_property/model/abaltion/action_kv/panovggt_inj32_akv1e5_other2e6_scalevln_event0p50_bg0p10_tail0p70"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -53,7 +53,7 @@ training:
   num_train_epochs: 1
   logging_steps: 5
   save_steps: 200
-  eval_steps: 200
+  eval_steps: 100
   max_steps: -1
   eval_strategy: "steps"
   save_strategy: "steps"
@@ -68,9 +68,9 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovln_actionkv_inj32_scalevln_r2rrxr_nooverlap447623_akv1e5_other2e6"
+  run_name: "panovggt_inj32_akv1e5_other2e6_event0p50_bg0p10_tail0p70"
   remove_unused_columns: false
-  dataloader_num_workers: 4
+  dataloader_num_workers: 6
   gradient_checkpointing: true
   max_grad_norm: 1.0
   deepspeed: "/workspace/code_dir/VLN/scripts/zero2.json"
@@ -82,10 +82,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovln_actionkv_inj32_scalevln_r2rrxr_nooverlap447623_akv1e5_other2e6"
-  tags: ["qwen3.5", "scalevln", "scalevln-match-r2rrxr", "strict-no-overlap", "action-chunk-distmatch", "word-action", "stop-pad", "panovggt-geometry", "action-bearing-kv", "action-kv-hybrid-init", "action-kv-inj32", "freeze-panovggt-mlp", "freeze-panovggt-alpha", "action-kv-lr1e-5", "lm-lr2e-6", "visual-lr2e-6", "merger-lr2e-6", "warmup-0p03", "bf16", "flash", "4gpu", "global-batch-128"]
+  name: "panovggt_inj32_akv1e5_other2e6_event0p50_bg0p10_tail0p70"
+  tags: ["qwen3.5", "scalevln", "scalevln-tail0p70", "word-action", "stop-pad", "panovggt-geometry", "action-bearing-kv", "action-kv-hybrid-init", "action-kv-inj32", "freeze-panovggt-mlp", "freeze-panovggt-alpha", "action-kv-lr1e-5", "lm-lr2e-6", "visual-lr2e-6", "merger-lr2e-6", "warmup-0p03", "bf16", "flash", "8gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "Stage-2 continuation on ScaleVLN from a hybrid init: PanoVGGT-only base plus action_bearing_kv tensors copied from the action-only checkpoint. Uses train_scalevln_r2rrxr_maxtch_nooverlap_447623.jsonl: 447,623 ScaleVLN samples selected to strictly avoid overlapping action spans within each episode while matching the full 4-action chunk distribution of train_r2r_rxr_ebs_event0p50_bg0p05_taildense4.jsonl. The selected set has action-chunk TVD=1.98e-5 and JS=3.25e-6 bits versus R2R+RxR; only three 1-count target chunks are unavailable or mutually conflicting under strict no-overlap. Stop-tail dense overlaps are not retained in this strict training set. Uses module-wise LR: action_bearing_kv=1e-5 while language_model, visual_encoder, and visual_merger stay at 2e-6. PanoVGGT MLP/alpha are frozen; visual, visual_merger, language_model, and action_bearing_kv are trainable. Uses bf16/flash on GPUs 0-3 with per_device_train_batch_size=4 and gradient_accumulation_steps=8 for global batch 128."
+  notes: "Stage-2 continuation on ScaleVLN from a hybrid init: PanoVGGT-only base plus action_bearing_kv tensors copied from the action-only checkpoint. Uses train_scalevln_ebs_event0p50_bg0p10_tail0p70.jsonl: 1,161,351 samples from 104,299 episodes, generated with event_keep_prob=0.50, background_keep_prob=0.10, body_keep_advance=4, tail_dense_keep_prob=0.70, and stop-padded 4-action windows. Uses module-wise LR: action_bearing_kv=1e-5 while language_model, visual_encoder, and visual_merger stay at 2e-6. PanoVGGT MLP/alpha are frozen; visual, visual_merger, language_model, and action_bearing_kv are trainable. Uses bf16/flash on GPUs 0-7 with per_device_train_batch_size=4 and gradient_accumulation_steps=4 for global batch 128."
   id: null
   resume: "never"

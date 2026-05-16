@@ -13,6 +13,7 @@ DEFAULT_SEED = 42
 EBS_SAMPLER = "ebs"
 DEFAULT_EVENT_KEEP_PROB = 0.50
 DEFAULT_BACKGROUND_KEEP_PROB = 0.05
+DEFAULT_TAIL_DENSE_KEEP_PROB = 1.00
 DEFAULT_BODY_KEEP_ADVANCE = DEFAULT_ACTION_HORIZON
 STOP_ACTION_ID = 0
 EVENT_ACTION_IDS = {2, 3}
@@ -164,6 +165,7 @@ def print_ebs_sampling_summary(
     candidate_counts: Counter,
     event_keep_prob: float,
     background_keep_prob: float,
+    tail_dense_keep_prob: float,
     body_keep_advance: int,
     action_horizon: int = DEFAULT_ACTION_HORIZON,
 ) -> None:
@@ -171,6 +173,7 @@ def print_ebs_sampling_summary(
         f"chunk_sampler={EBS_SAMPLER} "
         f"event_keep_prob={event_keep_prob} "
         f"background_keep_prob={background_keep_prob} "
+        f"tail_dense_keep_prob={tail_dense_keep_prob} "
         f"tail_dense={action_horizon} "
         f"terminal_buffer={action_horizon - 1} "
         f"body_keep_advance={body_keep_advance}"
@@ -184,6 +187,7 @@ def build_ebs_action_chunk_starts(
     action_horizon: int = DEFAULT_ACTION_HORIZON,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
     body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
     rng: Optional[random.Random] = None,
 ) -> List[int]:
@@ -197,6 +201,10 @@ def build_ebs_action_chunk_starts(
         background_keep_prob,
         "background_keep_prob",
     )
+    tail_dense_keep_prob = validate_keep_probability(
+        tail_dense_keep_prob,
+        "tail_dense_keep_prob",
+    )
     if rng is None:
         rng = random.Random(DEFAULT_SEED)
 
@@ -208,7 +216,7 @@ def build_ebs_action_chunk_starts(
 
     dense_start = max(0, num_actions - action_horizon)
     body_stop = max(0, dense_start - action_horizon + 1)
-    start_steps = set(range(dense_start, num_actions))
+    start_steps = set()
 
     start_step = 0
     while start_step < body_stop:
@@ -224,6 +232,10 @@ def build_ebs_action_chunk_starts(
         else:
             start_step += 1
 
+    for start_step in range(dense_start, num_actions):
+        if tail_dense_keep_prob >= 1.0 or rng.random() < tail_dense_keep_prob:
+            start_steps.add(start_step)
+
     return sorted(start_steps)
 
 
@@ -232,6 +244,7 @@ def build_action_chunks(
     action_horizon: int = DEFAULT_ACTION_HORIZON,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
     body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
     pad_stop_to_horizon: bool = False,
     rng: Optional[random.Random] = None,
@@ -241,6 +254,7 @@ def build_action_chunks(
         action_horizon=action_horizon,
         event_keep_prob=event_keep_prob,
         background_keep_prob=background_keep_prob,
+        tail_dense_keep_prob=tail_dense_keep_prob,
         body_keep_advance=body_keep_advance,
         rng=rng,
     )
@@ -283,6 +297,7 @@ def process_dataset(
     seed: int = DEFAULT_SEED,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
     body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
     output_handle=None,
 ):
@@ -319,6 +334,7 @@ def process_dataset(
                 actions,
                 event_keep_prob=event_keep_prob,
                 background_keep_prob=background_keep_prob,
+                tail_dense_keep_prob=tail_dense_keep_prob,
                 body_keep_advance=body_keep_advance,
                 pad_stop_to_horizon=pad_stop_to_horizon,
                 rng=rng,
@@ -374,6 +390,7 @@ def main(
     seed: int = DEFAULT_SEED,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
     background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
+    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
     body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
@@ -391,6 +408,10 @@ def main(
         background_keep_prob,
         "background_keep_prob",
     )
+    tail_dense_keep_prob = validate_keep_probability(
+        tail_dense_keep_prob,
+        "tail_dense_keep_prob",
+    )
     candidate_counts = compute_ebs_candidate_counts(
         annotations_by_subset=annotations_by_subset,
     )
@@ -398,6 +419,7 @@ def main(
         candidate_counts=candidate_counts,
         event_keep_prob=event_keep_prob,
         background_keep_prob=background_keep_prob,
+        tail_dense_keep_prob=tail_dense_keep_prob,
         body_keep_advance=body_keep_advance,
     )
 
@@ -416,6 +438,7 @@ def main(
             seed=seed,
             event_keep_prob=event_keep_prob,
             background_keep_prob=background_keep_prob,
+            tail_dense_keep_prob=tail_dense_keep_prob,
             body_keep_advance=body_keep_advance,
             output_handle=output_handle,
         )
@@ -473,6 +496,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--tail_dense_keep_prob",
+        type=float,
+        default=DEFAULT_TAIL_DENSE_KEEP_PROB,
+        help=(
+            "Keep probability for each terminal dense chunk, including the "
+            "final stop-only chunk."
+        ),
+    )
+    parser.add_argument(
         "--body_keep_advance",
         type=int,
         default=DEFAULT_BODY_KEEP_ADVANCE,
@@ -493,5 +525,6 @@ if __name__ == "__main__":
         seed=args.seed,
         event_keep_prob=args.event_keep_prob,
         background_keep_prob=args.background_keep_prob,
+        tail_dense_keep_prob=args.tail_dense_keep_prob,
         body_keep_advance=args.body_keep_advance,
     )

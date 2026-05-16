@@ -22,6 +22,8 @@ import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -5063,6 +5065,9 @@ def load_existing_candidates(work_dir: str) -> Dict[str, Dict[str, Any]]:
                 episode_id = str(row.get("episode_id", ""))
                 if not episode_id:
                     continue
+                previous = existing.get(episode_id)
+                if candidate_is_usable(previous or {}) and not candidate_is_usable(row):
+                    continue
                 existing[episode_id] = row
     return existing
 
@@ -5237,6 +5242,25 @@ def provider_defaults(args: argparse.Namespace) -> None:
     args.api_key = args.api_key or DEFAULT_QWEN_API_KEY
 
 
+def check_api_available(args: argparse.Namespace) -> None:
+    url = args.base_url.rstrip("/") + "/models"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {args.api_key}"},
+        method="GET",
+    )
+    timeout = max(1.0, min(float(args.request_timeout), 10.0))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status} from {url}")
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(
+            f"API preflight failed for {url}: {error}. "
+            "Start the VLM server or fix --base-url/--api-key before running."
+        ) from error
+
+
 def default_progress_dir(output_jsonl: str) -> str:
     output_path = Path(output_jsonl)
     return str(output_path.parent / f"{output_path.stem}_progress")
@@ -5255,6 +5279,8 @@ def parse_episode_ids(value: Optional[str]) -> Optional[List[str]]:
 
 def run(args: argparse.Namespace) -> int:
     provider_defaults(args)
+    if args.api_preflight:
+        check_api_available(args)
     if not args.work_dir:
         args.work_dir = default_progress_dir(args.output_jsonl)
     args.stage_models = {
@@ -5319,6 +5345,15 @@ def run(args: argparse.Namespace) -> int:
     )
 
     progress = None
+    successful_episode_count = resumed_success_count
+    failed_episode_count = 0
+
+    def refresh_progress_postfix() -> None:
+        if progress is not None:
+            progress.set_postfix_str(
+                f"success={successful_episode_count} failed={failed_episode_count}"
+            )
+
     if tqdm is not None:
         progress = tqdm(
             total=len(selected_rows),
@@ -5326,10 +5361,7 @@ def run(args: argparse.Namespace) -> int:
             desc="rewrite",
             dynamic_ncols=True,
         )
-        if resumed_success_count:
-            progress.set_postfix_str(
-                f"resumed={resumed_success_count} pending={len(pending_rows)}"
-            )
+        refresh_progress_postfix()
 
     rank_count = max(1, int(args.num_workers))
     rank_locks = [threading.Lock() for _ in range(rank_count)]
@@ -5352,13 +5384,15 @@ def run(args: argparse.Namespace) -> int:
         for row in pending_rows:
             candidate = process_episode(row, args)
             record_candidate(0, candidate)
+            if candidate_is_usable(candidate):
+                successful_episode_count += 1
+            else:
+                failed_episode_count += 1
             if args.sleep_between_requests > 0:
                 time.sleep(args.sleep_between_requests)
             if progress is not None:
                 progress.update(1)
-                progress.set_postfix_str(
-                    f"ep={candidate['episode_id']} status={candidate['status']}"
-                )
+                refresh_progress_postfix()
     else:
         with ThreadPoolExecutor(max_workers=args.num_workers) as pool:
             future_to_info = {
@@ -5380,11 +5414,13 @@ def run(args: argparse.Namespace) -> int:
                         "error": f"worker_failed: {type(error).__name__}: {error}",
                     }
                 record_candidate(rank, candidate)
+                if candidate_is_usable(candidate):
+                    successful_episode_count += 1
+                else:
+                    failed_episode_count += 1
                 if progress is not None:
                     progress.update(1)
-                    progress.set_postfix_str(
-                        f"ep={candidate['episode_id']} status={candidate['status']}"
-                    )
+                    refresh_progress_postfix()
 
     if progress is not None:
         progress.close()
@@ -5468,6 +5504,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--disable-thinking", type=str2bool, default=True)
+    parser.add_argument("--api-preflight", type=str2bool, default=True)
 
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--episode-ids", default=None, help="Comma-separated episode ids.")

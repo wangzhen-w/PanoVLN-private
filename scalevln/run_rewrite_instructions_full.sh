@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-source /opt/conda/bin/activate vllm
+# source /opt/conda/bin/activate vllm
 
 PYTHON_BIN="python"
 PY_SCRIPT="${SCRIPT_DIR}/rewrite_scalevln_instructions.py"
@@ -13,15 +13,15 @@ INPUT_JSONL="/workspace/code_dir/a_property/dataset/PanoVLN/sub_dataset/scalevln
 IMAGE_ROOT="/workspace/code_dir/a_property/dataset/PanoVLN/images/scalevln"
 OUTPUT_JSONL="/workspace/code_dir/a_property/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl"
 
-BASE_URL="http://127.0.0.1:10426/v1"
-MODEL="Qwen3.5-27B"
-API_KEY="test"
+BASE_URL="http://172.17.0.4:10823/v1"
+MODEL="Qwen"
+API_KEY="EMPTY"
 
 MAX_EPISODES=0
 SAMPLE_MODE="first"
 SEED=42
 
-NUM_WORKERS=24
+NUM_WORKERS=16
 MAX_WAYPOINTS=12
 START_WINDOW_FRAMES=6
 ENDPOINT_WINDOW_FRAMES=6

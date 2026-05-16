@@ -14,15 +14,16 @@ export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
 INPUT_ROOT="/workspace/code_dir/a_property/dataset/PanoVLN"
-OUTPUT_PATH="/workspace/code_dir/a_property/dataset/PanoVLN/train_scalevln_ebs_match_r2rrxr_adv3.jsonl"
+OUTPUT_PATH="/workspace/code_dir/a_property/dataset/PanoVLN/train_scalevln_ebs_event0p50_bg0p10_tail0p70.jsonl"
 DATASET_NAMES=(scalevln)
 MAX_EPISODES_PER_SUBSET=""
 PAD_STOP_TO_HORIZON="true"
 SEED="42"
 
-EVENT_KEEP_PROB="0.70"
-BACKGROUND_KEEP_PROB="0.93"
-BODY_KEEP_ADVANCE="3"
+EVENT_KEEP_PROB="0.50"
+BACKGROUND_KEEP_PROB="0.10"
+BODY_KEEP_ADVANCE="4"
+TAIL_DENSE_KEEP_PROB="0.70"
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
 
@@ -34,6 +35,7 @@ echo "SEED: ${SEED}"
 echo "EVENT_KEEP_PROB: ${EVENT_KEEP_PROB}"
 echo "BACKGROUND_KEEP_PROB: ${BACKGROUND_KEEP_PROB}"
 echo "BODY_KEEP_ADVANCE: ${BODY_KEEP_ADVANCE}"
+echo "TAIL_DENSE_KEEP_PROB: ${TAIL_DENSE_KEEP_PROB}"
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     echo "python not found in PATH" >&2
@@ -49,6 +51,7 @@ PREPARE_CMD=(
     --event_keep_prob "${EVENT_KEEP_PROB}"
     --background_keep_prob "${BACKGROUND_KEEP_PROB}"
     --body_keep_advance "${BODY_KEEP_ADVANCE}"
+    --tail_dense_keep_prob "${TAIL_DENSE_KEEP_PROB}"
 )
 
 if [[ -n "${MAX_EPISODES_PER_SUBSET}" ]]; then
