@@ -287,6 +287,13 @@ def main():
     )
 
     model = load_model(cfg)
+    if RANK == 0:
+        action_attention_layers = getattr(model, "_pano_action_bearing_attention_layers", None)
+        action_inject_layers = getattr(model, "_pano_action_bearing_inject_layers", None)
+        if action_attention_layers is not None:
+            rank0_print(RANK, f"action_bearing_full_attention_layers: {list(action_attention_layers)}")
+        if action_inject_layers is not None:
+            rank0_print(RANK, f"action_bearing_actual_inject_layers: {list(action_inject_layers)}")
     sync_model_special_tokens(model, tokenizer)
     set_model(cfg, model)
 

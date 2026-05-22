@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import yaml
 
@@ -24,7 +24,7 @@ class ModelConfig:
     action_bearing_key_alpha_max: float = 0.05
     action_bearing_value_alpha_init: float = 0.05
     action_bearing_value_alpha_max: float = 0.1
-    action_bearing_inject_layers: int = 16
+    action_bearing_inject_layers: Optional[Union[int, List[int]]] = 16
 
 
 @dataclass

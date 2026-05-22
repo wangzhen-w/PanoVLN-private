@@ -11,17 +11,17 @@ export HABITAT_SIM_LOG=quiet
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-MODEL_PATH="/workspace/code_dir/a_property/model/4-action/panovln_ebs_event0p50_bg0p05_panovggt_current_only"
+MODEL_PATH="/workspace/code_dir/a_property/model/abaltion/panovggt_actionkv/panovln_ebs_panovggt_action_kv_joint_lr1e5_visual2e6_vggt0.1"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/code_dir/a_property/vln_result/4-action/panovln_ebs_event0p50_bg0p05_panovggt_current_only"
+SAVE_PATH="/workspace/code_dir/vln_result/ablation/panovggt_actionkv/panovln_ebs_panovggt_action_kv_joint_lr1e5_visual2e6_vggt0.1"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 
-GPU_IDS="0,1,2,3,4,5"
-PROCS_PER_GPU=2
+GPU_IDS="4,5,6,7"
+PROCS_PER_GPU=3
 MAX_EPISODES=0
 SAVE_TOPDOWN=false
 SEED=42

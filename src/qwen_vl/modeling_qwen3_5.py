@@ -60,6 +60,45 @@ def _bounded_raw_alpha(alpha_init: float, alpha_max: float) -> torch.Tensor:
     return torch.tensor(_inverse_sigmoid(alpha_init / alpha_max), dtype=torch.float32)
 
 
+def _parse_action_bearing_inject_layers(raw_layers) -> tuple[int | None, tuple[int, ...] | None]:
+    if raw_layers is None:
+        return None, None
+    if isinstance(raw_layers, bool):
+        raise TypeError(f"action_bearing_inject_layers must be an int or a list of ints, got {raw_layers!r}")
+    if isinstance(raw_layers, int):
+        if raw_layers < 0:
+            raise ValueError(f"action_bearing_inject_layers must be >= 0, got {raw_layers}")
+        return int(raw_layers), None
+    if isinstance(raw_layers, str):
+        raw_layers = raw_layers.strip()
+        if raw_layers.lower() in {"", "none", "null"}:
+            return None, None
+        raw_layers = raw_layers.strip("[]")
+        raw_layers = [part.strip() for part in raw_layers.split(",") if part.strip()]
+    if not isinstance(raw_layers, (list, tuple)):
+        raise TypeError(
+            "action_bearing_inject_layers must be an int legacy count or an explicit list of decoder layer indices, "
+            f"got {type(raw_layers).__name__}"
+        )
+
+    indices = []
+    for layer_idx in raw_layers:
+        if isinstance(layer_idx, str):
+            layer_idx = layer_idx.strip()
+            if not layer_idx:
+                continue
+            layer_idx = int(layer_idx)
+        if isinstance(layer_idx, bool) or not isinstance(layer_idx, int):
+            raise TypeError(
+                "action_bearing_inject_layers explicit mode expects integer decoder layer indices, "
+                f"got {layer_idx!r}"
+            )
+        if layer_idx < 0:
+            raise ValueError(f"action_bearing_inject_layers layer indices must be >= 0, got {layer_idx}")
+        indices.append(int(layer_idx))
+    return None, tuple(dict.fromkeys(indices))
+
+
 def ensure_panovggt_config(config) -> None:
     vision_config = config.vision_config
     text_config = getattr(config, "text_config", None)
@@ -398,7 +437,10 @@ class ActionBearingKV(nn.Module):
         self.key_alpha_max = float(getattr(config, "action_bearing_key_alpha_max", 0.05))
         self.value_alpha_init = float(getattr(config, "action_bearing_value_alpha_init", 0.05))
         self.value_alpha_max = float(getattr(config, "action_bearing_value_alpha_max", 0.1))
-        self.inject_layers = int(getattr(config, "action_bearing_inject_layers", 16))
+        self.inject_layers, self.inject_layer_indices = _parse_action_bearing_inject_layers(
+            getattr(config, "action_bearing_inject_layers", 16)
+        )
+        self.inject_layer_index_set = frozenset(self.inject_layer_indices or ())
         self.turn_angle_deg = ACTION_BEARING_TURN_ANGLE_DEG
         self.max_steps = ACTION_BEARING_MAX_STEPS
         self.sigma_steps = ACTION_BEARING_SIGMA_STEPS
@@ -410,9 +452,6 @@ class ActionBearingKV(nn.Module):
             raise ValueError(f"action_bearing_max_steps must be >= 1, got {self.max_steps}")
         if self.sigma_steps <= 0.0:
             raise ValueError(f"action_bearing_sigma_steps must be positive, got {self.sigma_steps}")
-        if self.inject_layers < 0:
-            raise ValueError(f"action_bearing_inject_layers must be >= 0, got {self.inject_layers}")
-
         self.num_bins = 2 * self.max_steps + 1
         if len(ACTION_BEARING_BIN_TOKEN_IDS) != self.num_bins:
             raise AssertionError(
@@ -444,11 +483,16 @@ class ActionBearingKV(nn.Module):
         return math.radians(self.turn_angle_deg)
 
     def should_inject_layer(self, layer_idx: int | None) -> bool:
-        if not self.enabled or self.inject_layers <= 0:
+        if not self.enabled:
             return False
         if layer_idx is None:
             return False
-        return int(layer_idx) < self.inject_layers
+        layer_idx = int(layer_idx)
+        if self.inject_layer_indices is not None:
+            return layer_idx in self.inject_layer_index_set
+        if self.inject_layers is None or self.inject_layers <= 0:
+            return False
+        return layer_idx < self.inject_layers
 
     def reset_parameters(self, init_std: float = 0.02) -> None:
         nn.init.normal_(self.bin_embeddings, mean=0.0, std=float(init_std))
@@ -705,6 +749,32 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         layers = getattr(language_model, "layers", None)
         if layers is None:
             return
+
+        action_bearing_kv = self.action_bearing_kv
+        full_attention_layers = tuple(
+            layer_index
+            for layer_index, decoder_layer in enumerate(layers)
+            if getattr(decoder_layer, "self_attn", None) is not None
+        )
+        self._pano_action_bearing_attention_layers = full_attention_layers
+        if action_bearing_kv is not None and action_bearing_kv.inject_layer_indices is not None:
+            full_attention_layer_set = set(full_attention_layers)
+            missing_layers = [
+                layer_index
+                for layer_index in action_bearing_kv.inject_layer_indices
+                if layer_index not in full_attention_layer_set
+            ]
+            if missing_layers:
+                raise ValueError(
+                    "Action-Bearing KV can only inject Qwen full-attention decoder layers. "
+                    f"Requested layers {missing_layers} are not full-attention layers; "
+                    f"available full-attention layers are {list(full_attention_layers)}."
+                )
+        self._pano_action_bearing_inject_layers = tuple(
+            layer_index
+            for layer_index in full_attention_layers
+            if action_bearing_kv is not None and action_bearing_kv.should_inject_layer(layer_index)
+        )
 
         owner = self
         for layer_index, decoder_layer in enumerate(layers):
