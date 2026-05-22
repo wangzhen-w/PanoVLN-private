@@ -11,18 +11,21 @@ model:
     visual_merger: true
     language_model: true
     panovggt_mlp: true
-    action_bearing_kv: false
+    action_calibrator: true
   panovggt_enabled: true
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_init: 0.2
   panovggt_alpha_max: 0.4
   panovggt_force_fp32: false
-  action_bearing_enabled: false
-  action_bearing_key_alpha_init: 0.01
-  action_bearing_key_alpha_max: 0.03
-  action_bearing_value_alpha_init: 0.03
-  action_bearing_value_alpha_max: 0.08
-  action_bearing_inject_layers: [3, 7, 11, 15, 19, 23, 27, 31]   #32  Both writing styles are compatible.
+  action_calibrator_enabled: true
+  action_calibrator_hidden_size: 32
+  action_calibrator_max_delta: 0.35
+  action_calibrator_delta_scale: 1.0
+  action_calibrator_l2_weight: 1.0e-4
+  action_calibrator_turn_angle_deg: 15.0
+  action_calibrator_inference_enabled: true
+  action_calibrator_attention_layer_indices: [19, 23, 27, 31]
+  action_calibrator_step_decay: [1.0, 0.75, 0.55, 0.40]
 
 data:
   train_jsonl: "/workspace/code/a_property/dataset/PanoVLN/train_r2r_rxr_ebs_event050_bg005_tail100_taildense4.jsonl"
@@ -38,17 +41,17 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code/a_property/model/panovln_ebs_panovggt_again"
+  output_dir: "/workspace/code/a_property/model/panovln_ebs_panovggt_paac"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 8
   learning_rate: 2.0e-5
   language_model_lr: 2.0e-5
-  visual_lr: 2.0e-5
+  visual_lr: 5.0e-6
   visual_merger_lr: 2.0e-5
   panovggt_mlp_lr: 2.0e-5
-  action_bearing_kv_lr: 1.0e-5
+  action_calibrator_lr: 2.0e-5
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5
@@ -68,7 +71,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovln_ebs_panovggt_action_kv_joint_lr1e5_visual2e6"
+  run_name: "panovln_ebs_panovggt_paac"
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
@@ -82,10 +85,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovln_ebs_panovggt_action_kv_joint_lr1e5_visual2e6"
-  tags: ["qwen3.5-4b", "r2r-rxr", "ebs", "one-shot-joint-train", "word-action", "stop-pad", "panovggt-geometry", "action-bearing-kv", "action-kv-full-attn-3-7-11-15-19-23-27-31", "panovggt-alpha0p2-max0p4", "action-alpha-key0p01-value0p03", "lm-lr1e-5", "visual-lr2e-6", "merger-lr1e-5", "panovggt-lr1e-5", "action-kv-lr1e-5", "warmup-0p03", "bf16", "flash", "4gpu", "global-batch-128"]
+  name: "panovln_ebs_panovggt_paac"
+  tags: ["qwen3.5-4b", "r2r-rxr", "ebs", "one-shot-joint-train", "word-action", "stop-pad", "panovggt-geometry", "paac", "attention-to-action", "lm-lr2e-5", "visual-lr5e-6", "merger-lr2e-5", "panovggt-lr2e-5", "calibrator-lr2e-5", "warmup-0p03", "bf16", "eager-attn", "4gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "One-shot joint training from /workspace/code_dir/a_property/model/Qwen3.5-4B on the R2R+RxR EBS dataset train_r2r_rxr_ebs_event050_bg005_tail100_taildense4.jsonl. PanoVGGT and action-bearing KV are enabled from the start instead of continuing from a PanoVGGT-only checkpoint. Module-wise LR: language_model=1e-5, visual=2e-6, visual_merger=1e-5, panovggt_mlp=1e-5, action_bearing_kv=1e-5. Action KV explicitly injects Qwen full-attention decoder layers [3, 7, 11, 15, 19, 23, 27, 31] with key/value alpha init 0.01/0.03 and max 0.03/0.08. PanoVGGT alpha init/max is 0.2/0.4. Uses bf16/flash on GPUs 0-3 with per_device_train_batch_size=4 and gradient_accumulation_steps=8 for global batch 128."
+  notes: "One-shot joint training from /workspace/code/a_property/model/Qwen3.5-4B on the R2R+RxR EBS dataset. PanoVGGT geometry and PAAC/ActionCalibrator are enabled from the start. PAAC reads the model's existing decoder attention from action-query positions to current panorama image tokens, pools the attention over the 360-degree yaw ring into directional evidence and confidence features, then adds a bounded zero-mean residual only to forward/left/right logits before CE; stop is left to the base LM head. Module-wise LR: language_model=2e-5, visual=5e-6, visual_merger=2e-5, panovggt_mlp=2e-5, action_calibrator=2e-5."
   id: null
   resume: "never"

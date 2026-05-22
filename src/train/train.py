@@ -29,15 +29,13 @@ RANK = int(os.environ.get("RANK", "0"))
 class PanoVLNTrainer(Trainer):
     RAW_ALPHA_NO_DECAY_SUFFIXES = (
         "panovggt_mlp.raw_alpha",
-        "action_bearing_kv.raw_key_alpha",
-        "action_bearing_kv.raw_value_alpha",
     )
     MODULE_LR_KEYS = (
         "language_model",
         "visual",
         "visual_merger",
         "panovggt_mlp",
-        "action_bearing_kv",
+        "action_calibrator",
     )
 
     def __init__(self, *args, module_learning_rates=None, **kwargs):
@@ -61,8 +59,8 @@ class PanoVLNTrainer(Trainer):
         return name == module_name or name.startswith(f"{module_name}.") or f".{module_name}." in name
 
     def _module_lr_key_for_parameter(self, name: str):
-        if self._name_has_module(name, "action_bearing_kv"):
-            return "action_bearing_kv"
+        if self._name_has_module(name, "action_calibrator"):
+            return "action_calibrator"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -154,12 +152,17 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_alpha_init: {_config_value(cfg.model.panovggt_alpha_init)}")
     rank0_print(RANK, f"panovggt_alpha_max: {_config_value(cfg.model.panovggt_alpha_max)}")
     rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
-    rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
-    rank0_print(RANK, f"action_bearing_key_alpha_init: {_config_value(cfg.model.action_bearing_key_alpha_init)}")
-    rank0_print(RANK, f"action_bearing_key_alpha_max: {_config_value(cfg.model.action_bearing_key_alpha_max)}")
-    rank0_print(RANK, f"action_bearing_value_alpha_init: {_config_value(cfg.model.action_bearing_value_alpha_init)}")
-    rank0_print(RANK, f"action_bearing_value_alpha_max: {_config_value(cfg.model.action_bearing_value_alpha_max)}")
-    rank0_print(RANK, f"action_bearing_inject_layers: {_config_value(cfg.model.action_bearing_inject_layers)}")
+    rank0_print(RANK, f"action_calibrator_enabled: {_config_value(cfg.model.action_calibrator_enabled)}")
+    rank0_print(RANK, f"action_calibrator_hidden_size: {_config_value(cfg.model.action_calibrator_hidden_size)}")
+    rank0_print(RANK, f"action_calibrator_max_delta: {_config_value(cfg.model.action_calibrator_max_delta)}")
+    rank0_print(RANK, f"action_calibrator_delta_scale: {_config_value(cfg.model.action_calibrator_delta_scale)}")
+    rank0_print(RANK, f"action_calibrator_l2_weight: {_config_value(cfg.model.action_calibrator_l2_weight)}")
+    rank0_print(RANK, f"action_calibrator_turn_angle_deg: {_config_value(cfg.model.action_calibrator_turn_angle_deg)}")
+    rank0_print(RANK, f"action_calibrator_inference_enabled: {_config_value(cfg.model.action_calibrator_inference_enabled)}")
+    rank0_print(RANK, f"action_calibrator_attention_layer_indices: {_config_value(cfg.model.action_calibrator_attention_layer_indices)}")
+    if cfg.model.action_calibrator_attention_layers is not None:
+        rank0_print(RANK, f"action_calibrator_attention_layers: {_config_value(cfg.model.action_calibrator_attention_layers)}")
+    rank0_print(RANK, f"action_calibrator_step_decay: {_config_value(cfg.model.action_calibrator_step_decay)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -167,7 +170,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
-    rank0_print(RANK, f"action_bearing_kv_lr: {_config_value(cfg.training.action_bearing_kv_lr)}")
+    rank0_print(RANK, f"action_calibrator_lr: {_config_value(cfg.training.action_calibrator_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -287,13 +290,6 @@ def main():
     )
 
     model = load_model(cfg)
-    if RANK == 0:
-        action_attention_layers = getattr(model, "_pano_action_bearing_attention_layers", None)
-        action_inject_layers = getattr(model, "_pano_action_bearing_inject_layers", None)
-        if action_attention_layers is not None:
-            rank0_print(RANK, f"action_bearing_full_attention_layers: {list(action_attention_layers)}")
-        if action_inject_layers is not None:
-            rank0_print(RANK, f"action_bearing_actual_inject_layers: {list(action_inject_layers)}")
     sync_model_special_tokens(model, tokenizer)
     set_model(cfg, model)
 
@@ -314,7 +310,7 @@ def main():
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
-            "action_bearing_kv": cfg.training.action_bearing_kv_lr,
+            "action_calibrator": cfg.training.action_calibrator_lr,
         },
         compute_metrics=(
             build_action_accuracy(

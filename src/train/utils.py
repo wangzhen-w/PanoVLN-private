@@ -27,7 +27,7 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "panovggt_mlp": True,
-    "action_bearing_kv": True,
+    "action_calibrator": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,7 +74,7 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
-        "action_bearing_kv": getattr(model, "action_bearing_kv", None),
+        "action_calibrator": getattr(model, "action_calibrator", None),
         "language_model": language_model,
     }
 
@@ -85,13 +85,6 @@ def set_model(cfg, model):
             continue
         for _, param in module.named_parameters():
             param.requires_grad = True
-
-    action_bearing_kv = named_modules.get("action_bearing_kv")
-    if action_bearing_kv is not None:
-        if float(getattr(action_bearing_kv, "key_alpha_max", 0.0)) <= 0.0:
-            action_bearing_kv.raw_key_alpha.requires_grad = False
-        if float(getattr(action_bearing_kv, "value_alpha_max", 0.0)) <= 0.0:
-            action_bearing_kv.raw_value_alpha.requires_grad = False
 
     if trainable_modules.get("language_model"):
         if hasattr(model, "lm_head"):
@@ -116,13 +109,17 @@ def _load_model_config(cfg):
         "panovggt_alpha_max",
         "panovggt_force_fp32",
     )
-    action_bearing_fields = (
-        "action_bearing_enabled",
-        "action_bearing_key_alpha_init",
-        "action_bearing_key_alpha_max",
-        "action_bearing_value_alpha_init",
-        "action_bearing_value_alpha_max",
-        "action_bearing_inject_layers",
+    action_calibrator_fields = (
+        "action_calibrator_enabled",
+        "action_calibrator_hidden_size",
+        "action_calibrator_max_delta",
+        "action_calibrator_delta_scale",
+        "action_calibrator_l2_weight",
+        "action_calibrator_turn_angle_deg",
+        "action_calibrator_inference_enabled",
+        "action_calibrator_attention_layer_indices",
+        "action_calibrator_attention_layers",
+        "action_calibrator_step_decay",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -135,7 +132,7 @@ def _load_model_config(cfg):
                 delattr(config, field_name)
 
     apply_module_fields(bool(cfg.model.panovggt_enabled), panovggt_fields)
-    apply_module_fields(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
+    apply_module_fields(bool(cfg.model.action_calibrator_enabled), action_calibrator_fields)
     return config
 
 

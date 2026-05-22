@@ -382,7 +382,7 @@ class PanoVLN_Agent(Agent):
         max_memory_images,
         memory_pool_window_frames,
         save_topdown=False,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
     ):
         
         print("Initialize PanoVLN")
@@ -499,6 +499,7 @@ class PanoVLN_Agent(Agent):
                 top_p=generation_kwargs["top_p"],
                 num_beams=generation_kwargs["num_beams"],
                 max_new_tokens=generation_kwargs["max_new_tokens"],
+                use_cache=False,
             )
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(prompt_inputs.input_ids, cont)
@@ -641,7 +642,7 @@ def main():
     parser.add_argument("--total-max-episodes", type=int, default=0,
                         help="limit total eval episodes before splitting across workers; 0 means all")
     parser.add_argument("--save-topdown",type=str2bool,default=False,help="save per-episode top-down videos")
-    parser.add_argument("--attn-implementation", type=str, default="sdpa",
+    parser.add_argument("--attn-implementation", type=str, default="flash_attention_2",
                         choices=["sdpa", "flash_attention_2", "eager"],
                         help="attention backend used to load the model")
     parser.add_argument("--early-stop-max-steps", type=int, default=0,

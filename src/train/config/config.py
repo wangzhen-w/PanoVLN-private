@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -19,12 +19,16 @@ class ModelConfig:
     panovggt_alpha_init: float = 0.1
     panovggt_alpha_max: float = 0.2
     panovggt_force_fp32: bool = False
-    action_bearing_enabled: bool = False
-    action_bearing_key_alpha_init: float = 0.02
-    action_bearing_key_alpha_max: float = 0.05
-    action_bearing_value_alpha_init: float = 0.05
-    action_bearing_value_alpha_max: float = 0.1
-    action_bearing_inject_layers: Optional[Union[int, List[int]]] = 16
+    action_calibrator_enabled: bool = False
+    action_calibrator_hidden_size: int = 64
+    action_calibrator_max_delta: float = 0.35
+    action_calibrator_delta_scale: float = 1.0
+    action_calibrator_l2_weight: float = 0.0
+    action_calibrator_turn_angle_deg: float = 15.0
+    action_calibrator_inference_enabled: bool = True
+    action_calibrator_attention_layer_indices: Optional[List[int]] = None
+    action_calibrator_attention_layers: Optional[Any] = None
+    action_calibrator_step_decay: Optional[List[float]] = None
 
 
 @dataclass
@@ -53,7 +57,7 @@ class TrainingConfig:
     visual_lr: Optional[float] = None
     visual_merger_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
-    action_bearing_kv_lr: Optional[float] = None
+    action_calibrator_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10
