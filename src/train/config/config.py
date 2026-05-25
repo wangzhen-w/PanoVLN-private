@@ -21,7 +21,8 @@ class ModelConfig:
     panovggt_force_fp32: bool = False
     action_calibrator_enabled: bool = False
     action_calibrator_hidden_size: int = 64
-    action_calibrator_max_delta: float = 0.35
+    action_calibrator_alpha_init: float = 0.225
+    action_calibrator_alpha_max: float = 0.45
     action_calibrator_delta_scale: float = 1.0
     action_calibrator_l2_weight: float = 0.0
     action_calibrator_turn_angle_deg: float = 15.0

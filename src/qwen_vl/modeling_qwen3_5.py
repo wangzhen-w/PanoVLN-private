@@ -24,6 +24,7 @@ ACTION_CALIBRATOR_ACTIONS = ("stop", "forward", "left", "right")
 ACTION_CALIBRATOR_MOVEMENT_ACTION_INDICES = (1, 2, 3)
 ACTION_CALIBRATOR_FIRST_TOKEN_IDS = (9215, 13048, 2282, 1246)
 ACTION_CALIBRATOR_NEXT_TOKEN_IDS = (2842, 4487, 2047, 1245)
+ACTION_CALIBRATOR_MODE_THRESHOLD = 0.35
 ACTION_CALIBRATOR_TOKEN_TO_ACTION = {
     token_id: action_index
     for action_index, token_ids in enumerate(zip(ACTION_CALIBRATOR_FIRST_TOKEN_IDS, ACTION_CALIBRATOR_NEXT_TOKEN_IDS))
@@ -362,7 +363,8 @@ def ensure_action_calibrator_config(config) -> None:
     defaults = {
         "action_calibrator_enabled": False,
         "action_calibrator_hidden_size": 64,
-        "action_calibrator_max_delta": 0.35,
+        "action_calibrator_alpha_init": 0.225,
+        "action_calibrator_alpha_max": 0.45,
         "action_calibrator_delta_scale": 1.0,
         "action_calibrator_l2_weight": 0.0,
         "action_calibrator_turn_angle_deg": 15.0,
@@ -391,7 +393,8 @@ class ActionCalibrator(nn.Module):
         ensure_action_calibrator_config(config)
         self.enabled = bool(getattr(config, "action_calibrator_enabled", False))
         self.inner_size = int(getattr(config, "action_calibrator_hidden_size", 64))
-        self.max_delta = float(getattr(config, "action_calibrator_max_delta", 0.35))
+        self.alpha_init = float(getattr(config, "action_calibrator_alpha_init", 0.225))
+        self.alpha_max = float(getattr(config, "action_calibrator_alpha_max", 0.45))
         self.delta_scale = float(getattr(config, "action_calibrator_delta_scale", 1.0))
         self.turn_angle_deg = float(getattr(config, "action_calibrator_turn_angle_deg", 15.0))
         self.attention_layer_indices = self._normalize_attention_layer_indices(
@@ -405,6 +408,7 @@ class ActionCalibrator(nn.Module):
         while len(step_decay) < ACTION_CALIBRATOR_MAX_STEPS:
             step_decay.append(float(step_decay[-1]))
         self.step_decay = tuple(float(value) for value in step_decay[:ACTION_CALIBRATOR_MAX_STEPS])
+        self.mode_threshold = ACTION_CALIBRATOR_MODE_THRESHOLD
 
         self.mlp = nn.Sequential(
             nn.LayerNorm(self.FEATURE_SIZE),
@@ -412,6 +416,8 @@ class ActionCalibrator(nn.Module):
             nn.SiLU(),
             nn.Linear(self.inner_size, len(ACTION_CALIBRATOR_MOVEMENT_ACTION_INDICES)),
         )
+        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+        self.last_diagnostics = None
         self.reset_parameters()
 
     @staticmethod
@@ -422,11 +428,143 @@ class ActionCalibrator(nn.Module):
             return (int(value),)
         return tuple(int(index) for index in value)
 
+    @property
+    def alpha(self) -> torch.Tensor:
+        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
+
     def reset_parameters(self) -> None:
         self.mlp[0].reset_parameters()
         self.mlp[1].reset_parameters()
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
+        with torch.no_grad():
+            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+
+    @staticmethod
+    def _largest_connected_component(
+        mask: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, float, int]:
+        height, width = [int(value) for value in mask.shape]
+        visited = torch.zeros_like(mask, dtype=torch.bool)
+        best_coords = []
+        best_mass = -1.0
+
+        for start_y in range(height):
+            for start_x in range(width):
+                if bool(visited[start_y, start_x].item()) or not bool(mask[start_y, start_x].item()):
+                    continue
+                stack = [(start_y, start_x)]
+                visited[start_y, start_x] = True
+                coords = []
+                mass = 0.0
+
+                while stack:
+                    y, x = stack.pop()
+                    coords.append((y, x))
+                    mass += float(weights[y, x].item())
+                    for dy in (-1, 0, 1):
+                        ny = y + dy
+                        if ny < 0 or ny >= height:
+                            continue
+                        for dx in (-1, 0, 1):
+                            if dy == 0 and dx == 0:
+                                continue
+                            nx = (x + dx) % width
+                            if bool(visited[ny, nx].item()) or not bool(mask[ny, nx].item()):
+                                continue
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+
+                if mass > best_mass:
+                    best_mass = mass
+                    best_coords = coords
+
+        component = torch.zeros_like(mask, dtype=torch.bool)
+        for y, x in best_coords:
+            component[y, x] = True
+        return component, max(best_mass, 0.0), len(best_coords)
+
+    def _dominant_attention_mode(
+        self,
+        norm_attn: torch.Tensor,
+        image_grid_hw,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_items, token_count = [int(value) for value in norm_attn.shape]
+        if image_grid_hw is None:
+            return (
+                norm_attn,
+                norm_attn.new_ones((num_items,), dtype=torch.float32),
+                norm_attn.new_full((num_items,), token_count, dtype=torch.float32),
+            )
+        if torch.is_tensor(image_grid_hw):
+            grid_values = image_grid_hw.detach().to(device="cpu", dtype=torch.long).flatten().tolist()
+        else:
+            grid_values = list(image_grid_hw)
+        if len(grid_values) != 2:
+            return (
+                norm_attn,
+                norm_attn.new_ones((num_items,), dtype=torch.float32),
+                norm_attn.new_full((num_items,), token_count, dtype=torch.float32),
+            )
+
+        grid_h, grid_w = [int(value) for value in grid_values]
+        if grid_h <= 0 or grid_w <= 0 or grid_h * grid_w != token_count:
+            return (
+                norm_attn,
+                norm_attn.new_ones((num_items,), dtype=torch.float32),
+                norm_attn.new_full((num_items,), token_count, dtype=torch.float32),
+            )
+
+        grid = norm_attn.reshape(num_items, grid_h, grid_w)
+        hpad = torch.cat([grid[..., -1:], grid, grid[..., :1]], dim=-1)
+        padded = F.pad(hpad.unsqueeze(1), (0, 0, 1, 1), mode="replicate")
+        kernel = grid.new_tensor(
+            [
+                [1.0, 2.0, 1.0],
+                [2.0, 4.0, 2.0],
+                [1.0, 2.0, 1.0],
+            ],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3) / 16.0
+        smooth = F.conv2d(padded.to(dtype=torch.float32), kernel).squeeze(1)
+        thresholds = smooth.flatten(1).amax(dim=-1) * float(self.mode_threshold)
+        candidate_masks = smooth >= thresholds.view(num_items, 1, 1)
+
+        mode_grids = []
+        mode_masses = []
+        mode_areas = []
+        for item_index in range(num_items):
+            item_grid = grid[item_index]
+            item_mask = candidate_masks[item_index]
+            if float(item_grid.sum().item()) <= 0.0 or not bool(item_mask.any().item()):
+                mode_grids.append(item_grid)
+                mode_masses.append(1.0)
+                mode_areas.append(float(token_count))
+                continue
+
+            component_cpu, mode_mass, mode_area = self._largest_connected_component(
+                item_mask.detach().to(device="cpu", dtype=torch.bool),
+                item_grid.detach().to(device="cpu", dtype=torch.float32),
+            )
+            if mode_mass <= 0.0 or mode_area <= 0:
+                mode_grids.append(item_grid)
+                mode_masses.append(1.0)
+                mode_areas.append(float(token_count))
+                continue
+
+            component = component_cpu.to(device=norm_attn.device, dtype=item_grid.dtype)
+            mode_grid = item_grid * component
+            mode_grid = mode_grid / mode_grid.sum().clamp_min(torch.finfo(mode_grid.dtype).eps)
+            mode_grids.append(mode_grid)
+            mode_masses.append(float(mode_mass))
+            mode_areas.append(float(mode_area))
+
+        return (
+            torch.stack(mode_grids, dim=0).reshape(num_items, token_count),
+            norm_attn.new_tensor(mode_masses, dtype=torch.float32),
+            norm_attn.new_tensor(mode_areas, dtype=torch.float32),
+        )
 
     def forward(
         self,
@@ -434,18 +572,21 @@ class ActionCalibrator(nn.Module):
         image_yaw: torch.Tensor,
         prefix_yaw_deg: torch.Tensor,
         decode_step: torch.Tensor,
+        base_action_logits: torch.Tensor | None = None,
+        image_grid_hw=None,
     ) -> torch.Tensor:
         if (
             not self.enabled
             or attention_to_image.numel() == 0
             or image_yaw.numel() == 0
-            or self.max_delta <= 0.0
+            or self.alpha_max <= 0.0
             or self.delta_scale == 0.0
         ):
             return attention_to_image.new_zeros(
                 (int(attention_to_image.shape[0]), len(ACTION_CALIBRATOR_MOVEMENT_ACTION_INDICES))
             )
 
+        num_items = int(attention_to_image.shape[0])
         attn = attention_to_image.detach().to(torch.float32).clamp_min(0.0)
         eps = torch.finfo(attn.dtype).eps
         image_mass = attn.sum(dim=-1).clamp_min(eps)
@@ -460,19 +601,26 @@ class ActionCalibrator(nn.Module):
 
         sin_yaw = torch.sin(rel_yaw)
         cos_yaw = torch.cos(rel_yaw)
+        mode_attn, mode_mass, mode_area = self._dominant_attention_mode(
+            norm_attn=norm_attn,
+            image_grid_hw=image_grid_hw,
+        )
         front_kernel = cos_yaw.clamp_min(0.0)
         right_kernel = sin_yaw.clamp_min(0.0)
         left_kernel = (-sin_yaw).clamp_min(0.0)
         back_kernel = (-cos_yaw).clamp_min(0.0)
 
-        e_front = (norm_attn * front_kernel).sum(dim=-1)
-        e_left = (norm_attn * left_kernel).sum(dim=-1)
-        e_right = (norm_attn * right_kernel).sum(dim=-1)
-        e_back = (norm_attn * back_kernel).sum(dim=-1)
-        mean_sin = (norm_attn * sin_yaw).sum(dim=-1)
-        mean_cos = (norm_attn * cos_yaw).sum(dim=-1)
+        e_front = (mode_attn * front_kernel).sum(dim=-1)
+        e_left = (mode_attn * left_kernel).sum(dim=-1)
+        e_right = (mode_attn * right_kernel).sum(dim=-1)
+        e_back = (mode_attn * back_kernel).sum(dim=-1)
+        full_mean_sin = (norm_attn * sin_yaw).sum(dim=-1)
+        full_mean_cos = (norm_attn * cos_yaw).sum(dim=-1)
+        full_concentration = torch.sqrt(full_mean_sin.square() + full_mean_cos.square()).clamp(max=1.0)
+        mean_sin = (mode_attn * sin_yaw).sum(dim=-1)
+        mean_cos = (mode_attn * cos_yaw).sum(dim=-1)
         concentration = torch.sqrt(mean_sin.square() + mean_cos.square()).clamp(max=1.0)
-        confidence = image_mass.clamp(max=1.0).sqrt() * concentration
+        confidence = image_mass.clamp(max=1.0).sqrt() * concentration * mode_mass.clamp(max=1.0).sqrt()
         step = decode_step.to(device=attn.device, dtype=torch.long).clamp(
             min=0,
             max=ACTION_CALIBRATOR_MAX_STEPS - 1,
@@ -487,12 +635,58 @@ class ActionCalibrator(nn.Module):
             ],
             dim=-1,
         )
+        attention_prior = torch.stack(
+            [
+                e_front - torch.maximum(e_left, e_right) - e_back,
+                e_left - e_right,
+                e_right - e_left,
+            ],
+            dim=-1,
+        )
+
+        with torch.no_grad():
+            entropy = -(norm_attn * torch.log(norm_attn + eps)).sum(dim=-1)
+            base_top1_is_stop = None
+            if base_action_logits is not None and base_action_logits.numel() > 0:
+                base_top1_is_stop = (
+                    base_action_logits.detach().to(device=attn.device, dtype=torch.float32).argmax(dim=-1) == 0
+                )
+            self.last_diagnostics = {
+                "e_front": e_front.detach(),
+                "e_left": e_left.detach(),
+                "e_right": e_right.detach(),
+                "e_back": e_back.detach(),
+                "entropy": entropy.detach(),
+                "confidence": confidence.detach(),
+                "full_concentration": full_concentration.detach(),
+                "mode_concentration": concentration.detach(),
+                "mode_mass": mode_mass.detach(),
+                "mode_area": mode_area.detach(),
+                "alpha": self.alpha.detach(),
+                "prior_forward": attention_prior[:, 0].detach(),
+                "prior_left": attention_prior[:, 1].detach(),
+                "prior_right": attention_prior[:, 2].detach(),
+                "base_top1_is_stop": None if base_top1_is_stop is None else base_top1_is_stop.detach(),
+            }
+
         param_dtype = next(self.mlp.parameters()).dtype
-        delta = self.mlp(features.to(dtype=param_dtype)).to(torch.float32)
+        residual = self.mlp(features.to(dtype=param_dtype)).to(torch.float32)
+        delta = attention_prior + residual
         delta = delta - delta.mean(dim=-1, keepdim=True)
-        delta = self.max_delta * torch.tanh(self.delta_scale * delta)
+        alpha = self.alpha.to(device=delta.device, dtype=delta.dtype)
+        delta = alpha * torch.tanh(self.delta_scale * delta)
         step_decay = attn.new_tensor(self.step_decay, dtype=torch.float32)[step].unsqueeze(-1)
         delta = delta * confidence.unsqueeze(-1) * step_decay
+        if base_action_logits is not None and base_action_logits.numel() > 0:
+            if int(base_action_logits.shape[0]) != num_items or int(base_action_logits.shape[-1]) != len(ACTION_CALIBRATOR_ACTIONS):
+                raise ValueError(
+                    "ActionCalibrator base_action_logits must have shape [N, 4], got "
+                    f"{tuple(base_action_logits.shape)}"
+                )
+            base_top1_is_stop = (
+                base_action_logits.detach().to(device=attn.device, dtype=torch.float32).argmax(dim=-1) == 0
+            )
+            delta = delta.masked_fill(base_top1_is_stop.unsqueeze(-1), 0.0)
         return delta.to(dtype=attention_to_image.dtype)
 
 
@@ -511,6 +705,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.output_norm.weight",
     )
     ACTION_CALIBRATOR_STATE_KEYS = (
+        "action_calibrator.raw_alpha",
         "action_calibrator.mlp.0.weight",
         "action_calibrator.mlp.0.bias",
         "action_calibrator.mlp.1.weight",
@@ -621,7 +816,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             - math.pi
         )
         yaw = yaw.unsqueeze(0).expand(target_h, target_w).reshape(-1)
-        return current_positions, yaw
+        return current_positions, yaw, (target_h, target_w)
 
     @staticmethod
     def _select_rope_positions(rope: torch.Tensor, batch_index: int, positions: torch.Tensor) -> torch.Tensor:
@@ -702,7 +897,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 context = self._action_calibrator_current_image_context(input_ids, image_grid_thw, batch_index)
                 if context is None:
                     continue
-                image_positions, _ = context
+                image_positions, _, _ = context
                 plan[batch_index] = {
                     "query_positions": torch.tensor(query_positions, device=input_ids.device, dtype=torch.long),
                     "image_positions": image_positions.to(device=input_ids.device, dtype=torch.long),
@@ -722,7 +917,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 context = self._action_calibrator_current_image_context(input_ids, image_grid_thw, batch_index)
                 if context is None:
                     continue
-                image_positions, _ = context
+                image_positions, _, _ = context
                 plan[batch_index] = {
                     "query_positions": torch.tensor([query_pos], device=input_ids.device, dtype=torch.long),
                     "image_positions": image_positions.to(device=input_ids.device, dtype=torch.long),
@@ -903,7 +1098,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             )
             if context is None:
                 continue
-            image_positions, image_yaw = context
+            image_positions, image_yaw, image_grid_hw = context
 
             prefix_yaws = []
             prefix_yaw = 0.0
@@ -912,7 +1107,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             turn_angle = float(getattr(calibrator, "turn_angle_deg", 15.0))
             for action_id in action_ids:
                 prefix_yaws.append(prefix_yaw)
-                active_mask.append(0.0 if stopped else 1.0)
+                active_mask.append(0.0 if stopped or action_id == 0 else 1.0)
                 if stopped:
                     continue
                 if action_id == 0:
@@ -933,15 +1128,33 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if attention_to_image is None:
                 continue
 
+            base_action_logits = torch.stack(
+                [
+                    logits[
+                        batch_index,
+                        shift_pos,
+                        action_token_sets[0 if action_order == 0 else 1],
+                    ]
+                    for action_order, shift_pos in enumerate(action_label_positions)
+                ],
+                dim=0,
+            )
             delta = calibrator(
                 attention_to_image=attention_to_image,
                 image_yaw=image_yaw,
                 prefix_yaw_deg=torch.tensor(prefix_yaws, device=logits.device, dtype=torch.float32),
-                decode_step=torch.arange(len(action_label_positions), device=logits.device, dtype=torch.float32),
+                decode_step=torch.arange(len(action_label_positions), device=logits.device, dtype=torch.long),
+                base_action_logits=base_action_logits,
+                image_grid_hw=image_grid_hw,
             )
-            delta = delta * torch.tensor(active_mask, device=logits.device, dtype=torch.float32).unsqueeze(-1)
+            active_mask_tensor = torch.tensor(active_mask, device=logits.device, dtype=torch.bool)
+            base_top1_is_stop = base_action_logits.detach().to(dtype=torch.float32).argmax(dim=-1) == 0
+            apply_mask = active_mask_tensor & ~base_top1_is_stop
+            delta = delta * active_mask_tensor.to(dtype=torch.float32).unsqueeze(-1)
             delta_chunks.append(delta.float())
             for action_order, shift_pos in enumerate(action_label_positions):
+                if not bool(apply_mask[action_order].item()):
+                    continue
                 token_ids = action_token_sets[0 if action_order == 0 else 1]
                 movement_token_ids = token_ids.index_select(0, movement_indices)
                 calibrated_logits[batch_index, shift_pos, movement_token_ids] = (
@@ -1016,7 +1229,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             )
             if context is None:
                 continue
-            image_positions, image_yaw = context
+            image_positions, image_yaw, image_grid_hw = context
             action_position = torch.tensor([query_pos], device=logits.device, dtype=torch.long)
             attention_to_image = self._action_calibrator_attention_to_image(
                 attentions=attentions,
@@ -1031,12 +1244,17 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             turn_angle = float(getattr(calibrator, "turn_angle_deg", 15.0))
             prefix_yaw = self._action_calibrator_prefix_yaw(prefix_actions, turn_angle)
             token_ids = action_token_sets[0 if decode_step == 0 else 1]
+            base_action_logits = logits[batch_index, logit_pos, token_ids]
+            if int(base_action_logits.detach().to(dtype=torch.float32).argmax(dim=-1).item()) == 0:
+                continue
             movement_token_ids = token_ids.index_select(0, movement_indices)
             delta = calibrator(
                 attention_to_image=attention_to_image,
                 image_yaw=image_yaw,
                 prefix_yaw_deg=torch.tensor([prefix_yaw], device=logits.device, dtype=torch.float32),
-                decode_step=torch.tensor([decode_step], device=logits.device, dtype=torch.float32),
+                decode_step=torch.tensor([decode_step], device=logits.device, dtype=torch.long),
+                base_action_logits=base_action_logits.unsqueeze(0),
+                image_grid_hw=image_grid_hw,
             )[0]
             calibrated_logits[batch_index, logit_pos, movement_token_ids] = (
                 calibrated_logits[batch_index, logit_pos, movement_token_ids] + delta.to(calibrated_logits.dtype)
@@ -1561,6 +1779,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values=None,
         **kwargs,
     ):
+        if self._action_calibrator_enabled():
+            use_cache = False
+            past_key_values = None
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1576,6 +1797,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             panovggt_pixel_values=panovggt_pixel_values,
             **kwargs,
         )
+        if self._action_calibrator_enabled():
+            model_inputs["use_cache"] = False
+            model_inputs["past_key_values"] = None
         if not is_first_iteration and use_cache:
             model_inputs["panovggt_pixel_values"] = None
         return model_inputs

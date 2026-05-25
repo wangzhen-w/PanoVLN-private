@@ -112,7 +112,8 @@ def _load_model_config(cfg):
     action_calibrator_fields = (
         "action_calibrator_enabled",
         "action_calibrator_hidden_size",
-        "action_calibrator_max_delta",
+        "action_calibrator_alpha_init",
+        "action_calibrator_alpha_max",
         "action_calibrator_delta_scale",
         "action_calibrator_l2_weight",
         "action_calibrator_turn_angle_deg",
