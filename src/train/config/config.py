@@ -14,8 +14,15 @@ class ModelConfig:
     image_token: str = "<image>"
     model_max_length: Optional[int] = None
     trainable_modules: Optional[Dict[str, bool]] = None
+    erp_pos_enabled: bool = False
+    erp_pos_hidden_size: Optional[int] = None
+    erp_pos_alpha_init: float = 0.02
+    erp_pos_alpha_max: float = 0.1
+    erp_assume_centered: bool = True
+    erp_center_latitude_deg: float = 0.0
+    erp_apply_to_current_only: bool = True
     panovggt_enabled: bool = False
-    panovggt_checkpoint_path: str = "/workspace/code_dir/a_property/model/PanoVGGT/model.pt"
+    panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_init: float = 0.1
     panovggt_alpha_max: float = 0.2
     panovggt_force_fp32: bool = False
@@ -52,6 +59,7 @@ class TrainingConfig:
     language_model_lr: Optional[float] = None
     visual_lr: Optional[float] = None
     visual_merger_lr: Optional[float] = None
+    erp_position_mlp_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
     action_bearing_kv_lr: Optional[float] = None
     weight_decay: float = 0.0

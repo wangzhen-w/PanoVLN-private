@@ -26,6 +26,7 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual": True,
     "visual_merger": True,
     "language_model": True,
+    "erp_position_mlp": True,
     "panovggt_mlp": True,
     "action_bearing_kv": True,
 }
@@ -73,6 +74,7 @@ def set_model(cfg, model):
             getattr(visual_model, "merger", None)
             if visual_model is not None else None
         ),
+        "erp_position_mlp": getattr(model, "erp_position_mlp", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
         "action_bearing_kv": getattr(model, "action_bearing_kv", None),
         "language_model": language_model,
@@ -109,6 +111,15 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
+    erp_fields = (
+        "erp_pos_enabled",
+        "erp_pos_hidden_size",
+        "erp_pos_alpha_init",
+        "erp_pos_alpha_max",
+        "erp_assume_centered",
+        "erp_center_latitude_deg",
+        "erp_apply_to_current_only",
+    )
     panovggt_fields = (
         "panovggt_enabled",
         "panovggt_checkpoint_path",
@@ -134,6 +145,21 @@ def _load_model_config(cfg):
             if hasattr(config, field_name):
                 delattr(config, field_name)
 
+    def apply_vision_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is None:
+            return
+        if enabled:
+            for field_name in field_names:
+                value = getattr(cfg.model, field_name)
+                if value is not None:
+                    setattr(vision_config, field_name, value)
+            return
+        for field_name in field_names:
+            if hasattr(vision_config, field_name):
+                delattr(vision_config, field_name)
+
+    apply_vision_module_fields(bool(cfg.model.erp_pos_enabled), erp_fields)
     apply_module_fields(bool(cfg.model.panovggt_enabled), panovggt_fields)
     apply_module_fields(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config

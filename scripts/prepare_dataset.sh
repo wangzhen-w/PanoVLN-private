@@ -13,17 +13,17 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-INPUT_ROOT="/workspace/code_dir/a_property/dataset/PanoVLN"
-OUTPUT_PATH="/workspace/code_dir/a_property/dataset/PanoVLN/train_scalevln_ebs_event0p50_bg0p10_tail0p70.jsonl"
-DATASET_NAMES=(scalevln)
+INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
+OUTPUT_PATH="/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
+DATASET_NAMES=(r2r rxr)
 MAX_EPISODES_PER_SUBSET=""
 PAD_STOP_TO_HORIZON="true"
 SEED="42"
 
 EVENT_KEEP_PROB="0.50"
-BACKGROUND_KEEP_PROB="0.10"
+BACKGROUND_KEEP_PROB="0.05"
 BODY_KEEP_ADVANCE="4"
-TAIL_DENSE_KEEP_PROB="0.70"
+TAIL_DENSE_KEEP_PROB="0.80"
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
 

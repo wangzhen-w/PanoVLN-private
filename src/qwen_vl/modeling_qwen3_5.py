@@ -99,13 +99,188 @@ def _parse_action_bearing_inject_layers(raw_layers) -> tuple[int | None, tuple[i
     return None, tuple(dict.fromkeys(indices))
 
 
+def ensure_erp_vision_config(vision_config) -> None:
+    defaults = {
+        "erp_pos_enabled": False,
+        "erp_pos_hidden_size": getattr(vision_config, "hidden_size", 1024),
+        "erp_pos_alpha_init": 0.02,
+        "erp_pos_alpha_max": 0.1,
+        "erp_assume_centered": True,
+        "erp_center_latitude_deg": 0.0,
+        "erp_apply_to_current_only": True,
+    }
+    for field_name, default_value in defaults.items():
+        if not hasattr(vision_config, field_name):
+            setattr(vision_config, field_name, default_value)
+
+
+class ERPPositionMLP(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        ensure_erp_vision_config(config)
+
+        self.enabled = bool(getattr(config, "erp_pos_enabled", False))
+        self.hidden_size = int(getattr(config, "erp_pos_hidden_size", config.hidden_size))
+        self.alpha_init = float(getattr(config, "erp_pos_alpha_init", 0.02))
+        self.alpha_max = float(getattr(config, "erp_pos_alpha_max", 0.1))
+        self.assume_centered = bool(getattr(config, "erp_assume_centered", True))
+        self.center_latitude_deg = float(getattr(config, "erp_center_latitude_deg", 0.0))
+        self.apply_to_current_only = bool(getattr(config, "erp_apply_to_current_only", True))
+        self.output_hidden_size = int(config.hidden_size)
+        self.initializer_range = float(getattr(config, "initializer_range", 0.02))
+
+        self.mlp = nn.Sequential(
+            nn.Linear(4, self.hidden_size),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, self.output_hidden_size),
+        )
+        self.output_norm = nn.RMSNorm(self.output_hidden_size, eps=1e-6)
+        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+        self.reset_parameters(self.initializer_range)
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
+
+    @staticmethod
+    def infer_vertical_fov_radians(height: int, width: int) -> float:
+        if height <= 0 or width <= 0:
+            return 0.0
+        return min(math.pi, 2.0 * math.pi * float(height) / float(width))
+
+    def reset_parameters(self, init_std: float | None = None) -> None:
+        init_std = self.initializer_range if init_std is None else float(init_std)
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=init_std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        self.output_norm.reset_parameters()
+        with torch.no_grad():
+            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+
+    def _build_position_features(
+        self,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        vertical_fov: float,
+        center_latitude: float,
+    ) -> torch.Tensor:
+        if not (0.0 < vertical_fov <= math.pi):
+            raise AssertionError(f"Invalid ERP vertical_fov={vertical_fov}")
+        if abs(center_latitude) > (0.5 * math.pi):
+            raise AssertionError(f"Invalid ERP center_latitude={center_latitude}")
+
+        ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
+        xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
+
+        lat = (ys[:, None] / float(height) - 0.5) * vertical_fov + center_latitude
+        lon = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
+        lat = lat.expand(height, width)
+        lon = lon.expand(height, width)
+
+        position_features = torch.stack(
+            [torch.sin(lat), torch.cos(lat), torch.sin(lon), torch.cos(lon)],
+            dim=-1,
+        ).reshape(height * width, 4)
+        if num_frames > 1:
+            position_features = position_features.repeat(num_frames, 1)
+        return position_features.to(dtype=dtype)
+
+    def apply_to_patch_tokens(
+        self,
+        patch_tokens: torch.Tensor,
+        grid_thw: torch.Tensor | None,
+        image_apply_mask: torch.Tensor | None = None,
+        image_erp_geometry: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.enabled or grid_thw is None or grid_thw.numel() == 0:
+            return patch_tokens
+
+        mlp_param = next(self.mlp.parameters())
+        param_device = mlp_param.device
+        param_dtype = mlp_param.dtype
+        default_center_latitude = 0.0
+        if not self.assume_centered:
+            default_center_latitude = math.radians(self.center_latitude_deg)
+
+        if grid_thw.ndim != 2 or int(grid_thw.shape[-1]) != 3:
+            raise AssertionError(f"Expected image_grid_thw shape [N, 3], got {tuple(grid_thw.shape)}")
+        num_images = int(grid_thw.shape[0])
+        if image_apply_mask is not None:
+            if image_apply_mask.ndim != 1 or int(image_apply_mask.shape[0]) != num_images:
+                raise AssertionError(
+                    f"Expected image_apply_mask to have shape [{num_images}], "
+                    f"got {tuple(image_apply_mask.shape)}"
+                )
+            apply_mask_list = image_apply_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
+        else:
+            apply_mask_list = [True] * num_images
+
+        geometry_list = None
+        if image_erp_geometry is not None:
+            if image_erp_geometry.ndim != 2 or tuple(image_erp_geometry.shape) != (num_images, 2):
+                raise AssertionError(
+                    "Expected image_erp_geometry to have shape "
+                    f"[{num_images}, 2], got {tuple(image_erp_geometry.shape)}"
+                )
+            geometry_list = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32).tolist()
+
+        split_sizes = [
+            int(size)
+            for size in grid_thw.prod(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+        ]
+        if sum(split_sizes) != int(patch_tokens.shape[0]):
+            raise AssertionError(
+                "Patch token count does not match image_grid_thw for ERP position MLP: "
+                f"tokens={int(patch_tokens.shape[0])}, expected={sum(split_sizes)}"
+            )
+        token_splits = list(patch_tokens.split(split_sizes, dim=0))
+        for image_index, (tokens, (num_frames, height, width)) in enumerate(
+            zip(token_splits, grid_thw.tolist())
+        ):
+            if not apply_mask_list[image_index]:
+                continue
+            if int(height) <= 0 or int(width) <= 0:
+                continue
+
+            if geometry_list is not None:
+                vertical_fov = float(geometry_list[image_index][0])
+                center_latitude = float(geometry_list[image_index][1])
+            else:
+                vertical_fov = self.infer_vertical_fov_radians(int(height), int(width))
+                center_latitude = default_center_latitude
+
+            position_features = self._build_position_features(
+                num_frames=int(num_frames),
+                height=int(height),
+                width=int(width),
+                device=param_device,
+                dtype=param_dtype,
+                vertical_fov=vertical_fov,
+                center_latitude=center_latitude,
+            )
+            position_delta = self.output_norm(self.mlp(position_features))
+            position_delta = self.alpha.to(dtype=position_delta.dtype) * position_delta
+            token_splits[image_index] = tokens + position_delta.to(
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+
+        return torch.cat(token_splits, dim=0)
+
+
 def ensure_panovggt_config(config) -> None:
     vision_config = config.vision_config
     text_config = getattr(config, "text_config", None)
     text_hidden_size = getattr(text_config, "hidden_size", getattr(vision_config, "out_hidden_size", 3584))
     defaults = {
         "panovggt_enabled": False,
-        "panovggt_checkpoint_path": "/workspace/code_dir/a_property/model/PanoVGGT/model.pt",
+        "panovggt_checkpoint_path": "/workspace/code/a_property/model/PanoVGGT/model.pt",
         "panovggt_alpha_init": 0.1,
         "panovggt_alpha_max": 0.2,
         "panovggt_force_fp32": False,
@@ -371,12 +546,28 @@ class PanoVGGTGeometryMLP(nn.Module):
         geometry = image_erp_geometry
         if geometry is not None:
             geometry = geometry.to(device=param.device, dtype=torch.float32)
+        if int(source_grid.shape[0]) != len(target_lengths) or len(target_lengths) != int(target_grid_thw.shape[0]):
+            raise AssertionError(
+                "PanoVGGT batch size mismatch: "
+                f"source={int(source_grid.shape[0])}, target_lengths={len(target_lengths)}, "
+                f"target_grid_thw={int(target_grid_thw.shape[0])}"
+            )
+        if geometry is not None and int(geometry.shape[0]) != len(target_lengths):
+            raise AssertionError(
+                "PanoVGGT geometry batch size mismatch: "
+                f"geometry={int(geometry.shape[0])}, target_lengths={len(target_lengths)}"
+            )
         for sample_index, (grid_thw, target_len) in enumerate(zip(target_grid_thw.tolist(), target_lengths)):
             num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
             if num_frames != 1:
                 raise AssertionError(
                     "PanoVGGT geometry fusion expects a single current panorama per Qwen image, "
                     f"got image_grid_thw={grid_thw}"
+                )
+            if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
+                raise AssertionError(
+                    "PanoVGGT target grid is not divisible by Qwen spatial_merge_size: "
+                    f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}"
                 )
             target_h = max(1, grid_h // self.spatial_merge_size)
             target_w = max(1, grid_w // self.spatial_merge_size)
@@ -410,7 +601,7 @@ def ensure_action_bearing_config(config) -> None:
     vision_config = config.vision_config
     text_config = getattr(config, "text_config", None)
     text_hidden_size = getattr(text_config, "hidden_size", getattr(vision_config, "out_hidden_size", 3584))
-    output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
+    output_dim = int(text_hidden_size)
     defaults = {
         "action_bearing_enabled": False,
         "action_bearing_key_alpha_init": 0.02,
@@ -568,6 +759,11 @@ class ActionBearingKV(nn.Module):
                 "Action-Bearing KV expects a single current panorama per Qwen image, "
                 f"got image_grid_thw={grid_thw}"
             )
+        if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
+            raise AssertionError(
+                "Action-Bearing KV target grid is not divisible by Qwen spatial_merge_size: "
+                f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}"
+            )
         target_h = max(1, grid_h // self.spatial_merge_size)
         target_w = max(1, grid_w // self.spatial_merge_size)
         expected_len = target_h * target_w
@@ -607,6 +803,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
     ) + [r"panovggt\..*"]
 
+    ERP_STATE_KEYS = (
+        "erp_position_mlp.raw_alpha",
+        "erp_position_mlp.mlp.0.weight",
+        "erp_position_mlp.mlp.0.bias",
+        "erp_position_mlp.mlp.2.weight",
+        "erp_position_mlp.mlp.2.bias",
+        "erp_position_mlp.output_norm.weight",
+    )
     PANOVGGT_STATE_KEYS = (
         "panovggt_mlp.raw_alpha",
         "panovggt_mlp.input_norm.weight",
@@ -620,22 +824,37 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "action_bearing_kv.bin_embeddings",
         "action_bearing_kv.raw_key_alpha",
         "action_bearing_kv.raw_value_alpha",
+        "action_bearing_kv.input_norm.weight",
+        "action_bearing_kv.adapter.0.weight",
+        "action_bearing_kv.adapter.0.bias",
+        "action_bearing_kv.adapter.2.weight",
+        "action_bearing_kv.adapter.2.bias",
+        "action_bearing_kv.output_norm.weight",
     )
 
     def __init__(self, config):
+        vision_config = getattr(config, "vision_config", None)
+        erp_pos_enabled = bool(
+            getattr(vision_config, "erp_pos_enabled", getattr(config, "erp_pos_enabled", False))
+        )
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
         action_bearing_enabled = bool(getattr(config, "action_bearing_enabled", False))
+        if erp_pos_enabled:
+            ensure_erp_vision_config(config.vision_config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
         if action_bearing_enabled:
             ensure_action_bearing_config(config)
         super().__init__(config)
 
+        if erp_pos_enabled:
+            ensure_erp_vision_config(self.model.visual.config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
         if action_bearing_enabled:
             ensure_action_bearing_config(config)
 
+        self.erp_position_mlp = ERPPositionMLP(self.model.visual.config) if erp_pos_enabled else None
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
         self.action_bearing_kv = ActionBearingKV(config) if action_bearing_enabled else None
         if self.action_bearing_kv is not None:
@@ -649,15 +868,57 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
+        self._install_erp_position_hook()
         self._install_image_feature_hook()
         self._install_action_bearing_kv_hook()
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
+
+    def _erp_pos_enabled(self) -> bool:
+        return self.erp_position_mlp is not None and bool(getattr(self.erp_position_mlp, "enabled", False))
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
 
     def _action_bearing_enabled(self) -> bool:
         return self.action_bearing_kv is not None and bool(getattr(self.action_bearing_kv, "enabled", False))
+
+    def _install_erp_position_hook(self) -> None:
+        if not self._erp_pos_enabled():
+            return
+        visual = self.model.visual
+        if hasattr(visual.patch_embed, "_pano_origin_forward"):
+            return
+
+        visual.patch_embed._pano_origin_forward = visual.patch_embed.forward
+        owner = self
+
+        def patch_embed_with_erp(this, hidden_states):
+            outputs = this._pano_origin_forward(hidden_states)
+            if not owner._erp_pos_enabled():
+                return outputs
+            grid_thw = owner._pano_runtime_grid_thw
+            if grid_thw is None or outputs.numel() == 0:
+                return outputs
+
+            image_apply_mask = None
+            if owner.erp_position_mlp.apply_to_current_only:
+                image_apply_mask = torch.zeros(
+                    int(grid_thw.shape[0]),
+                    device=grid_thw.device,
+                    dtype=torch.bool,
+                )
+                for _, image_index in owner._current_image_flat_indices(grid_thw):
+                    if 0 <= image_index < int(image_apply_mask.shape[0]):
+                        image_apply_mask[image_index] = True
+
+            return owner.erp_position_mlp.apply_to_patch_tokens(
+                patch_tokens=outputs,
+                grid_thw=grid_thw,
+                image_apply_mask=image_apply_mask,
+                image_erp_geometry=owner._pano_runtime_image_geometry,
+            )
+
+        visual.patch_embed.forward = MethodType(patch_embed_with_erp, visual.patch_embed)
 
     def _install_image_feature_hook(self) -> None:
         if not self._panovggt_enabled():
@@ -691,16 +952,16 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 return vision_output
 
             panovggt_pixel_values = owner._pano_runtime_panovggt_pixel_values
-            if (
-                owner._panovggt_enabled()
-                and panovggt_pixel_values is not None
-                and panovggt_pixel_values.numel() > 0
-            ):
-                panovggt_items = [
-                    (batch_index, image_index)
-                    for batch_index, image_index in current_items
-                    if 0 <= batch_index < int(panovggt_pixel_values.shape[0])
-                ]
+            if owner._panovggt_enabled():
+                if panovggt_pixel_values is None or panovggt_pixel_values.numel() == 0:
+                    raise AssertionError("PanoVGGT is enabled but panovggt_pixel_values is missing")
+                if int(panovggt_pixel_values.shape[0]) != len(current_items):
+                    raise AssertionError(
+                        "PanoVGGT current-image batch size mismatch: "
+                        f"panovggt_batch={int(panovggt_pixel_values.shape[0])}, "
+                        f"current_items={len(current_items)}"
+                    )
+                panovggt_items = list(current_items)
                 if panovggt_items:
                     batch_indices = torch.tensor(
                         [item[0] for item in panovggt_items],
@@ -1063,6 +1324,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             or image_grid_thw.numel() == 0
         ):
             return {}
+        if (
+            float(getattr(action_bearing_kv, "key_alpha_max", 0.0)) <= 0.0
+            and float(getattr(action_bearing_kv, "value_alpha_max", 0.0)) <= 0.0
+        ):
+            return {}
 
         if input_ids.ndim != 2:
             raise AssertionError(f"Expected input_ids shape [B, L], got {tuple(input_ids.shape)}")
@@ -1074,7 +1340,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         image_grid_thw = image_grid_thw.to(device=input_device, dtype=torch.long)
         num_images = int(image_grid_thw.shape[0])
-        split_sizes = (image_grid_thw.prod(-1) // self.model.visual.spatial_merge_size**2).to(
+        spatial_merge_size = int(self.model.visual.spatial_merge_size)
+        if bool(torch.any(torch.remainder(image_grid_thw[:, 1], spatial_merge_size) != 0).item()) or bool(
+            torch.any(torch.remainder(image_grid_thw[:, 2], spatial_merge_size) != 0).item()
+        ):
+            raise AssertionError(
+                "image_grid_thw is not divisible by Qwen spatial_merge_size for action-bearing KV: "
+                f"image_grid_thw={image_grid_thw.tolist()}, spatial_merge_size={spatial_merge_size}"
+            )
+        split_sizes = (image_grid_thw.prod(-1) // spatial_merge_size**2).to(
             device=input_device,
             dtype=torch.long,
         )
@@ -1148,6 +1422,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 raise AssertionError(
                     "Current image token span is shorter than expected for action-bearing KV: "
                     f"batch={batch_index}, span={int(current_positions.numel())}, expected={current_token_len}"
+                )
+            if current_token_len > 1 and not bool(torch.all(current_positions[1:] == current_positions[:-1] + 1).item()):
+                raise AssertionError(
+                    "Current image token span is not contiguous for action-bearing KV: "
+                    f"batch={batch_index}, token_positions={current_positions.tolist()}"
                 )
 
             flat_image_index = image_offset + current_index
@@ -1263,7 +1542,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
-        if self._panovggt_enabled():
+        if self._erp_pos_enabled() or self._panovggt_enabled() or self._action_bearing_enabled():
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
@@ -1296,6 +1575,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         del module
         missing_keys = set(incompatible_keys.missing_keys)
 
+        erp_module = self.erp_position_mlp
+        if (
+            erp_module is not None
+            and erp_module.enabled
+            and any(key.startswith("erp_position_mlp.") for key in missing_keys)
+        ):
+            erp_module.reset_parameters(erp_module.initializer_range)
+
         panovggt_module = self.panovggt_mlp
         if (
             panovggt_module is not None
@@ -1309,9 +1596,17 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             else:
                 self._mark_panovggt_weights_ready()
 
+    def _reset_erp_parameters_after_pretrained_load(self) -> None:
+        if self._erp_pos_enabled() and self.erp_position_mlp is not None:
+            self.erp_position_mlp.reset_parameters(self.erp_position_mlp.initializer_range)
+
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
         if self._panovggt_enabled() and self.panovggt_mlp is not None:
             self.panovggt_mlp.reset_parameters()
+
+    @classmethod
+    def _checkpoint_has_erp_weights(cls, pretrained_model_name_or_path) -> bool | None:
+        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.ERP_STATE_KEYS)
 
     @classmethod
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
@@ -1338,7 +1633,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 weight_map = json.loads(index_path.read_text()).get("weight_map", {})
             except Exception:
                 return None
-            return any(key in weight_map for key in state_keys)
+            return all(key in weight_map for key in state_keys)
 
         safetensors_path = checkpoint_dir / "model.safetensors"
         if safetensors_path.exists():
@@ -1347,7 +1642,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
                 with safe_open(str(safetensors_path), framework="pt", device="cpu") as handle:
                     keys = set(handle.keys())
-                return any(key in keys for key in state_keys)
+                return all(key in keys for key in state_keys)
+            except Exception:
+                return None
+
+        torch_path = checkpoint_dir / "pytorch_model.bin"
+        if torch_path.exists():
+            try:
+                loaded = torch.load(str(torch_path), map_location="cpu")
+                if isinstance(loaded, dict) and "state_dict" in loaded and isinstance(loaded["state_dict"], dict):
+                    loaded = loaded["state_dict"]
+                if not isinstance(loaded, dict):
+                    return None
+                return all(key in loaded for key in state_keys)
             except Exception:
                 return None
 
@@ -1356,6 +1663,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        has_erp_weights = cls._checkpoint_has_erp_weights(pretrained_model_name_or_path)
+        if has_erp_weights is False:
+            model._reset_erp_parameters_after_pretrained_load()
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()
@@ -1371,7 +1681,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if (
             model._action_bearing_enabled()
             and model.action_bearing_kv is not None
-            and has_action_bearing_weights is not True
+            and has_action_bearing_weights is False
         ):
             model.action_bearing_kv.reset_parameters(
                 float(getattr(model.config.vision_config, "initializer_range", 0.02))
@@ -1392,6 +1702,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_grid_thw=None,
         video_grid_thw=None,
         is_first_iteration=False,
+        image_erp_geometry=None,
+        image_num_images=None,
+        image_current_index=None,
         panovggt_pixel_values=None,
         **kwargs,
     ):
@@ -1407,9 +1720,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             is_first_iteration=is_first_iteration,
+            image_erp_geometry=image_erp_geometry,
+            image_num_images=image_num_images,
+            image_current_index=image_current_index,
             panovggt_pixel_values=panovggt_pixel_values,
             **kwargs,
         )
         if not is_first_iteration and use_cache:
+            model_inputs["image_erp_geometry"] = None
+            model_inputs["image_num_images"] = None
+            model_inputs["image_current_index"] = None
             model_inputs["panovggt_pixel_values"] = None
         return model_inputs

@@ -28,6 +28,7 @@ RANK = int(os.environ.get("RANK", "0"))
 
 class PanoVLNTrainer(Trainer):
     RAW_ALPHA_NO_DECAY_SUFFIXES = (
+        "erp_position_mlp.raw_alpha",
         "panovggt_mlp.raw_alpha",
         "action_bearing_kv.raw_key_alpha",
         "action_bearing_kv.raw_value_alpha",
@@ -36,6 +37,7 @@ class PanoVLNTrainer(Trainer):
         "language_model",
         "visual",
         "visual_merger",
+        "erp_position_mlp",
         "panovggt_mlp",
         "action_bearing_kv",
     )
@@ -63,6 +65,8 @@ class PanoVLNTrainer(Trainer):
     def _module_lr_key_for_parameter(self, name: str):
         if self._name_has_module(name, "action_bearing_kv"):
             return "action_bearing_kv"
+        if self._name_has_module(name, "erp_position_mlp"):
+            return "erp_position_mlp"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -150,6 +154,10 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, "trainable_modules:")
     for name, enabled in (cfg.model.trainable_modules or {}).items():
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
+    rank0_print(RANK, f"erp_pos_enabled: {_config_value(cfg.model.erp_pos_enabled)}")
+    rank0_print(RANK, f"erp_pos_alpha_init: {_config_value(cfg.model.erp_pos_alpha_init)}")
+    rank0_print(RANK, f"erp_pos_alpha_max: {_config_value(cfg.model.erp_pos_alpha_max)}")
+    rank0_print(RANK, f"erp_apply_to_current_only: {_config_value(cfg.model.erp_apply_to_current_only)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_init: {_config_value(cfg.model.panovggt_alpha_init)}")
     rank0_print(RANK, f"panovggt_alpha_max: {_config_value(cfg.model.panovggt_alpha_max)}")
@@ -166,6 +174,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"language_model_lr: {_config_value(cfg.training.language_model_lr)}")
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
+    rank0_print(RANK, f"erp_position_mlp_lr: {_config_value(cfg.training.erp_position_mlp_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"action_bearing_kv_lr: {_config_value(cfg.training.action_bearing_kv_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
@@ -313,6 +322,7 @@ def main():
             "language_model": cfg.training.language_model_lr,
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
+            "erp_position_mlp": cfg.training.erp_position_mlp_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
             "action_bearing_kv": cfg.training.action_bearing_kv_lr,
         },
