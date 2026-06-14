@@ -71,7 +71,7 @@ def _parse_action_bearing_inject_layers(raw_layers) -> tuple[int | None, tuple[i
         return int(raw_layers), None
     if isinstance(raw_layers, str):
         raw_layers = raw_layers.strip()
-        if raw_layers.lower() in {"", "none", "null"}:
+        if raw_layers.lower() in {"", "all", "none", "null"}:
             return None, None
         raw_layers = raw_layers.strip("[]")
         raw_layers = [part.strip() for part in raw_layers.split(",") if part.strip()]
@@ -103,8 +103,7 @@ def ensure_erp_vision_config(vision_config) -> None:
     defaults = {
         "erp_pos_enabled": False,
         "erp_pos_hidden_size": getattr(vision_config, "hidden_size", 1024),
-        "erp_pos_alpha_init": 0.02,
-        "erp_pos_alpha_max": 0.1,
+        "erp_pos_alpha_value": 0.02,
         "erp_assume_centered": True,
         "erp_center_latitude_deg": 0.0,
         "erp_apply_to_current_only": True,
@@ -121,8 +120,10 @@ class ERPPositionMLP(nn.Module):
 
         self.enabled = bool(getattr(config, "erp_pos_enabled", False))
         self.hidden_size = int(getattr(config, "erp_pos_hidden_size", config.hidden_size))
-        self.alpha_init = float(getattr(config, "erp_pos_alpha_init", 0.02))
-        self.alpha_max = float(getattr(config, "erp_pos_alpha_max", 0.1))
+        self.register_buffer(
+            "alpha_value",
+            torch.tensor(float(getattr(config, "erp_pos_alpha_value", 0.02)), dtype=torch.float32),
+        )
         self.assume_centered = bool(getattr(config, "erp_assume_centered", True))
         self.center_latitude_deg = float(getattr(config, "erp_center_latitude_deg", 0.0))
         self.apply_to_current_only = bool(getattr(config, "erp_apply_to_current_only", True))
@@ -135,12 +136,11 @@ class ERPPositionMLP(nn.Module):
             nn.Linear(self.hidden_size, self.output_hidden_size),
         )
         self.output_norm = nn.RMSNorm(self.output_hidden_size, eps=1e-6)
-        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
         self.reset_parameters(self.initializer_range)
 
     @property
     def alpha(self) -> torch.Tensor:
-        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
+        return self.alpha_value
 
     @staticmethod
     def infer_vertical_fov_radians(height: int, width: int) -> float:
@@ -156,8 +156,6 @@ class ERPPositionMLP(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         self.output_norm.reset_parameters()
-        with torch.no_grad():
-            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
 
     def _build_position_features(
         self,
@@ -281,8 +279,7 @@ def ensure_panovggt_config(config) -> None:
     defaults = {
         "panovggt_enabled": False,
         "panovggt_checkpoint_path": "/workspace/code/a_property/model/PanoVGGT/model.pt",
-        "panovggt_alpha_init": 0.1,
-        "panovggt_alpha_max": 0.2,
+        "panovggt_alpha_value": 0.1,
         "panovggt_force_fp32": False,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
@@ -386,23 +383,27 @@ class PanoVGGTGeometryMLP(nn.Module):
         self.context_dim = PANOVGGT_CONTEXT_DIM
         self.output_dim = int(getattr(config, "panovggt_output_dim", config.text_config.hidden_size))
         self.hidden_dim = PANOVGGT_MLP_HIDDEN_SIZE
-        self.alpha_init = float(getattr(config, "panovggt_alpha_init", 0.1))
-        self.alpha_max = float(getattr(config, "panovggt_alpha_max", 0.2))
+        self.register_buffer(
+            "alpha_value",
+            torch.tensor(float(getattr(config, "panovggt_alpha_value", 0.1)), dtype=torch.float32),
+        )
         self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
+        if self.spatial_merge_size <= 0:
+            raise ValueError(f"Qwen spatial_merge_size must be positive, got {self.spatial_merge_size}")
+        self.mlp_input_dim = self.context_dim
 
         self.input_norm = nn.RMSNorm(self.context_dim, eps=1e-6)
         self.mlp = nn.Sequential(
-            nn.Linear(self.context_dim, self.hidden_dim),
+            nn.Linear(self.mlp_input_dim, self.hidden_dim),
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.output_dim),
         )
         self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
         self.reset_parameters()
 
     @property
     def alpha(self) -> torch.Tensor:
-        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
+        return self.alpha_value
 
     def reset_parameters(self) -> None:
         self.input_norm.reset_parameters()
@@ -412,8 +413,6 @@ class PanoVGGTGeometryMLP(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        with torch.no_grad():
-            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
 
     def _infer_patch_grid(
         self,
@@ -482,6 +481,22 @@ class PanoVGGTGeometryMLP(nn.Module):
             align_corners=False,
         )
         return sampled[0].permute(1, 2, 0).reshape(target_h * target_w, source_grid.shape[1])
+
+    def _sample_token_geometry(
+        self,
+        source_grid: torch.Tensor,
+        target_h: int,
+        target_w: int,
+        geometry: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        sampled = self._sample_geometry_grid(
+            source_grid,
+            target_h=target_h,
+            target_w=target_w,
+            geometry=geometry,
+        )
+        return self.input_norm(sampled.to(dtype=dtype))
 
     def forward(
         self,
@@ -579,18 +594,20 @@ class PanoVGGTGeometryMLP(nn.Module):
                     f"expected_len={expected_len}, qwen_len={int(target_len)}"
                 )
 
-            geo = self._sample_geometry_grid(
+            sample_geometry = None if geometry is None else geometry[sample_index]
+            geo = self._sample_token_geometry(
                 source_grid[sample_index:sample_index + 1],
                 target_h=target_h,
                 target_w=target_w,
-                geometry=None if geometry is None else geometry[sample_index],
+                geometry=sample_geometry,
+                dtype=param.dtype,
             )
             if geo.shape[0] != int(target_len):
                 raise AssertionError(
                     "PanoVGGT sampled geometry length mismatch: "
                     f"sampled_len={geo.shape[0]}, qwen_len={int(target_len)}"
                 )
-            projected = self.output_norm(self.mlp(self.input_norm(geo.to(dtype=param.dtype))))
+            projected = self.output_norm(self.mlp(geo))
             projected = self.alpha.to(dtype=projected.dtype) * projected
             deltas.append(projected.to(device=output_device, dtype=output_dtype))
 
@@ -604,11 +621,9 @@ def ensure_action_bearing_config(config) -> None:
     output_dim = int(text_hidden_size)
     defaults = {
         "action_bearing_enabled": False,
-        "action_bearing_key_alpha_init": 0.02,
-        "action_bearing_key_alpha_max": 0.05,
-        "action_bearing_value_alpha_init": 0.05,
-        "action_bearing_value_alpha_max": 0.1,
-        "action_bearing_inject_layers": 16,
+        "action_bearing_key_alpha_value": 0.02,
+        "action_bearing_value_alpha_value": 0.05,
+        "action_bearing_inject_layers": None,
         "action_bearing_output_dim": output_dim,
     }
     for field_name, default_value in defaults.items():
@@ -624,10 +639,14 @@ class ActionBearingKV(nn.Module):
         self.enabled = bool(getattr(config, "action_bearing_enabled", False))
         self.output_dim = int(getattr(config, "action_bearing_output_dim", config.text_config.hidden_size))
         self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
-        self.key_alpha_init = float(getattr(config, "action_bearing_key_alpha_init", 0.02))
-        self.key_alpha_max = float(getattr(config, "action_bearing_key_alpha_max", 0.05))
-        self.value_alpha_init = float(getattr(config, "action_bearing_value_alpha_init", 0.05))
-        self.value_alpha_max = float(getattr(config, "action_bearing_value_alpha_max", 0.1))
+        self.register_buffer(
+            "key_alpha_value",
+            torch.tensor(float(getattr(config, "action_bearing_key_alpha_value", 0.02)), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "value_alpha_value",
+            torch.tensor(float(getattr(config, "action_bearing_value_alpha_value", 0.05)), dtype=torch.float32),
+        )
         self.inject_layers, self.inject_layer_indices = _parse_action_bearing_inject_layers(
             getattr(config, "action_bearing_inject_layers", 16)
         )
@@ -657,17 +676,15 @@ class ActionBearingKV(nn.Module):
             nn.Linear(self.hidden_dim, self.output_dim),
         )
         self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.raw_key_alpha = nn.Parameter(_bounded_raw_alpha(self.key_alpha_init, self.key_alpha_max))
-        self.raw_value_alpha = nn.Parameter(_bounded_raw_alpha(self.value_alpha_init, self.value_alpha_max))
         self.reset_parameters(float(getattr(config.vision_config, "initializer_range", 0.02)))
 
     @property
     def key_alpha(self) -> torch.Tensor:
-        return float(self.key_alpha_max) * torch.sigmoid(self.raw_key_alpha)
+        return self.key_alpha_value
 
     @property
     def value_alpha(self) -> torch.Tensor:
-        return float(self.value_alpha_max) * torch.sigmoid(self.raw_value_alpha)
+        return self.value_alpha_value
 
     @property
     def turn_angle_radians(self) -> float:
@@ -681,7 +698,9 @@ class ActionBearingKV(nn.Module):
         layer_idx = int(layer_idx)
         if self.inject_layer_indices is not None:
             return layer_idx in self.inject_layer_index_set
-        if self.inject_layers is None or self.inject_layers <= 0:
+        if self.inject_layers is None:
+            return True
+        if self.inject_layers <= 0:
             return False
         return layer_idx < self.inject_layers
 
@@ -694,9 +713,6 @@ class ActionBearingKV(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=float(init_std))
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        with torch.no_grad():
-            self.raw_key_alpha.copy_(_bounded_raw_alpha(self.key_alpha_init, self.key_alpha_max))
-            self.raw_value_alpha.copy_(_bounded_raw_alpha(self.value_alpha_init, self.value_alpha_max))
 
     def initialize_bin_embeddings_from_text(self, input_embeddings: nn.Embedding | None) -> bool:
         if input_embeddings is None or not hasattr(input_embeddings, "weight"):
@@ -804,7 +820,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     ) + [r"panovggt\..*"]
 
     ERP_STATE_KEYS = (
-        "erp_position_mlp.raw_alpha",
+        "erp_position_mlp.alpha_value",
         "erp_position_mlp.mlp.0.weight",
         "erp_position_mlp.mlp.0.bias",
         "erp_position_mlp.mlp.2.weight",
@@ -812,7 +828,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "erp_position_mlp.output_norm.weight",
     )
     PANOVGGT_STATE_KEYS = (
-        "panovggt_mlp.raw_alpha",
+        "panovggt_mlp.alpha_value",
         "panovggt_mlp.input_norm.weight",
         "panovggt_mlp.mlp.0.weight",
         "panovggt_mlp.mlp.0.bias",
@@ -821,9 +837,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.output_norm.weight",
     )
     ACTION_BEARING_STATE_KEYS = (
+        "action_bearing_kv.key_alpha_value",
+        "action_bearing_kv.value_alpha_value",
         "action_bearing_kv.bin_embeddings",
-        "action_bearing_kv.raw_key_alpha",
-        "action_bearing_kv.raw_value_alpha",
         "action_bearing_kv.input_norm.weight",
         "action_bearing_kv.adapter.0.weight",
         "action_bearing_kv.adapter.0.bias",
@@ -1325,8 +1341,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ):
             return {}
         if (
-            float(getattr(action_bearing_kv, "key_alpha_max", 0.0)) <= 0.0
-            and float(getattr(action_bearing_kv, "value_alpha_max", 0.0)) <= 0.0
+            not bool((action_bearing_kv.key_alpha_value > 0.0).detach().cpu().item())
+            and not bool((action_bearing_kv.value_alpha_value > 0.0).detach().cpu().item())
         ):
             return {}
 
@@ -1494,8 +1510,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if not action_bearing_kv.should_inject_layer(layer_idx):
             return key_states, value_states
 
-        use_key_delta = float(action_bearing_kv.key_alpha_max) > 0.0
-        use_value_delta = float(action_bearing_kv.value_alpha_max) > 0.0
+        use_key_delta = bool((action_bearing_kv.key_alpha_value > 0.0).detach().cpu().item())
+        use_value_delta = bool((action_bearing_kv.value_alpha_value > 0.0).detach().cpu().item())
         if not use_key_delta and not use_value_delta:
             return key_states, value_states
 

@@ -88,13 +88,6 @@ def set_model(cfg, model):
         for _, param in module.named_parameters():
             param.requires_grad = True
 
-    action_bearing_kv = named_modules.get("action_bearing_kv")
-    if action_bearing_kv is not None:
-        if float(getattr(action_bearing_kv, "key_alpha_max", 0.0)) <= 0.0:
-            action_bearing_kv.raw_key_alpha.requires_grad = False
-        if float(getattr(action_bearing_kv, "value_alpha_max", 0.0)) <= 0.0:
-            action_bearing_kv.raw_value_alpha.requires_grad = False
-
     if trainable_modules.get("language_model"):
         if hasattr(model, "lm_head"):
             for _, param in model.lm_head.named_parameters():
@@ -114,25 +107,25 @@ def _load_model_config(cfg):
     erp_fields = (
         "erp_pos_enabled",
         "erp_pos_hidden_size",
-        "erp_pos_alpha_init",
-        "erp_pos_alpha_max",
+        "erp_pos_alpha_value",
         "erp_assume_centered",
         "erp_center_latitude_deg",
         "erp_apply_to_current_only",
     )
+    erp_crop_fields = (
+        "erp_top_crop_degrees",
+        "erp_bottom_crop_degrees",
+    )
     panovggt_fields = (
         "panovggt_enabled",
         "panovggt_checkpoint_path",
-        "panovggt_alpha_init",
-        "panovggt_alpha_max",
+        "panovggt_alpha_value",
         "panovggt_force_fp32",
     )
     action_bearing_fields = (
         "action_bearing_enabled",
-        "action_bearing_key_alpha_init",
-        "action_bearing_key_alpha_max",
-        "action_bearing_value_alpha_init",
-        "action_bearing_value_alpha_max",
+        "action_bearing_key_alpha_value",
+        "action_bearing_value_alpha_value",
         "action_bearing_inject_layers",
     )
 
@@ -159,9 +152,35 @@ def _load_model_config(cfg):
             if hasattr(vision_config, field_name):
                 delattr(vision_config, field_name)
 
-    apply_vision_module_fields(bool(cfg.model.erp_pos_enabled), erp_fields)
-    apply_module_fields(bool(cfg.model.panovggt_enabled), panovggt_fields)
-    apply_module_fields(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
+    def apply_vision_module_fields_preserve_checkpoint(enabled: bool, field_names: tuple[str, ...]) -> None:
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is None:
+            return
+        checkpoint_enabled = bool(getattr(vision_config, field_names[0], False))
+        if checkpoint_enabled:
+            for field_name in field_names:
+                if not hasattr(vision_config, field_name):
+                    value = getattr(cfg.model, field_name)
+                    if value is not None:
+                        setattr(vision_config, field_name, value)
+            return
+        apply_vision_module_fields(enabled, field_names)
+
+    def apply_module_fields_preserve_checkpoint(enabled: bool, field_names: tuple[str, ...]) -> None:
+        checkpoint_enabled = bool(getattr(config, field_names[0], False))
+        if checkpoint_enabled:
+            for field_name in field_names:
+                if not hasattr(config, field_name):
+                    setattr(config, field_name, getattr(cfg.model, field_name))
+            return
+        apply_module_fields(enabled, field_names)
+
+    apply_vision_module_fields_preserve_checkpoint(bool(cfg.model.erp_pos_enabled), erp_fields)
+    for field_name in erp_crop_fields:
+        if not hasattr(config, field_name):
+            setattr(config, field_name, getattr(cfg.model, field_name))
+    apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
+    apply_module_fields_preserve_checkpoint(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config
 
 

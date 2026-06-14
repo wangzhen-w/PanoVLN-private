@@ -122,14 +122,30 @@ def resolve_current_image_index(num_images: int) -> int:
     return num_images - 1
 
 
-def preprocess_vln_memory_image(image: Image.Image) -> Image.Image:
-    processed_image = image.convert("RGB").resize(DEFAULT_VLN_MEMORY_IMAGE_SIZE)
-    return crop_erp_latitude(processed_image)
-
-
-def preprocess_vln_current_image(image: Image.Image) -> Image.Image:
+def preprocess_vln_current_image(
+    image: Image.Image,
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+) -> Image.Image:
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
-    return crop_erp_latitude(processed_image)
+    return crop_erp_latitude(
+        processed_image,
+        top_crop_degrees=top_crop_degrees,
+        bottom_crop_degrees=bottom_crop_degrees,
+    )
+
+
+def preprocess_vln_memory_image(
+    image: Image.Image,
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+) -> Image.Image:
+    processed_image = image.convert("RGB").resize(DEFAULT_VLN_MEMORY_IMAGE_SIZE)
+    return crop_erp_latitude(
+        processed_image,
+        top_crop_degrees=top_crop_degrees,
+        bottom_crop_degrees=bottom_crop_degrees,
+    )
 
 
 def preprocess_panovggt_current_image(image: Image.Image) -> torch.Tensor:
@@ -407,6 +423,8 @@ class SupervisedDataset(Dataset):
         image_token: str,
         model_max_length: Optional[int],
         image_size: Optional[List[int]] = None,
+        erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+        erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
@@ -423,6 +441,8 @@ class SupervisedDataset(Dataset):
             self.image_token = image_token
         self.model_max_length = model_max_length
         self.image_size = resolve_runtime_image_size(image_size)
+        self.erp_top_crop_degrees = float(erp_top_crop_degrees)
+        self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
         self.prompt_format = prompt_format
         self._fp = None
@@ -470,9 +490,17 @@ class SupervisedDataset(Dataset):
             with Image.open(image_path) as image:
                 is_current_observation = image_index == num_images - 1
                 if is_current_observation:
-                    processed_image = preprocess_vln_current_image(image)
+                    processed_image = preprocess_vln_current_image(
+                        image,
+                        top_crop_degrees=self.erp_top_crop_degrees,
+                        bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                    )
                 else:
-                    processed_image = preprocess_vln_memory_image(image)
+                    processed_image = preprocess_vln_memory_image(
+                        image,
+                        top_crop_degrees=self.erp_top_crop_degrees,
+                        bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                    )
                 images.append(processed_image)
         return images
 
@@ -537,7 +565,11 @@ class SupervisedDataset(Dataset):
             "labels": labels,
         }
         image_count = len(vision_paths)
-        item["image_erp_geometry"] = build_erp_image_geometry_batch(image_count)
+        item["image_erp_geometry"] = build_erp_image_geometry_batch(
+            image_count,
+            top_crop_degrees=self.erp_top_crop_degrees,
+            bottom_crop_degrees=self.erp_bottom_crop_degrees,
+        )
         item["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         item["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],

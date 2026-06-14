@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/code/a_property/model/action_kv_k001_002_v004_008"
+OUTPUT_DIR="/workspace/code/a_property/model/qwen35_4b_62.5merged_alpha_tensor"
 GPU_DEVICES="0,1,2,3"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"

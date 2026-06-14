@@ -25,6 +25,8 @@ from habitat.config.default_structured_configs import (
 from PIL import Image
 from peft import PeftModel
 from src.train.data.data import (
+    DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    DEFAULT_ERP_TOP_CROP_DEGREES,
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
     VLN_SYSTEM_PROMPT,
@@ -148,15 +150,29 @@ def select_vln_eval_image_indices(
 def preprocess_vln_eval_images(
     rgb_history: Sequence[Image.Image],
     selected_indices: Sequence[int],
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
 ) -> List[Image.Image]:
     selected_images = []
     for image_position, frame_index in enumerate(selected_indices):
         raw_image = rgb_history[frame_index]
         is_current_observation = image_position == len(selected_indices) - 1
         if is_current_observation:
-            selected_images.append(preprocess_vln_current_image(raw_image))
+            selected_images.append(
+                preprocess_vln_current_image(
+                    raw_image,
+                    top_crop_degrees=top_crop_degrees,
+                    bottom_crop_degrees=bottom_crop_degrees,
+                )
+            )
         else:
-            selected_images.append(preprocess_vln_memory_image(raw_image))
+            selected_images.append(
+                preprocess_vln_memory_image(
+                    raw_image,
+                    top_crop_degrees=top_crop_degrees,
+                    bottom_crop_degrees=bottom_crop_degrees,
+                )
+            )
     return selected_images
 
 
@@ -406,6 +422,12 @@ class PanoVLN_Agent(Agent):
             model_path,
             **model_init_kwargs,
         )
+        action_attention_layers = getattr(self.model, "_pano_action_bearing_attention_layers", None)
+        action_inject_layers = getattr(self.model, "_pano_action_bearing_inject_layers", None)
+        if action_attention_layers is not None:
+            print(f"action_bearing_full_attention_layers: {list(action_attention_layers)}", flush=True)
+        if action_inject_layers is not None:
+            print(f"action_bearing_actual_inject_layers: {list(action_inject_layers)}", flush=True)
 
         if lora_path is not None and lora_path!= '':
             print('Loading LoRA weights...')
@@ -414,6 +436,12 @@ class PanoVLN_Agent(Agent):
             self.model = self.model.merge_and_unload()
             print('Model is loaded...')
 
+        self.erp_top_crop_degrees = float(
+            getattr(self.model.config, "erp_top_crop_degrees", DEFAULT_ERP_TOP_CROP_DEGREES)
+        )
+        self.erp_bottom_crop_degrees = float(
+            getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
+        )
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -477,7 +505,11 @@ class PanoVLN_Agent(Agent):
             padding=True,
         )
         image_count = len(self.current_images)
-        prompt_inputs["image_erp_geometry"] = build_erp_image_geometry_batch(image_count)
+        prompt_inputs["image_erp_geometry"] = build_erp_image_geometry_batch(
+            image_count,
+            top_crop_degrees=self.erp_top_crop_degrees,
+            bottom_crop_degrees=self.erp_bottom_crop_degrees,
+        )
         prompt_inputs["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         prompt_inputs["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],
@@ -528,6 +560,8 @@ class PanoVLN_Agent(Agent):
         return preprocess_vln_eval_images(
             rgb_history=self.rgb_history,
             selected_indices=selected_indices,
+            top_crop_degrees=self.erp_top_crop_degrees,
+            bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
 
     def _predict_action_sequence_from_images(self, instruction, selected_images):
