@@ -157,6 +157,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
+    rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_key_alpha_value: {_config_value(cfg.model.action_bearing_key_alpha_value)}")
@@ -233,6 +234,7 @@ def main():
         rank0_print(RANK, "===== Effective model config =====")
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
+        rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(RANK, f"action_bearing_enabled: {_config_value(getattr(model_config, 'action_bearing_enabled', None))}")
@@ -247,7 +249,6 @@ def main():
         image_root=train_image_root,
         image_token=cfg.model.image_token,
         model_max_length=cfg.model.model_max_length,
-        image_size=cfg.data.image_size,
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
@@ -265,7 +266,6 @@ def main():
             image_root=eval_image_root,
             image_token=cfg.model.image_token,
             model_max_length=cfg.model.model_max_length,
-            image_size=cfg.data.image_size,
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,

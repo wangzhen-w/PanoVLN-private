@@ -1,5 +1,5 @@
 model:
-  name_or_path: "/workspace/data1/model/ablation_new/panovggt_new/qwen35_4b_new_adapt_alpha_tensor_init"
+  name_or_path: "/workspace/code/a_property/model/Qwen3.5-4B"
   trust_remote_code: false
   torch_dtype: "bfloat16"
   attn_implementation: "flash_attention_2"
@@ -20,7 +20,8 @@ model:
   erp_bottom_crop_degrees: 20.0
   panovggt_enabled: true
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
-  panovggt_alpha_value: 0.19958190978870516
+  panovggt_alpha_value: 0.1
+  panovggt_sampling_mode: "grouping"    #"singlepoint"每个 Qwen token 采一个 PanoVGGT C token / "grouping"2x2 四个 C 拼接
   panovggt_force_fp32: false
   action_bearing_enabled: false
   action_bearing_key_alpha_value: 0.01
@@ -35,21 +36,20 @@ data:
   train_max_samples: null
   eval_max_samples: 3000
   shuffle: true
-  image_size: [640, 320]
   action_vocab: ["stop", "forward", "left", "right"]
   f1_action_weight: [1.0, 1.0, 1.0, 1.0]
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code/a_property/model/qwen35_4b_62.5merged_alpha_tensor"
+  output_dir: "/workspace/code/a_property/model/panovggt_grouping_pano840x420_visual2e-6_merger1e-5_mlp1e-5"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 8
   learning_rate: 2.0e-5
   language_model_lr: 2.0e-5
-  visual_lr: 5.0e-6
-  visual_merger_lr: 2.0e-5
+  visual_lr: 2.0e-6
+  visual_merger_lr: 1.0e-5
   erp_position_mlp_lr: 1.0e-5
   panovggt_mlp_lr: 1.0e-5
   action_bearing_kv_lr: 1.0e-5
@@ -72,7 +72,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "qwen35_4b_panovggt_new_adapt_alpha_tensor_fulltrain"
+  run_name: "qwen35_4b_panovggt_grouping_pano840x420_event050_bg005_tail080_visual2e-6_merger1e-5_mlp1e-5"
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
@@ -86,10 +86,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "qwen35_4b_panovggt_new_adapt_alpha_tensor_fulltrain"
-  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "panovggt", "singlepoint", "alpha-tensor", "stitched-init", "ebs-event050-bg005-tail080", "4-action", "word-action", "stop-pad", "bf16", "flash", "4gpu", "global-batch-128"]
+  name: "qwen35_4b_panovggt_grouping_pano840x420_event050_bg005_tail080_visual2e-6_merger1e-5_mlp1e-5"
+  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "panovggt", "grouping", "janusvln-style", "pano840x420", "alpha-value-0.1", "raw-qwen-init", "ebs-event050-bg005-tail080", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-mlp-lr-1e-5", "4-action", "word-action", "stop-pad", "bf16", "flash", "4gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "PanoVGGT single-point alpha-tensor run from raw Qwen3.5-4B stitched with new_adapt PanoVGGT backbone and MLP. PanoVGGT backbone frozen; PanoVGGT MLP, visual, visual merger, and language model are trainable. Uses train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with bf16/flash on GPUs 0-3, per_device_train_batch_size=4, gradient_accumulation_steps=8, global batch 128."
+  notes: "PanoVGGT JanusVLN-style grouping alpha-value run from raw Qwen3.5-4B with PanoVGGT input resized to 840x420 while Qwen current observation stays 960x480. Each Qwen visual token uses the corresponding 2x2 PanoVGGT embeddings concatenated before the MLP. PanoVGGT backbone frozen; PanoVGGT MLP, visual, visual merger, and language model are trainable. Uses visual_lr=2e-6, visual_merger_lr=1e-5, panovggt_mlp_lr=1e-5, panovggt_alpha_value=0.1 on train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with bf16/flash on GPUs 0-3, per_device_train_batch_size=4, gradient_accumulation_steps=8, global batch 128."
   id: null
   resume: "never"

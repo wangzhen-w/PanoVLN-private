@@ -15,10 +15,9 @@ except ModuleNotFoundError:
     from utils import build_prompt_and_target
 
 
-DEFAULT_IMAGE_SIZE = (640, 320)
 DEFAULT_VLN_MEMORY_IMAGE_SIZE = (448, 224)
 DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (960, 480)
-DEFAULT_PANOVGGT_IMAGE_SIZE = (1036, 518)
+DEFAULT_PANOVGGT_IMAGE_SIZE = (840, 420)
 DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
@@ -46,12 +45,6 @@ VLN_SYSTEM_PROMPT = (
     "Return exactly four action words in execution order, separated by spaces. "
     "If the task is complete before four actions, fill the remaining positions with stop."
 )
-def resolve_runtime_image_size(image_size):
-    if image_size is None:
-        return DEFAULT_IMAGE_SIZE
-    if len(image_size) != 2:
-        raise ValueError(f"image_size must contain exactly 2 integers, got {image_size}")
-    return (int(image_size[0]), int(image_size[1]))
 
 
 def crop_erp_latitude(
@@ -422,7 +415,6 @@ class SupervisedDataset(Dataset):
         image_root: Optional[str],
         image_token: str,
         model_max_length: Optional[int],
-        image_size: Optional[List[int]] = None,
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
@@ -440,7 +432,6 @@ class SupervisedDataset(Dataset):
         else:
             self.image_token = image_token
         self.model_max_length = model_max_length
-        self.image_size = resolve_runtime_image_size(image_size)
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)

@@ -1,8 +1,7 @@
 from .collator import MultiModalDataCollator
-from .data import SupervisedDataset, resolve_runtime_image_size
+from .data import SupervisedDataset
 
 __all__ = [
     "MultiModalDataCollator",
     "SupervisedDataset",
-    "resolve_runtime_image_size",
 ]

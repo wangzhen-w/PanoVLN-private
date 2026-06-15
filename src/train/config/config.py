@@ -25,6 +25,7 @@ class ModelConfig:
     panovggt_enabled: bool = False
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.1
+    panovggt_sampling_mode: str = "grouping"
     panovggt_force_fp32: bool = False
     action_bearing_enabled: bool = False
     action_bearing_key_alpha_value: float = 0.02
@@ -41,7 +42,6 @@ class DataConfig:
     train_max_samples: Optional[int] = None
     eval_max_samples: Optional[int] = None
     shuffle: bool = True
-    image_size: Optional[List[int]] = None
     action_vocab: Optional[List[str]] = None
     f1_action_weight: Optional[List[float]] = None
     prompt_format: str = "chat_template"

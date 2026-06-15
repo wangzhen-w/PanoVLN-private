@@ -120,6 +120,7 @@ def _load_model_config(cfg):
         "panovggt_enabled",
         "panovggt_checkpoint_path",
         "panovggt_alpha_value",
+        "panovggt_sampling_mode",
         "panovggt_force_fp32",
     )
     action_bearing_fields = (

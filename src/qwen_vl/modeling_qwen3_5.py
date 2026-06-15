@@ -280,6 +280,7 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_enabled": False,
         "panovggt_checkpoint_path": "/workspace/code/a_property/model/PanoVGGT/model.pt",
         "panovggt_alpha_value": 0.1,
+        "panovggt_sampling_mode": "grouping",
         "panovggt_force_fp32": False,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
@@ -383,6 +384,12 @@ class PanoVGGTGeometryMLP(nn.Module):
         self.context_dim = PANOVGGT_CONTEXT_DIM
         self.output_dim = int(getattr(config, "panovggt_output_dim", config.text_config.hidden_size))
         self.hidden_dim = PANOVGGT_MLP_HIDDEN_SIZE
+        self.sampling_mode = str(getattr(config, "panovggt_sampling_mode", "grouping")).lower()
+        if self.sampling_mode not in {"singlepoint", "grouping"}:
+            raise ValueError(
+                "panovggt_sampling_mode must be 'singlepoint' or 'grouping', "
+                f"got {self.sampling_mode!r}"
+            )
         self.register_buffer(
             "alpha_value",
             torch.tensor(float(getattr(config, "panovggt_alpha_value", 0.1)), dtype=torch.float32),
@@ -390,7 +397,11 @@ class PanoVGGTGeometryMLP(nn.Module):
         self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
         if self.spatial_merge_size <= 0:
             raise ValueError(f"Qwen spatial_merge_size must be positive, got {self.spatial_merge_size}")
-        self.mlp_input_dim = self.context_dim
+        self.spatial_merge_unit = self.spatial_merge_size**2
+        if self.sampling_mode == "grouping":
+            self.mlp_input_dim = self.context_dim * self.spatial_merge_unit
+        else:
+            self.mlp_input_dim = self.context_dim
 
         self.input_norm = nn.RMSNorm(self.context_dim, eps=1e-6)
         self.mlp = nn.Sequential(
@@ -482,7 +493,7 @@ class PanoVGGTGeometryMLP(nn.Module):
         )
         return sampled[0].permute(1, 2, 0).reshape(target_h * target_w, source_grid.shape[1])
 
-    def _sample_token_geometry(
+    def _sample_token_geometry_singlepoint(
         self,
         source_grid: torch.Tensor,
         target_h: int,
@@ -497,6 +508,57 @@ class PanoVGGTGeometryMLP(nn.Module):
             geometry=geometry,
         )
         return self.input_norm(sampled.to(dtype=dtype))
+
+    def _sample_token_geometry_grouping(
+        self,
+        source_grid: torch.Tensor,
+        target_h: int,
+        target_w: int,
+        geometry: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        group_h = target_h * self.spatial_merge_size
+        group_w = target_w * self.spatial_merge_size
+        sampled = self._sample_geometry_grid(
+            source_grid,
+            target_h=group_h,
+            target_w=group_w,
+            geometry=geometry,
+        )
+        sampled = self.input_norm(sampled.to(dtype=dtype))
+        sampled = sampled.reshape(
+            target_h,
+            self.spatial_merge_size,
+            target_w,
+            self.spatial_merge_size,
+            self.context_dim,
+        )
+        sampled = sampled.permute(0, 2, 1, 3, 4).contiguous()
+        return sampled.reshape(target_h * target_w, self.mlp_input_dim)
+
+    def _sample_token_geometry(
+        self,
+        source_grid: torch.Tensor,
+        target_h: int,
+        target_w: int,
+        geometry: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.sampling_mode == "grouping":
+            return self._sample_token_geometry_grouping(
+                source_grid,
+                target_h=target_h,
+                target_w=target_w,
+                geometry=geometry,
+                dtype=dtype,
+            )
+        return self._sample_token_geometry_singlepoint(
+            source_grid,
+            target_h=target_h,
+            target_w=target_w,
+            geometry=geometry,
+            dtype=dtype,
+        )
 
     def forward(
         self,
