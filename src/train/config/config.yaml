@@ -41,7 +41,7 @@ data:
   prompt_format: "chat_template"
 
 training:
-  output_dir: "/workspace/code/a_property/model/panovggt_grouping_pano840x420_visual2e-6_merger1e-5_mlp1e-5"
+  output_dir: "/workspace/code/a_property/model/panovggt_grouping_visual2e-6_merger2e-5_mlp1e-5"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -49,7 +49,7 @@ training:
   learning_rate: 2.0e-5
   language_model_lr: 2.0e-5
   visual_lr: 2.0e-6
-  visual_merger_lr: 1.0e-5
+  visual_merger_lr: 2.0e-5
   erp_position_mlp_lr: 1.0e-5
   panovggt_mlp_lr: 1.0e-5
   action_bearing_kv_lr: 1.0e-5

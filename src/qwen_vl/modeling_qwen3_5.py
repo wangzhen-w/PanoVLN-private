@@ -120,9 +120,10 @@ class ERPPositionMLP(nn.Module):
 
         self.enabled = bool(getattr(config, "erp_pos_enabled", False))
         self.hidden_size = int(getattr(config, "erp_pos_hidden_size", config.hidden_size))
+        self.alpha_init = float(getattr(config, "erp_pos_alpha_value", 0.02))
         self.register_buffer(
             "alpha_value",
-            torch.tensor(float(getattr(config, "erp_pos_alpha_value", 0.02)), dtype=torch.float32),
+            torch.tensor(self.alpha_init, dtype=torch.float32),
         )
         self.assume_centered = bool(getattr(config, "erp_assume_centered", True))
         self.center_latitude_deg = float(getattr(config, "erp_center_latitude_deg", 0.0))
@@ -156,6 +157,7 @@ class ERPPositionMLP(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         self.output_norm.reset_parameters()
+        self.alpha_value.fill_(self.alpha_init)
 
     def _build_position_features(
         self,
@@ -390,9 +392,10 @@ class PanoVGGTGeometryMLP(nn.Module):
                 "panovggt_sampling_mode must be 'singlepoint' or 'grouping', "
                 f"got {self.sampling_mode!r}"
             )
+        self.alpha_init = float(getattr(config, "panovggt_alpha_value", 0.1))
         self.register_buffer(
             "alpha_value",
-            torch.tensor(float(getattr(config, "panovggt_alpha_value", 0.1)), dtype=torch.float32),
+            torch.tensor(self.alpha_init, dtype=torch.float32),
         )
         self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
         if self.spatial_merge_size <= 0:
@@ -424,6 +427,7 @@ class PanoVGGTGeometryMLP(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        self.alpha_value.fill_(self.alpha_init)
 
     def _infer_patch_grid(
         self,
@@ -701,13 +705,15 @@ class ActionBearingKV(nn.Module):
         self.enabled = bool(getattr(config, "action_bearing_enabled", False))
         self.output_dim = int(getattr(config, "action_bearing_output_dim", config.text_config.hidden_size))
         self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
+        self.key_alpha_init = float(getattr(config, "action_bearing_key_alpha_value", 0.02))
+        self.value_alpha_init = float(getattr(config, "action_bearing_value_alpha_value", 0.05))
         self.register_buffer(
             "key_alpha_value",
-            torch.tensor(float(getattr(config, "action_bearing_key_alpha_value", 0.02)), dtype=torch.float32),
+            torch.tensor(self.key_alpha_init, dtype=torch.float32),
         )
         self.register_buffer(
             "value_alpha_value",
-            torch.tensor(float(getattr(config, "action_bearing_value_alpha_value", 0.05)), dtype=torch.float32),
+            torch.tensor(self.value_alpha_init, dtype=torch.float32),
         )
         self.inject_layers, self.inject_layer_indices = _parse_action_bearing_inject_layers(
             getattr(config, "action_bearing_inject_layers", 16)
@@ -775,6 +781,8 @@ class ActionBearingKV(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=float(init_std))
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+        self.key_alpha_value.fill_(self.key_alpha_init)
+        self.value_alpha_value.fill_(self.value_alpha_init)
 
     def initialize_bin_embeddings_from_text(self, input_embeddings: nn.Embedding | None) -> bool:
         if input_embeddings is None or not hasattr(input_embeddings, "weight"):
