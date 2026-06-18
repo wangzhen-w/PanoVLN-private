@@ -9,6 +9,7 @@ import yaml
 from config.config import load_config
 from data.collator import MultiModalDataCollator
 from data.data import SupervisedDataset
+from data.sampler import TraceSampler
 from utils import (
     build_action_accuracy,
     init_wandb,
@@ -38,13 +39,74 @@ class PanoVLNTrainer(Trainer):
         "action_bearing_kv",
     )
 
-    def __init__(self, *args, module_learning_rates=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        module_learning_rates=None,
+        trace_enable: bool = False,
+        trace_sampler_shuffle: bool = True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.module_learning_rates = {
             name: float(lr)
             for name, lr in (module_learning_rates or {}).items()
             if lr is not None
         }
+        self.trace_enable = bool(trace_enable)
+        self.trace_sampler_shuffle = bool(trace_sampler_shuffle)
+
+    def _get_train_sampler(self, train_dataset=None):
+        if not self.trace_enable:
+            return super()._get_train_sampler(train_dataset)
+
+        if train_dataset is None:
+            train_dataset = self.train_dataset
+        if train_dataset is None:
+            return None
+
+        episode_keys = getattr(train_dataset, "episode_keys", None)
+        step_indices = getattr(train_dataset, "step_indices", None)
+        end_step_indices = getattr(train_dataset, "end_step_indices", None)
+        action_sequences = getattr(train_dataset, "action_sequences", None)
+        if (
+            episode_keys is None
+            or step_indices is None
+            or end_step_indices is None
+            or action_sequences is None
+        ):
+            raise ValueError(
+                "trace_enable=true requires train_dataset to be built with "
+                "collect_trace_metadata=true"
+            )
+
+        per_process_batch_size = max(1, int(self._train_batch_size))
+        world_size = max(1, int(self.args.world_size))
+        gradient_accumulation_steps = max(1, int(self.args.gradient_accumulation_steps))
+        window_size = per_process_batch_size * world_size * gradient_accumulation_steps
+
+        sampler = TraceSampler(
+            episode_keys=episode_keys,
+            step_indices=step_indices,
+            end_step_indices=end_step_indices,
+            action_sequences=action_sequences,
+            window_size=window_size,
+            conflict_step_window=4,
+            seed=self.args.seed,
+            shuffle=self.trace_sampler_shuffle,
+        )
+        if RANK == 0:
+            rank0_print(
+                RANK,
+                "TRACE sampler enabled: "
+                f"samples={len(sampler)}, "
+                f"episode_groups={sampler.num_episode_groups}, "
+                f"window_size={window_size}, "
+                f"per_process_batch_size={per_process_batch_size}, "
+                f"world_size={world_size}, "
+                f"gradient_accumulation_steps={gradient_accumulation_steps}",
+            )
+        return sampler
 
     def get_decay_parameter_names(self, model):
         decay_parameter_names = super().get_decay_parameter_names(model)
@@ -163,6 +225,8 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"action_bearing_key_alpha_value: {_config_value(cfg.model.action_bearing_key_alpha_value)}")
     rank0_print(RANK, f"action_bearing_value_alpha_value: {_config_value(cfg.model.action_bearing_value_alpha_value)}")
     rank0_print(RANK, f"action_bearing_inject_layers: {_config_value(cfg.model.action_bearing_inject_layers)}")
+    rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
+    rank0_print(RANK, f"trace_enable: {_config_value(cfg.data.trace_enable)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -255,6 +319,7 @@ def main():
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
         prompt_format=cfg.data.prompt_format,
+        collect_trace_metadata=cfg.data.trace_enable,
     )
 
     eval_dataset = None
@@ -333,6 +398,8 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=MultiModalDataCollator(tokenizer),
         processing_class=tokenizer,
+        trace_enable=cfg.data.trace_enable,
+        trace_sampler_shuffle=cfg.data.shuffle,
         module_learning_rates={
             "language_model": cfg.training.language_model_lr,
             "visual": cfg.training.visual_lr,

@@ -45,6 +45,7 @@ class DataConfig:
     action_vocab: Optional[List[str]] = None
     f1_action_weight: Optional[List[float]] = None
     prompt_format: str = "chat_template"
+    trace_enable: bool = False
 
 
 @dataclass
