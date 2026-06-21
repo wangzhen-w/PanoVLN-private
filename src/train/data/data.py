@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 
 
 DEFAULT_VLN_MEMORY_IMAGE_SIZE = (448, 224)
+DEFAULT_VLN_EVENT_MEMORY_IMAGE_SIZE = (288, 144)
 DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (960, 480)
 DEFAULT_PANOVGGT_IMAGE_SIZE = (1036, 518)
 DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
@@ -24,6 +25,21 @@ DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES = 5
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
 PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP = 2
+QWEN_MEMORY_POLICY_UNIFORM = "uniform"
+QWEN_MEMORY_POLICY_PROGRESS_EVENT = "progress_event"
+QWEN_MEMORY_POLICIES = {
+    QWEN_MEMORY_POLICY_UNIFORM,
+    QWEN_MEMORY_POLICY_PROGRESS_EVENT,
+}
+DEFAULT_QWEN_MEMORY_POLICY = QWEN_MEMORY_POLICY_UNIFORM
+DEFAULT_QWEN_MEMORY_EVENT_BUDGET = 3
+DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD = 3
+DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION = True
+DEFAULT_QWEN_MEMORY_COMPRESSED_MIN_PIXELS = 32768
+DEFAULT_QWEN_MEMORY_COMPRESSED_MAX_PIXELS = 16777216
+VLN_IMAGE_ROLE_STANDARD = "standard"
+VLN_IMAGE_ROLE_EVENT = "event"
+VLN_IMAGE_ROLE_CURRENT = "current"
 VLN_ACTION_WORDS = {"forward", "left", "right", "stop"}
 VLN_ACTION_ALIASES = {
     "move_forward": "forward",
@@ -143,6 +159,19 @@ def preprocess_vln_memory_image(
     )
 
 
+def preprocess_vln_event_memory_image(
+    image: Image.Image,
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+) -> Image.Image:
+    processed_image = image.convert("RGB").resize(DEFAULT_VLN_EVENT_MEMORY_IMAGE_SIZE)
+    return crop_erp_latitude(
+        processed_image,
+        top_crop_degrees=top_crop_degrees,
+        bottom_crop_degrees=bottom_crop_degrees,
+    )
+
+
 def preprocess_panovggt_current_image(image: Image.Image) -> torch.Tensor:
     processed_image = image.convert("RGB").resize(
         DEFAULT_PANOVGGT_IMAGE_SIZE,
@@ -167,19 +196,22 @@ def _normalize_history_action(action: Any) -> Optional[str]:
     return _normalize_vln_action(action)
 
 
-def normalize_history_actions(actions: Any) -> List[str]:
+def normalize_history_actions(
+    actions: Any,
+    feature_name: str = "PanoVGGT spatial memory",
+) -> List[str]:
     if not isinstance(actions, list):
         raise ValueError(
-            "PanoVGGT spatial memory requires VLN examples to provide "
+            f"{feature_name} requires VLN examples to provide "
             "a list field 'history_actions'. Regenerate or patch the JSONL "
-            "before enabling panovggt_spatial_memory."
+            "before enabling this memory policy."
         )
     normalized_actions = []
     for action_index, action in enumerate(actions):
         normalized_action = _normalize_history_action(action)
         if normalized_action is None:
             raise ValueError(
-                "PanoVGGT spatial memory field 'history_actions' must contain "
+                f"{feature_name} field 'history_actions' must contain "
                 f"action ids or action words, got {action!r} at index {action_index}"
             )
         normalized_actions.append(normalized_action)
@@ -324,6 +356,13 @@ def select_panovggt_spatial_memory_paths(
     return [image_paths[index] for index in selected_indices], selected_indices
 
 
+def _selection_roles_for_indices(selected_indices: Sequence[int]) -> List[str]:
+    roles = [VLN_IMAGE_ROLE_STANDARD for _ in selected_indices]
+    if roles:
+        roles[-1] = VLN_IMAGE_ROLE_CURRENT
+    return roles
+
+
 def build_vln_image_selection(
     current_step: int,
     last_frame_index: int,
@@ -351,6 +390,204 @@ def build_vln_image_selection(
     return [candidate_frame_indices[position] for position in selected_positions]
 
 
+def _select_with_current_anchor(
+    candidate_indices: Sequence[int],
+    current_frame_index: int,
+    target_count: int,
+) -> List[int]:
+    target_count = max(0, int(target_count))
+    if target_count <= 0:
+        return []
+
+    candidates = sorted(
+        {
+            int(frame_index)
+            for frame_index in candidate_indices
+            if 0 <= int(frame_index) < current_frame_index
+        }
+    )
+    if len(candidates) <= target_count:
+        return candidates
+
+    anchor_position = len(candidates)
+    selected_positions = [
+        (slot * anchor_position) // target_count
+        for slot in range(target_count)
+    ]
+    return [candidates[position] for position in selected_positions]
+
+
+def _detect_large_turn_events(
+    *,
+    history_actions: Sequence[str],
+    pool_start_frame: int,
+    current_frame_index: int,
+    event_turn_threshold: int,
+) -> List[Tuple[int, int]]:
+    event_turn_threshold = max(1, int(event_turn_threshold))
+    events: List[Tuple[int, int]] = []
+    run_action = None
+    run_start = None
+
+    def flush_run(end_action_index: int) -> None:
+        nonlocal run_action, run_start
+        if run_action is None or run_start is None:
+            return
+        run_length = end_action_index - run_start + 1
+        pre_boundary = run_start
+        post_boundary = end_action_index + 1
+        if (
+            run_length >= event_turn_threshold
+            and pre_boundary >= pool_start_frame
+            and post_boundary <= current_frame_index
+        ):
+            events.append((pre_boundary, post_boundary))
+
+    for action_index in range(current_frame_index):
+        action = history_actions[action_index]
+        if action in {"left", "right"}:
+            if action == run_action:
+                continue
+            flush_run(action_index - 1)
+            run_action = action
+            run_start = action_index
+            continue
+        flush_run(action_index - 1)
+        run_action = None
+        run_start = None
+
+    flush_run(current_frame_index - 1)
+    return events
+
+
+def build_vln_progress_event_memory_selection(
+    current_step: int,
+    last_frame_index: int,
+    history_actions: Any,
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+    event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
+    event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
+    event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+) -> List[Tuple[int, str]]:
+    max_memory_images = max(0, int(max_memory_images))
+    memory_pool_window_frames = max(1, int(memory_pool_window_frames))
+    current_frame_index = min(max(0, int(current_step)), int(last_frame_index))
+    if current_frame_index < 0:
+        return []
+
+    total_selected_images = max_memory_images + 1
+    pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
+    candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
+    if len(candidate_frame_indices) <= total_selected_images:
+        return list(zip(
+            candidate_frame_indices,
+            _selection_roles_for_indices(candidate_frame_indices),
+        ))
+
+    normalized_actions = normalize_history_actions(
+        history_actions,
+        feature_name="Qwen progress-event memory",
+    )
+    if len(normalized_actions) != int(last_frame_index):
+        raise ValueError(
+            "Qwen progress-event memory requires len(history_actions) == num_frames - 1, "
+            f"got len(history_actions)={len(normalized_actions)} for num_frames={int(last_frame_index) + 1}"
+        )
+
+    history_pool_indices = list(range(pool_start_frame, current_frame_index))
+    selected_roles: Dict[int, str] = {}
+
+    max_turn_events = max(0, int(event_budget))
+    turn_events = _detect_large_turn_events(
+        history_actions=normalized_actions,
+        pool_start_frame=pool_start_frame,
+        current_frame_index=current_frame_index,
+        event_turn_threshold=event_turn_threshold,
+    )
+    recent_events = sorted(turn_events, key=lambda boundaries: boundaries[1], reverse=True)
+    for pre_boundary, post_boundary in recent_events[:max_turn_events]:
+        for frame_index in (pre_boundary, post_boundary):
+            if frame_index == current_frame_index:
+                continue
+            if pool_start_frame <= frame_index < current_frame_index:
+                selected_roles[frame_index] = VLN_IMAGE_ROLE_EVENT
+
+    event_frame_cost = 0.5 if event_compression else 1.0
+    event_equivalent_slots = len(selected_roles) * event_frame_cost
+    standard_budget = max(0, int(math.floor(max_memory_images - event_equivalent_slots)))
+
+    progress_candidates = [
+        frame_index
+        for frame_index in history_pool_indices
+        if frame_index not in selected_roles
+        and _frame_producing_action(frame_index, normalized_actions) == "forward"
+    ]
+    progress_indices = _select_with_current_anchor(
+        progress_candidates,
+        current_frame_index=current_frame_index,
+        target_count=standard_budget,
+    )
+    for frame_index in progress_indices:
+        selected_roles.setdefault(frame_index, VLN_IMAGE_ROLE_STANDARD)
+
+    remaining_standard_budget = standard_budget - len(progress_indices)
+    fallback_candidates = [
+        frame_index
+        for frame_index in history_pool_indices
+        if frame_index not in selected_roles
+    ]
+    fallback_indices = _select_with_current_anchor(
+        fallback_candidates,
+        current_frame_index=current_frame_index,
+        target_count=remaining_standard_budget,
+    )
+    for frame_index in fallback_indices:
+        selected_roles.setdefault(frame_index, VLN_IMAGE_ROLE_STANDARD)
+
+    selected_items = sorted(selected_roles.items())
+    selected_items.append((current_frame_index, VLN_IMAGE_ROLE_CURRENT))
+    return selected_items
+
+
+def build_vln_image_selection_with_roles(
+    current_step: int,
+    last_frame_index: int,
+    history_actions: Any = None,
+    qwen_memory_policy: str = DEFAULT_QWEN_MEMORY_POLICY,
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+    event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
+    event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
+    event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+) -> List[Tuple[int, str]]:
+    qwen_memory_policy = str(qwen_memory_policy or DEFAULT_QWEN_MEMORY_POLICY).strip().lower()
+    if qwen_memory_policy not in QWEN_MEMORY_POLICIES:
+        raise ValueError(
+            f"Unknown qwen_memory_policy={qwen_memory_policy!r}; "
+            f"expected one of {sorted(QWEN_MEMORY_POLICIES)}"
+        )
+    if qwen_memory_policy == QWEN_MEMORY_POLICY_PROGRESS_EVENT:
+        return build_vln_progress_event_memory_selection(
+            current_step=current_step,
+            last_frame_index=last_frame_index,
+            history_actions=history_actions,
+            max_memory_images=max_memory_images,
+            memory_pool_window_frames=memory_pool_window_frames,
+            event_budget=event_budget,
+            event_compression=event_compression,
+            event_turn_threshold=event_turn_threshold,
+        )
+
+    selected_indices = build_vln_image_selection(
+        current_step=current_step,
+        last_frame_index=last_frame_index,
+        max_memory_images=max_memory_images,
+        memory_pool_window_frames=memory_pool_window_frames,
+    )
+    return list(zip(selected_indices, _selection_roles_for_indices(selected_indices)))
+
+
 def select_vln_image_paths(
     image_paths: List[str],
     max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
@@ -366,6 +603,35 @@ def select_vln_image_paths(
         memory_pool_window_frames=memory_pool_window_frames,
     )
     return [image_paths[index] for index in selected_indices]
+
+
+def select_vln_image_paths_with_roles(
+    image_paths: List[str],
+    history_actions: Any = None,
+    qwen_memory_policy: str = DEFAULT_QWEN_MEMORY_POLICY,
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+    event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
+    event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
+    event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+) -> Tuple[List[str], List[str], List[int]]:
+    if not image_paths:
+        return [], [], []
+
+    selection = build_vln_image_selection_with_roles(
+        current_step=len(image_paths) - 1,
+        last_frame_index=len(image_paths) - 1,
+        history_actions=history_actions,
+        qwen_memory_policy=qwen_memory_policy,
+        max_memory_images=max_memory_images,
+        memory_pool_window_frames=memory_pool_window_frames,
+        event_budget=event_budget,
+        event_compression=event_compression,
+        event_turn_threshold=event_turn_threshold,
+    )
+    selected_indices = [frame_index for frame_index, _ in selection]
+    selected_roles = [role for _, role in selection]
+    return [image_paths[index] for index in selected_indices], selected_roles, selected_indices
 
 
 def text_content(text: str) -> Dict[str, str]:
@@ -542,7 +808,15 @@ def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
     return normalized_actions
 
 
-def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
+def apply_vln_memory_policy(
+    example: Dict[str, Any],
+    qwen_memory_policy: str = DEFAULT_QWEN_MEMORY_POLICY,
+    qwen_memory_max_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    qwen_memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+    qwen_memory_event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
+    qwen_memory_event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
+    qwen_memory_event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+) -> Dict[str, Any]:
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
         raise ValueError("VLN example field 'images' must contain the full image history")
@@ -550,12 +824,23 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(image_path, str) or not image_path:
             raise ValueError("VLN example field 'images' must contain non-empty string paths")
 
-    selected_images = select_vln_image_paths(raw_images)
+    selected_images, selected_roles, selected_indices = select_vln_image_paths_with_roles(
+        raw_images,
+        history_actions=example.get("history_actions"),
+        qwen_memory_policy=qwen_memory_policy,
+        max_memory_images=qwen_memory_max_images,
+        memory_pool_window_frames=qwen_memory_pool_window_frames,
+        event_budget=qwen_memory_event_budget,
+        event_compression=qwen_memory_event_compression,
+        event_turn_threshold=qwen_memory_event_turn_threshold,
+    )
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example)
 
     normalized = dict(example)
     normalized["images"] = selected_images
+    normalized["image_memory_roles"] = selected_roles
+    normalized["image_memory_indices"] = selected_indices
     normalized["messages"] = [
         {
             "role": "system",
@@ -647,6 +932,12 @@ class SupervisedDataset(Dataset):
         shuffle: bool = True,
         prompt_format: str = "chat_template",
         collect_trace_metadata: bool = False,
+        qwen_memory_policy: str = DEFAULT_QWEN_MEMORY_POLICY,
+        qwen_memory_max_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+        qwen_memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+        qwen_memory_event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
+        qwen_memory_event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
+        qwen_memory_event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
     ):
         self.jsonl_path = jsonl_path
         self.processor = processor
@@ -663,6 +954,12 @@ class SupervisedDataset(Dataset):
         self.panovggt_enabled = bool(panovggt_enabled)
         self.panovggt_spatial_memory = bool(panovggt_spatial_memory)
         self.panovggt_spatial_memory_frames = max(1, int(panovggt_spatial_memory_frames))
+        self.qwen_memory_policy = str(qwen_memory_policy or DEFAULT_QWEN_MEMORY_POLICY).strip().lower()
+        self.qwen_memory_max_images = max(0, int(qwen_memory_max_images))
+        self.qwen_memory_pool_window_frames = max(1, int(qwen_memory_pool_window_frames))
+        self.qwen_memory_event_budget = max(0, int(qwen_memory_event_budget))
+        self.qwen_memory_event_compression = bool(qwen_memory_event_compression)
+        self.qwen_memory_event_turn_threshold = max(1, int(qwen_memory_event_turn_threshold))
         self.prompt_format = prompt_format
         self._fp = None
         self.episode_keys = None
@@ -729,14 +1026,37 @@ class SupervisedDataset(Dataset):
         handle.seek(self.offsets[index])
         return json.loads(handle.readline())
 
-    def _load_images(self, image_paths: List[str]):
+    def _load_images(self, image_paths: List[str], image_roles: Optional[List[str]] = None):
         images = []
         num_images = len(image_paths)
+        if image_roles is not None and len(image_roles) != num_images:
+            raise ValueError(
+                "Qwen image memory roles must match the number of selected image paths, "
+                f"got {len(image_roles)} roles for {num_images} images"
+            )
         for image_index, image_path in enumerate(image_paths):
             with Image.open(image_path) as image:
-                is_current_observation = image_index == num_images - 1
+                image_role = (
+                    image_roles[image_index]
+                    if image_roles is not None
+                    else (
+                        VLN_IMAGE_ROLE_CURRENT
+                        if image_index == num_images - 1
+                        else VLN_IMAGE_ROLE_STANDARD
+                    )
+                )
+                is_current_observation = image_role == VLN_IMAGE_ROLE_CURRENT or image_index == num_images - 1
                 if is_current_observation:
                     processed_image = preprocess_vln_current_image(
+                        image,
+                        top_crop_degrees=self.erp_top_crop_degrees,
+                        bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                    )
+                elif (
+                    image_role == VLN_IMAGE_ROLE_EVENT
+                    and self.qwen_memory_event_compression
+                ):
+                    processed_image = preprocess_vln_event_memory_image(
                         image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
@@ -750,6 +1070,20 @@ class SupervisedDataset(Dataset):
                 images.append(processed_image)
         return images
 
+    def _qwen_processor_image_kwargs(self, image_roles: Optional[List[str]]) -> Dict[str, Any]:
+        if not (
+            self.qwen_memory_event_compression
+            and image_roles is not None
+            and VLN_IMAGE_ROLE_EVENT in image_roles
+        ):
+            return {}
+        return {
+            "size": {
+                "shortest_edge": DEFAULT_QWEN_MEMORY_COMPRESSED_MIN_PIXELS,
+                "longest_edge": DEFAULT_QWEN_MEMORY_COMPRESSED_MAX_PIXELS,
+            }
+        }
+
     def _load_panovggt_images(self, image_paths: List[str]) -> torch.Tensor:
         images = []
         for image_path in image_paths:
@@ -759,11 +1093,20 @@ class SupervisedDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         raw_example = self._load_example(index)
-        example = apply_vln_memory_policy(raw_example)
+        example = apply_vln_memory_policy(
+            raw_example,
+            qwen_memory_policy=self.qwen_memory_policy,
+            qwen_memory_max_images=self.qwen_memory_max_images,
+            qwen_memory_pool_window_frames=self.qwen_memory_pool_window_frames,
+            qwen_memory_event_budget=self.qwen_memory_event_budget,
+            qwen_memory_event_compression=self.qwen_memory_event_compression,
+            qwen_memory_event_turn_threshold=self.qwen_memory_event_turn_threshold,
+        )
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
             image_root=self.image_root,
         )
+        vision_roles = example.get("image_memory_roles")
         prompt_and_target = build_prompt_and_target(
             messages,
             self.prompt_format,
@@ -780,10 +1123,12 @@ class SupervisedDataset(Dataset):
                 text=full_text,
                 images=self._load_images(
                     image_paths=vision_paths,
+                    image_roles=vision_roles,
                 ),
                 return_tensors="pt",
                 truncation=self.model_max_length is not None,
                 max_length=self.model_max_length,
+                **self._qwen_processor_image_kwargs(vision_roles),
             )
         else:
             encoded = self.tokenizer(

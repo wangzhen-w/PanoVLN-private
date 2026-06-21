@@ -128,6 +128,12 @@ def _load_model_config(cfg):
         "panovggt_spatial_memory_frames",
         "panovggt_patch_token_cache",
         "panovggt_patch_token_cache_size",
+        "qwen_memory_policy",
+        "qwen_memory_max_images",
+        "qwen_memory_pool_window_frames",
+        "qwen_memory_event_budget",
+        "qwen_memory_event_compression",
+        "qwen_memory_event_turn_threshold",
     )
     action_bearing_fields = (
         "action_bearing_enabled",

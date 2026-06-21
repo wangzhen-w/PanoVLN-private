@@ -27,16 +27,27 @@ from peft import PeftModel
 from src.train.data.data import (
     DEFAULT_ERP_BOTTOM_CROP_DEGREES,
     DEFAULT_ERP_TOP_CROP_DEGREES,
+    DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
+    DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
+    DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+    DEFAULT_QWEN_MEMORY_POLICY,
+    DEFAULT_QWEN_MEMORY_COMPRESSED_MAX_PIXELS,
+    DEFAULT_QWEN_MEMORY_COMPRESSED_MIN_PIXELS,
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
     DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
+    VLN_IMAGE_ROLE_CURRENT,
+    VLN_IMAGE_ROLE_EVENT,
+    VLN_IMAGE_ROLE_STANDARD,
     VLN_SYSTEM_PROMPT,
     build_erp_image_geometry_batch,
     build_panovggt_spatial_memory_selection,
     build_vln_image_selection,
+    build_vln_image_selection_with_roles,
     build_vln_user_content,
     preprocess_panovggt_current_image,
     preprocess_vln_current_image,
+    preprocess_vln_event_memory_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
 )
@@ -149,19 +160,67 @@ def select_vln_eval_image_indices(
     )
 
 
+def select_vln_eval_image_selection(
+    history_length: int,
+    history_actions: Sequence,
+    qwen_memory_policy: str,
+    max_memory_images: int,
+    memory_pool_window_frames: int,
+    event_budget: int,
+    event_compression: bool,
+    event_turn_threshold: int,
+) -> List[tuple[int, str]]:
+    last_frame_index = history_length - 1
+    if last_frame_index < 0:
+        return []
+    return build_vln_image_selection_with_roles(
+        current_step=last_frame_index,
+        last_frame_index=last_frame_index,
+        history_actions=list(history_actions),
+        qwen_memory_policy=qwen_memory_policy,
+        max_memory_images=max_memory_images,
+        memory_pool_window_frames=memory_pool_window_frames,
+        event_budget=event_budget,
+        event_compression=event_compression,
+        event_turn_threshold=event_turn_threshold,
+    )
+
+
 def preprocess_vln_eval_images(
     rgb_history: Sequence[Image.Image],
     selected_indices: Sequence[int],
+    selected_roles: Sequence[str] | None = None,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
 ) -> List[Image.Image]:
     selected_images = []
     for image_position, frame_index in enumerate(selected_indices):
         raw_image = rgb_history[frame_index]
-        is_current_observation = image_position == len(selected_indices) - 1
+        image_role = (
+            selected_roles[image_position]
+            if selected_roles is not None
+            else (
+                VLN_IMAGE_ROLE_CURRENT
+                if image_position == len(selected_indices) - 1
+                else VLN_IMAGE_ROLE_STANDARD
+            )
+        )
+        is_current_observation = (
+            image_role == VLN_IMAGE_ROLE_CURRENT
+            or image_position == len(selected_indices) - 1
+        )
         if is_current_observation:
             selected_images.append(
                 preprocess_vln_current_image(
+                    raw_image,
+                    top_crop_degrees=top_crop_degrees,
+                    bottom_crop_degrees=bottom_crop_degrees,
+                )
+            )
+        elif image_role == VLN_IMAGE_ROLE_EVENT and event_compression:
+            selected_images.append(
+                preprocess_vln_event_memory_image(
                     raw_image,
                     top_crop_degrees=top_crop_degrees,
                     bottom_crop_degrees=bottom_crop_degrees,
@@ -411,6 +470,10 @@ class PanoVLN_Agent(Agent):
         self.turn_angle = turn_angle
         self.max_memory_images = max(0, int(max_memory_images))
         self.memory_pool_window_frames = max(1, int(memory_pool_window_frames))
+        self.qwen_memory_policy = DEFAULT_QWEN_MEMORY_POLICY
+        self.qwen_memory_event_budget = DEFAULT_QWEN_MEMORY_EVENT_BUDGET
+        self.qwen_memory_event_compression = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION
+        self.qwen_memory_event_turn_threshold = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD
         self.attn_implementation = attn_implementation
         os.makedirs(self.result_path, exist_ok=True)
         if self.save_topdown:
@@ -464,6 +527,44 @@ class PanoVLN_Agent(Agent):
             1,
             int(getattr(self.model.config, "panovggt_patch_token_cache_size", 100)),
         )
+        self.qwen_memory_policy = str(
+            getattr(self.model.config, "qwen_memory_policy", self.qwen_memory_policy)
+        ).strip().lower()
+        self.max_memory_images = max(
+            0,
+            int(getattr(self.model.config, "qwen_memory_max_images", self.max_memory_images)),
+        )
+        self.memory_pool_window_frames = max(
+            1,
+            int(
+                getattr(
+                    self.model.config,
+                    "qwen_memory_pool_window_frames",
+                    self.memory_pool_window_frames,
+                )
+            ),
+        )
+        self.qwen_memory_event_budget = max(
+            0,
+            int(getattr(self.model.config, "qwen_memory_event_budget", self.qwen_memory_event_budget)),
+        )
+        self.qwen_memory_event_compression = bool(
+            getattr(
+                self.model.config,
+                "qwen_memory_event_compression",
+                self.qwen_memory_event_compression,
+            )
+        )
+        self.qwen_memory_event_turn_threshold = max(
+            1,
+            int(
+                getattr(
+                    self.model.config,
+                    "qwen_memory_event_turn_threshold",
+                    self.qwen_memory_event_turn_threshold,
+                )
+            ),
+        )
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -504,11 +605,18 @@ class PanoVLN_Agent(Agent):
             f"panovggt_spatial_memory={self.panovggt_spatial_memory}, "
             f"panovggt_spatial_memory_frames={self.panovggt_spatial_memory_frames}, "
             f"panovggt_patch_token_cache={self.panovggt_patch_token_cache}, "
-            f"panovggt_patch_token_cache_size={self.panovggt_patch_token_cache_size})"
+            f"panovggt_patch_token_cache_size={self.panovggt_patch_token_cache_size}, "
+            f"qwen_memory_policy={self.qwen_memory_policy}, "
+            f"qwen_memory_max_images={self.max_memory_images}, "
+            f"qwen_memory_pool_window_frames={self.memory_pool_window_frames}, "
+            f"qwen_memory_event_budget={self.qwen_memory_event_budget}, "
+            f"qwen_memory_event_compression={self.qwen_memory_event_compression}, "
+            f"qwen_memory_event_turn_threshold={self.qwen_memory_event_turn_threshold})"
         )
         
         self.rgb_history = []
         self.current_images = []
+        self.current_image_roles = []
         self.executed_action_history = []
         self.last_returned_action = None
         self.model_generated_actions = []
@@ -527,11 +635,22 @@ class PanoVLN_Agent(Agent):
 
         texts = [build_eval_generation_prompt(self.processor, self.conversations)]
 
+        image_kwargs = {}
+        if (
+            self.qwen_memory_event_compression
+            and VLN_IMAGE_ROLE_EVENT in self.current_image_roles
+        ):
+            image_kwargs["size"] = {
+                "shortest_edge": DEFAULT_QWEN_MEMORY_COMPRESSED_MIN_PIXELS,
+                "longest_edge": DEFAULT_QWEN_MEMORY_COMPRESSED_MAX_PIXELS,
+            }
+
         prompt_inputs = self.processor(
             text=texts,
             images=self.current_images if self.current_images else None,
             return_tensors="pt",
             padding=True,
+            **image_kwargs,
         )
         image_count = len(self.current_images)
         prompt_inputs["image_erp_geometry"] = build_erp_image_geometry_batch(
@@ -576,19 +695,28 @@ class PanoVLN_Agent(Agent):
         self.executed_action_history.append(self.last_returned_action)
         self.last_returned_action = None
 
-    def _select_image_indices(self):
-        return select_vln_eval_image_indices(
+    def _select_image_selection(self):
+        return select_vln_eval_image_selection(
             history_length=len(self.rgb_history),
+            history_actions=self.executed_action_history,
+            qwen_memory_policy=self.qwen_memory_policy,
             max_memory_images=self.max_memory_images,
             memory_pool_window_frames=self.memory_pool_window_frames,
+            event_budget=self.qwen_memory_event_budget,
+            event_compression=self.qwen_memory_event_compression,
+            event_turn_threshold=self.qwen_memory_event_turn_threshold,
         )
 
-    def _prepare_selected_images(self, selected_indices):
+    def _prepare_selected_images(self, selected_selection):
+        selected_indices = [frame_index for frame_index, _ in selected_selection]
+        selected_roles = [role for _, role in selected_selection]
         return preprocess_vln_eval_images(
             rgb_history=self.rgb_history,
             selected_indices=selected_indices,
+            selected_roles=selected_roles,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
+            event_compression=self.qwen_memory_event_compression,
         )
 
     def _select_panovggt_image_indices(self):
@@ -662,8 +790,9 @@ class PanoVLN_Agent(Agent):
             frame_index = evictable_indices.pop(0)
             self.panovggt_patch_token_cache_store.pop(frame_index, None)
 
-    def _predict_action_sequence_from_images(self, instruction, selected_images):
+    def _predict_action_sequence_from_images(self, instruction, selected_images, selected_roles):
         self.current_images = selected_images
+        self.current_image_roles = list(selected_roles)
         self.conversations = build_eval_messages(
             instruction=instruction,
             images=selected_images,
@@ -700,6 +829,7 @@ class PanoVLN_Agent(Agent):
         self.topdown_frames = []
         self.rgb_history = []
         self.current_images = []
+        self.current_image_roles = []
         self.executed_action_history = []
         self.last_returned_action = None
         self.model_generated_actions = []
@@ -724,11 +854,13 @@ class PanoVLN_Agent(Agent):
         self.rgb_history.append(Image.fromarray(rgb.astype('uint8')).convert('RGB'))
 
         if not self.pending_action_queue:
-            selected_indices = self._select_image_indices()
-            selected_images = self._prepare_selected_images(selected_indices)
+            selected_selection = self._select_image_selection()
+            selected_images = self._prepare_selected_images(selected_selection)
+            selected_roles = [role for _, role in selected_selection]
             navigation, action_ids = self._predict_action_sequence_from_images(
                 instruction=observations["instruction"]["text"],
                 selected_images=selected_images,
+                selected_roles=selected_roles,
             )
 
             if not action_ids:

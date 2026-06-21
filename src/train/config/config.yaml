@@ -20,7 +20,7 @@ model:
   erp_bottom_crop_degrees: 20.0
   panovggt_enabled: true
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
-  panovggt_alpha_value: 0.1
+  panovggt_alpha_value: 0.05
   panovggt_sampling_mode: "grouping"    #"singlepoint"每个 Qwen token 采一个 PanoVGGT C token / "grouping"2x2 四个 C 拼接
   panovggt_force_fp32: false
   action_bearing_enabled: false
@@ -33,6 +33,12 @@ memory:
   panovggt_spatial_memory_frames: 3
   panovggt_patch_token_cache: true
   panovggt_patch_token_cache_size: 100
+  qwen_memory_policy: "progress_event"  # choices: "uniform", "progress_event"
+  qwen_memory_max_images: 10
+  qwen_memory_pool_window_frames: 100
+  qwen_memory_event_budget: 3
+  qwen_memory_event_compression: true
+  qwen_memory_event_turn_threshold: 3  # consecutive 15-degree turns; 3 means 45 degrees
 
 data:
   train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
@@ -48,7 +54,7 @@ data:
   trace_enable: false
 
 training:
-  output_dir: "/workspace/code/a_property/model/panovggt_0.1_0.2_grouping_spatial_fixed_mem3_8card"
+  output_dir: "/workspace/code/a_property/model/panovggt_0.05_grouping_spatial_fixed_mem3_qwen_progress_event_8card"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -79,7 +85,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovggt_0.1_0.2_grouping_spatial_fixed_mem3_8card_seed42"
+  run_name: "panovggt_0.05_grouping_spatial_fixed_mem3_qwen_progress_event_8card_seed42"
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
@@ -93,10 +99,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovggt_0.1_0.2_grouping_spatial_fixed_mem3_8card_seed42"
-  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "panovggt", "panovggt-alpha-0.1", "panovggt-grouping", "panovggt-spatial-memory", "panovggt-memory-3", "panovggt-fixed-frames", "panovggt-gap2-forward-fill", "ebs-event050-bg005-tail080", "history-actions-patched", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-mlp-lr-1e-5", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
+  name: "panovggt_0.05_grouping_spatial_fixed_mem3_qwen_progress_event_8card_seed42"
+  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "panovggt", "panovggt-alpha-0.05", "panovggt-grouping", "panovggt-spatial-memory", "panovggt-memory-3", "panovggt-fixed-frames", "panovggt-gap2-forward-fill", "qwen-progress-event-memory", "qwen-event-compression", "qwen-event-budget-3", "qwen-event-threshold-45deg", "ebs-event050-bg005-tail080", "history-actions-patched", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-mlp-lr-1e-5", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "PanoVGGT spatial-geometric memory enabled with a fixed 3-frame window for both train and eval. The selector first uses backward forward-gap=2 spatial keyframes, then fills missing slots with nearest real history frames including turns, and pads only when the whole trajectory has fewer than 3 frames. Uses patched train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with history_actions, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, visual_lr=2e-6, visual_merger_lr=1e-5, panovggt_mlp_lr=1e-5, language_model_lr=2e-5. PanoVGGT is enabled with alpha=0.1, grouping sampling, and trace_enable=false."
+  notes: "PanoVGGT spatial-geometric memory enabled with a fixed 3-frame window for both train and eval. Qwen memory uses progress_event policy: recent 100-frame pool, 10-slot history budget, up to 3 large-turn events at 45deg threshold represented by compressed event boundary thumbnails, with remaining budget assigned to forward-progress frames and temporal fallback. Uses patched train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with history_actions, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, visual_lr=2e-6, visual_merger_lr=1e-5, panovggt_mlp_lr=1e-5, language_model_lr=2e-5. PanoVGGT is enabled with alpha=0.05, grouping sampling, and trace_enable=false."
   id: null
   resume: "never"

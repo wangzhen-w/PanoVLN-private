@@ -39,6 +39,12 @@ class MemoryConfig:
     panovggt_spatial_memory_frames: int = 5
     panovggt_patch_token_cache: bool = True
     panovggt_patch_token_cache_size: int = 100
+    qwen_memory_policy: str = "uniform"
+    qwen_memory_max_images: int = 10
+    qwen_memory_pool_window_frames: int = 100
+    qwen_memory_event_budget: int = 3
+    qwen_memory_event_compression: bool = True
+    qwen_memory_event_turn_threshold: int = 3
 
 
 @dataclass
@@ -143,6 +149,12 @@ def load_config(path: str) -> TrainConfig:
         "panovggt_spatial_memory_frames",
         "panovggt_patch_token_cache",
         "panovggt_patch_token_cache_size",
+        "qwen_memory_policy",
+        "qwen_memory_max_images",
+        "qwen_memory_pool_window_frames",
+        "qwen_memory_event_budget",
+        "qwen_memory_event_compression",
+        "qwen_memory_event_turn_threshold",
     ):
         if legacy_field in model and legacy_field not in memory:
             memory[legacy_field] = model.pop(legacy_field)

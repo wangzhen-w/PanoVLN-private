@@ -225,6 +225,12 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_spatial_memory_frames: {_config_value(cfg.memory.panovggt_spatial_memory_frames)}")
     rank0_print(RANK, f"panovggt_patch_token_cache: {_config_value(cfg.memory.panovggt_patch_token_cache)}")
     rank0_print(RANK, f"panovggt_patch_token_cache_size: {_config_value(cfg.memory.panovggt_patch_token_cache_size)}")
+    rank0_print(RANK, f"qwen_memory_policy: {_config_value(cfg.memory.qwen_memory_policy)}")
+    rank0_print(RANK, f"qwen_memory_max_images: {_config_value(cfg.memory.qwen_memory_max_images)}")
+    rank0_print(RANK, f"qwen_memory_pool_window_frames: {_config_value(cfg.memory.qwen_memory_pool_window_frames)}")
+    rank0_print(RANK, f"qwen_memory_event_budget: {_config_value(cfg.memory.qwen_memory_event_budget)}")
+    rank0_print(RANK, f"qwen_memory_event_compression: {_config_value(cfg.memory.qwen_memory_event_compression)}")
+    rank0_print(RANK, f"qwen_memory_event_turn_threshold: {_config_value(cfg.memory.qwen_memory_event_turn_threshold)}")
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_key_alpha_value: {_config_value(cfg.model.action_bearing_key_alpha_value)}")
     rank0_print(RANK, f"action_bearing_value_alpha_value: {_config_value(cfg.model.action_bearing_value_alpha_value)}")
@@ -312,6 +318,36 @@ def main():
             cfg.memory.panovggt_patch_token_cache_size,
         )
     )
+    effective_qwen_memory_policy = str(
+        getattr(model_config, "qwen_memory_policy", cfg.memory.qwen_memory_policy)
+    )
+    effective_qwen_memory_max_images = int(
+        getattr(model_config, "qwen_memory_max_images", cfg.memory.qwen_memory_max_images)
+    )
+    effective_qwen_memory_pool_window_frames = int(
+        getattr(
+            model_config,
+            "qwen_memory_pool_window_frames",
+            cfg.memory.qwen_memory_pool_window_frames,
+        )
+    )
+    effective_qwen_memory_event_budget = int(
+        getattr(model_config, "qwen_memory_event_budget", cfg.memory.qwen_memory_event_budget)
+    )
+    effective_qwen_memory_event_compression = bool(
+        getattr(
+            model_config,
+            "qwen_memory_event_compression",
+            cfg.memory.qwen_memory_event_compression,
+        )
+    )
+    effective_qwen_memory_event_turn_threshold = int(
+        getattr(
+            model_config,
+            "qwen_memory_event_turn_threshold",
+            cfg.memory.qwen_memory_event_turn_threshold,
+        )
+    )
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
     )
@@ -327,6 +363,12 @@ def main():
         rank0_print(RANK, f"panovggt_spatial_memory_frames: {_config_value(effective_panovggt_spatial_memory_frames)}")
         rank0_print(RANK, f"panovggt_patch_token_cache: {_config_value(effective_panovggt_patch_token_cache)}")
         rank0_print(RANK, f"panovggt_patch_token_cache_size: {_config_value(effective_panovggt_patch_token_cache_size)}")
+        rank0_print(RANK, f"qwen_memory_policy: {_config_value(effective_qwen_memory_policy)}")
+        rank0_print(RANK, f"qwen_memory_max_images: {_config_value(effective_qwen_memory_max_images)}")
+        rank0_print(RANK, f"qwen_memory_pool_window_frames: {_config_value(effective_qwen_memory_pool_window_frames)}")
+        rank0_print(RANK, f"qwen_memory_event_budget: {_config_value(effective_qwen_memory_event_budget)}")
+        rank0_print(RANK, f"qwen_memory_event_compression: {_config_value(effective_qwen_memory_event_compression)}")
+        rank0_print(RANK, f"qwen_memory_event_turn_threshold: {_config_value(effective_qwen_memory_event_turn_threshold)}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(RANK, f"action_bearing_enabled: {_config_value(getattr(model_config, 'action_bearing_enabled', None))}")
@@ -346,6 +388,12 @@ def main():
         panovggt_enabled=effective_panovggt_enabled,
         panovggt_spatial_memory=effective_panovggt_spatial_memory,
         panovggt_spatial_memory_frames=effective_panovggt_spatial_memory_frames,
+        qwen_memory_policy=effective_qwen_memory_policy,
+        qwen_memory_max_images=effective_qwen_memory_max_images,
+        qwen_memory_pool_window_frames=effective_qwen_memory_pool_window_frames,
+        qwen_memory_event_budget=effective_qwen_memory_event_budget,
+        qwen_memory_event_compression=effective_qwen_memory_event_compression,
+        qwen_memory_event_turn_threshold=effective_qwen_memory_event_turn_threshold,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
         prompt_format=cfg.data.prompt_format,
@@ -366,6 +414,12 @@ def main():
             panovggt_enabled=effective_panovggt_enabled,
             panovggt_spatial_memory=effective_panovggt_spatial_memory,
             panovggt_spatial_memory_frames=effective_panovggt_spatial_memory_frames,
+            qwen_memory_policy=effective_qwen_memory_policy,
+            qwen_memory_max_images=effective_qwen_memory_max_images,
+            qwen_memory_pool_window_frames=effective_qwen_memory_pool_window_frames,
+            qwen_memory_event_budget=effective_qwen_memory_event_budget,
+            qwen_memory_event_compression=effective_qwen_memory_event_compression,
+            qwen_memory_event_turn_threshold=effective_qwen_memory_event_turn_threshold,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
