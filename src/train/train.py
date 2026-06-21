@@ -221,6 +221,10 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
+    rank0_print(RANK, f"panovggt_spatial_memory: {_config_value(cfg.memory.panovggt_spatial_memory)}")
+    rank0_print(RANK, f"panovggt_spatial_memory_frames: {_config_value(cfg.memory.panovggt_spatial_memory_frames)}")
+    rank0_print(RANK, f"panovggt_patch_token_cache: {_config_value(cfg.memory.panovggt_patch_token_cache)}")
+    rank0_print(RANK, f"panovggt_patch_token_cache_size: {_config_value(cfg.memory.panovggt_patch_token_cache_size)}")
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_key_alpha_value: {_config_value(cfg.model.action_bearing_key_alpha_value)}")
     rank0_print(RANK, f"action_bearing_value_alpha_value: {_config_value(cfg.model.action_bearing_value_alpha_value)}")
@@ -288,6 +292,26 @@ def main():
     model = load_model(cfg)
     model_config = model.config
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
+    effective_panovggt_spatial_memory = bool(
+        getattr(model_config, "panovggt_spatial_memory", cfg.memory.panovggt_spatial_memory)
+    )
+    effective_panovggt_spatial_memory_frames = int(
+        getattr(
+            model_config,
+            "panovggt_spatial_memory_frames",
+            cfg.memory.panovggt_spatial_memory_frames,
+        )
+    )
+    effective_panovggt_patch_token_cache = bool(
+        getattr(model_config, "panovggt_patch_token_cache", cfg.memory.panovggt_patch_token_cache)
+    )
+    effective_panovggt_patch_token_cache_size = int(
+        getattr(
+            model_config,
+            "panovggt_patch_token_cache_size",
+            cfg.memory.panovggt_patch_token_cache_size,
+        )
+    )
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
     )
@@ -299,6 +323,10 @@ def main():
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
+        rank0_print(RANK, f"panovggt_spatial_memory: {_config_value(effective_panovggt_spatial_memory)}")
+        rank0_print(RANK, f"panovggt_spatial_memory_frames: {_config_value(effective_panovggt_spatial_memory_frames)}")
+        rank0_print(RANK, f"panovggt_patch_token_cache: {_config_value(effective_panovggt_patch_token_cache)}")
+        rank0_print(RANK, f"panovggt_patch_token_cache_size: {_config_value(effective_panovggt_patch_token_cache_size)}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(RANK, f"action_bearing_enabled: {_config_value(getattr(model_config, 'action_bearing_enabled', None))}")
@@ -316,6 +344,8 @@ def main():
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
+        panovggt_spatial_memory=effective_panovggt_spatial_memory,
+        panovggt_spatial_memory_frames=effective_panovggt_spatial_memory_frames,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
         prompt_format=cfg.data.prompt_format,
@@ -334,6 +364,8 @@ def main():
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,
+            panovggt_spatial_memory=effective_panovggt_spatial_memory,
+            panovggt_spatial_memory_frames=effective_panovggt_spatial_memory_frames,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,

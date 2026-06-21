@@ -29,8 +29,10 @@ from src.train.data.data import (
     DEFAULT_ERP_TOP_CROP_DEGREES,
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
+    DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
     VLN_SYSTEM_PROMPT,
     build_erp_image_geometry_batch,
+    build_panovggt_spatial_memory_selection,
     build_vln_image_selection,
     build_vln_user_content,
     preprocess_panovggt_current_image,
@@ -442,6 +444,26 @@ class PanoVLN_Agent(Agent):
         self.erp_bottom_crop_degrees = float(
             getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
         )
+        self.panovggt_spatial_memory = bool(
+            getattr(self.model.config, "panovggt_spatial_memory", False)
+        )
+        self.panovggt_spatial_memory_frames = max(
+            1,
+            int(
+                getattr(
+                    self.model.config,
+                    "panovggt_spatial_memory_frames",
+                    DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
+                )
+            ),
+        )
+        self.panovggt_patch_token_cache = bool(
+            getattr(self.model.config, "panovggt_patch_token_cache", True)
+        )
+        self.panovggt_patch_token_cache_size = max(
+            1,
+            int(getattr(self.model.config, "panovggt_patch_token_cache_size", 100)),
+        )
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -476,7 +498,14 @@ class PanoVLN_Agent(Agent):
                 setattr(text_config, "bos_token_id", self.bos_token_id)
             if getattr(self.model, "generation_config", None) is not None:
                 self.model.generation_config.bos_token_id = self.bos_token_id
-        print(f"Initialization Complete (attn_implementation={self.attn_implementation})")
+        print(
+            "Initialization Complete "
+            f"(attn_implementation={self.attn_implementation}, "
+            f"panovggt_spatial_memory={self.panovggt_spatial_memory}, "
+            f"panovggt_spatial_memory_frames={self.panovggt_spatial_memory_frames}, "
+            f"panovggt_patch_token_cache={self.panovggt_patch_token_cache}, "
+            f"panovggt_patch_token_cache_size={self.panovggt_patch_token_cache_size})"
+        )
         
         self.rgb_history = []
         self.current_images = []
@@ -516,9 +545,7 @@ class PanoVLN_Agent(Agent):
             dtype=torch.long,
         )
         if bool(getattr(self.model.config, "panovggt_enabled", False)) and self.rgb_history:
-            prompt_inputs["panovggt_pixel_values"] = preprocess_panovggt_current_image(
-                self.rgb_history[-1]
-            ).unsqueeze(0)
+            prompt_inputs.update(self._prepare_panovggt_inputs())
 
         prompt_inputs = prompt_inputs.to(self.device)
         with torch.inference_mode():
@@ -564,6 +591,77 @@ class PanoVLN_Agent(Agent):
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
 
+    def _select_panovggt_image_indices(self):
+        if not self.panovggt_spatial_memory:
+            return [len(self.rgb_history) - 1]
+        return build_panovggt_spatial_memory_selection(
+            num_frames=len(self.rgb_history),
+            history_actions=self.executed_action_history,
+            total_frames=self.panovggt_spatial_memory_frames,
+        )
+
+    def _prepare_panovggt_pixel_values(self):
+        if not self.panovggt_spatial_memory:
+            return preprocess_panovggt_current_image(self.rgb_history[-1]).unsqueeze(0)
+        selected_indices = self._select_panovggt_image_indices()
+        images = [
+            preprocess_panovggt_current_image(self.rgb_history[frame_index])
+            for frame_index in selected_indices
+        ]
+        return torch.stack(images, dim=0).unsqueeze(0)
+
+    def _prepare_panovggt_inputs(self):
+        if not (self.panovggt_spatial_memory and self.panovggt_patch_token_cache):
+            return {"panovggt_pixel_values": self._prepare_panovggt_pixel_values()}
+        patch_tokens, image_hw = self._prepare_panovggt_patch_token_values()
+        return {
+            "panovggt_patch_tokens": patch_tokens,
+            "panovggt_patch_token_hw": image_hw,
+        }
+
+    def _encode_panovggt_frame_patch_tokens(self, frame_index):
+        image_tensor = preprocess_panovggt_current_image(
+            self.rgb_history[frame_index],
+        ).unsqueeze(0).unsqueeze(0)
+        target_dtype = next(self.model.parameters()).dtype
+        with torch.inference_mode():
+            patch_tokens, image_hw = self.model.encode_panovggt_patch_tokens(
+                image_tensor.to(device=self.device, dtype=target_dtype),
+                device=torch.device(self.device),
+                dtype=target_dtype,
+            )
+        return patch_tokens[0, 0].detach().cpu(), image_hw[0].detach().cpu()
+
+    def _prepare_panovggt_patch_token_values(self):
+        selected_indices = self._select_panovggt_image_indices()
+        for frame_index in sorted(set(selected_indices)):
+            if frame_index not in self.panovggt_patch_token_cache_store:
+                self.panovggt_patch_token_cache_store[frame_index] = (
+                    self._encode_panovggt_frame_patch_tokens(frame_index)
+                )
+        self._evict_panovggt_patch_token_cache(set(selected_indices))
+        selected_patch_tokens = [
+            self.panovggt_patch_token_cache_store[frame_index][0]
+            for frame_index in selected_indices
+        ]
+        image_hw = self.panovggt_patch_token_cache_store[selected_indices[-1]][1]
+        return torch.stack(selected_patch_tokens, dim=0).unsqueeze(0), image_hw.unsqueeze(0)
+
+    def _evict_panovggt_patch_token_cache(self, protected_indices):
+        if len(self.panovggt_patch_token_cache_store) <= self.panovggt_patch_token_cache_size:
+            return
+        evictable_indices = sorted(
+            frame_index
+            for frame_index in self.panovggt_patch_token_cache_store
+            if frame_index not in protected_indices
+        )
+        while (
+            len(self.panovggt_patch_token_cache_store) > self.panovggt_patch_token_cache_size
+            and evictable_indices
+        ):
+            frame_index = evictable_indices.pop(0)
+            self.panovggt_patch_token_cache_store.pop(frame_index, None)
+
     def _predict_action_sequence_from_images(self, instruction, selected_images):
         self.current_images = selected_images
         self.conversations = build_eval_messages(
@@ -608,6 +706,7 @@ class PanoVLN_Agent(Agent):
         self.model_parsed_action_sequences = []
         self.pending_action_queue = []
         self.conversations = []
+        self.panovggt_patch_token_cache_store = {}
         
     def act(self, observations, info, episode_id):
 

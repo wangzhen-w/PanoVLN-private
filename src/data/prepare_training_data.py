@@ -364,6 +364,10 @@ def process_dataset(
                     "step_index": action_chunk["start_step"],
                     "end_step": action_chunk["end_step"],
                     "real_action_count": action_chunk["real_action_count"],
+                    "history_actions": [
+                        action_id_to_str(int(action_id))
+                        for action_id in actions[: action_chunk["start_step"]]
+                    ],
                 }
                 if output_handle is None:
                     data2save.append(sample)

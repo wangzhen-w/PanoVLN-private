@@ -2,7 +2,7 @@ import json
 import math
 import os
 import random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
@@ -20,8 +20,10 @@ DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (960, 480)
 DEFAULT_PANOVGGT_IMAGE_SIZE = (1036, 518)
 DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
+DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES = 5
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
+PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP = 2
 VLN_ACTION_WORDS = {"forward", "left", "right", "stop"}
 VLN_ACTION_ALIASES = {
     "move_forward": "forward",
@@ -147,6 +149,179 @@ def preprocess_panovggt_current_image(image: Image.Image) -> torch.Tensor:
         Image.Resampling.LANCZOS,
     )
     return TF.to_tensor(processed_image)
+
+
+def _normalize_history_action(action: Any) -> Optional[str]:
+    if isinstance(action, bool):
+        return None
+    if isinstance(action, int):
+        if action == 0:
+            return "stop"
+        if action == 1:
+            return "forward"
+        if action == 2:
+            return "left"
+        if action == 3:
+            return "right"
+        return None
+    return _normalize_vln_action(action)
+
+
+def normalize_history_actions(actions: Any) -> List[str]:
+    if not isinstance(actions, list):
+        raise ValueError(
+            "PanoVGGT spatial memory requires VLN examples to provide "
+            "a list field 'history_actions'. Regenerate or patch the JSONL "
+            "before enabling panovggt_spatial_memory."
+        )
+    normalized_actions = []
+    for action_index, action in enumerate(actions):
+        normalized_action = _normalize_history_action(action)
+        if normalized_action is None:
+            raise ValueError(
+                "PanoVGGT spatial memory field 'history_actions' must contain "
+                f"action ids or action words, got {action!r} at index {action_index}"
+            )
+        normalized_actions.append(normalized_action)
+    return normalized_actions
+
+
+def _frame_producing_action(
+    frame_index: int,
+    history_actions: Sequence[str],
+) -> Optional[str]:
+    if frame_index <= 0:
+        return None
+    action_index = frame_index - 1
+    if action_index >= len(history_actions):
+        return None
+    return history_actions[action_index]
+
+
+def build_forward_counts_by_frame(
+    num_frames: int,
+    history_actions: Sequence[str],
+) -> List[int]:
+    num_frames = max(0, int(num_frames))
+    forward_counts = []
+    count = 0
+    for frame_index in range(num_frames):
+        if frame_index > 0 and _frame_producing_action(frame_index, history_actions) == "forward":
+            count += 1
+        forward_counts.append(count)
+    return forward_counts
+
+
+def _select_with_forward_gap(
+    *,
+    current_frame_index: int,
+    history_actions: Sequence[str],
+    forward_counts: Sequence[int],
+    target_count: int,
+    min_forward_gap: int,
+) -> List[int]:
+    selected = [current_frame_index]
+    last_selected_forward_count = int(forward_counts[current_frame_index])
+    for frame_index in range(current_frame_index - 1, -1, -1):
+        if _frame_producing_action(frame_index, history_actions) != "forward":
+            continue
+        frame_forward_count = int(forward_counts[frame_index])
+        if min_forward_gap > 0 and (
+            last_selected_forward_count - frame_forward_count < min_forward_gap
+        ):
+            continue
+        selected.append(frame_index)
+        last_selected_forward_count = frame_forward_count
+        if len(selected) >= target_count:
+            break
+    return selected
+
+
+def _fill_with_recent_real_frames(
+    *,
+    selected: List[int],
+    current_frame_index: int,
+    target_count: int,
+) -> List[int]:
+    selected_set = set(selected)
+    for frame_index in range(current_frame_index - 1, -1, -1):
+        if len(selected) >= target_count:
+            break
+        if frame_index in selected_set:
+            continue
+        selected.append(frame_index)
+        selected_set.add(frame_index)
+    return selected
+
+
+def _pad_indices_at_front(indices: List[int], target_count: int) -> List[int]:
+    if not indices:
+        return []
+    target_count = max(1, int(target_count))
+    if len(indices) >= target_count:
+        return indices[-target_count:]
+    return [indices[0]] * (target_count - len(indices)) + indices
+
+
+def build_panovggt_spatial_memory_selection(
+    *,
+    num_frames: int,
+    history_actions: Any,
+    total_frames: int = DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
+) -> List[int]:
+    """Select a fixed-size current-centric spatial window for PanoVGGT.
+
+    The window always ends with the current frame. It first selects
+    forward-produced spatial keyframes backwards with a two-forward-step gap.
+    If that yields too few frames, it fills with the nearest real history
+    frames, including turn-produced frames. Only trajectories shorter than the
+    requested window are padded by repeating the earliest available frame.
+    """
+    num_frames = int(num_frames)
+    total_frames = max(1, int(total_frames))
+    if num_frames <= 0:
+        return []
+
+    current_frame_index = num_frames - 1
+    normalized_actions = normalize_history_actions(history_actions)
+    expected_action_count = current_frame_index
+    if len(normalized_actions) != expected_action_count:
+        raise ValueError(
+            "PanoVGGT spatial memory requires len(history_actions) == num_frames - 1, "
+            f"got len(history_actions)={len(normalized_actions)} and num_frames={num_frames}"
+        )
+
+    forward_counts = build_forward_counts_by_frame(
+        num_frames,
+        normalized_actions,
+    )
+    selected = _select_with_forward_gap(
+        current_frame_index=current_frame_index,
+        history_actions=normalized_actions,
+        forward_counts=forward_counts,
+        target_count=total_frames,
+        min_forward_gap=PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP,
+    )
+    if len(selected) < total_frames:
+        selected = _fill_with_recent_real_frames(
+            selected=selected,
+            current_frame_index=current_frame_index,
+            target_count=total_frames,
+        )
+    return _pad_indices_at_front(sorted(selected[-total_frames:]), total_frames)
+
+
+def select_panovggt_spatial_memory_paths(
+    image_paths: List[str],
+    history_actions: Any,
+    total_frames: int = DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
+) -> Tuple[List[str], List[int]]:
+    selected_indices = build_panovggt_spatial_memory_selection(
+        num_frames=len(image_paths),
+        history_actions=history_actions,
+        total_frames=total_frames,
+    )
+    return [image_paths[index] for index in selected_indices], selected_indices
 
 
 def build_vln_image_selection(
@@ -466,6 +641,8 @@ class SupervisedDataset(Dataset):
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
+        panovggt_spatial_memory: bool = False,
+        panovggt_spatial_memory_frames: int = DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -484,6 +661,8 @@ class SupervisedDataset(Dataset):
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
+        self.panovggt_spatial_memory = bool(panovggt_spatial_memory)
+        self.panovggt_spatial_memory_frames = max(1, int(panovggt_spatial_memory_frames))
         self.prompt_format = prompt_format
         self._fp = None
         self.episode_keys = None
@@ -571,8 +750,16 @@ class SupervisedDataset(Dataset):
                 images.append(processed_image)
         return images
 
+    def _load_panovggt_images(self, image_paths: List[str]) -> torch.Tensor:
+        images = []
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                images.append(preprocess_panovggt_current_image(image))
+        return torch.stack(images, dim=0)
+
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        example = apply_vln_memory_policy(self._load_example(index))
+        raw_example = self._load_example(index)
+        example = apply_vln_memory_policy(raw_example)
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
             image_root=self.image_root,
@@ -646,9 +833,27 @@ class SupervisedDataset(Dataset):
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
 
-        if self.panovggt_enabled and vision_paths:
-            with Image.open(vision_paths[-1]) as image:
-                item["panovggt_pixel_values"] = preprocess_panovggt_current_image(image).unsqueeze(0)
+        if self.panovggt_enabled:
+            raw_images = raw_example.get("images", [])
+            if raw_images:
+                raw_image_paths = [
+                    _resolve_image_path(image_path, self.image_root)
+                    for image_path in raw_images
+                ]
+                if self.panovggt_spatial_memory:
+                    panovggt_paths, _ = select_panovggt_spatial_memory_paths(
+                        raw_image_paths,
+                        history_actions=raw_example.get("history_actions"),
+                        total_frames=self.panovggt_spatial_memory_frames,
+                    )
+                    item["panovggt_pixel_values"] = self._load_panovggt_images(
+                        panovggt_paths,
+                    ).unsqueeze(0)
+                else:
+                    with Image.open(raw_image_paths[-1]) as image:
+                        item["panovggt_pixel_values"] = preprocess_panovggt_current_image(
+                            image,
+                        ).unsqueeze(0)
 
         for key in STACKABLE_KEYS:
             if key in encoded:

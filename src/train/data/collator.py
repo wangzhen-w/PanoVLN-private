@@ -58,6 +58,12 @@ class MultiModalDataCollator:
 
         for key in STACKABLE_KEYS:
             if all(key in feature for feature in features):
-                batch[key] = torch.cat([feature[key] for feature in features], dim=0)
+                values = [feature[key] for feature in features]
+                if key == "panovggt_pixel_values":
+                    reference_shape = tuple(values[0].shape[1:])
+                    if any(tuple(value.shape[1:]) != reference_shape for value in values):
+                        batch[key] = values
+                        continue
+                batch[key] = torch.cat(values, dim=0)
 
         return batch

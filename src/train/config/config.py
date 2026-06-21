@@ -34,6 +34,14 @@ class ModelConfig:
 
 
 @dataclass
+class MemoryConfig:
+    panovggt_spatial_memory: bool = False
+    panovggt_spatial_memory_frames: int = 5
+    panovggt_patch_token_cache: bool = True
+    panovggt_patch_token_cache_size: int = 100
+
+
+@dataclass
 class DataConfig:
     train_jsonl: str
     eval_jsonl: Optional[str] = None
@@ -112,6 +120,7 @@ class RunConfig:
 @dataclass
 class TrainConfig:
     model: ModelConfig
+    memory: MemoryConfig
     data: DataConfig
     training: TrainingConfig
     run: RunConfig
@@ -122,14 +131,25 @@ def load_config(path: str) -> TrainConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    model = raw.get("model", {})
-    data = raw.get("data", {})
-    training = raw.get("training", {})
-    run = raw.get("run", {})
+    model = raw.get("model", {}) or {}
+    memory = raw.get("memory", {}) or {}
+    data = raw.get("data", {}) or {}
+    training = raw.get("training", {}) or {}
+    run = raw.get("run", {}) or {}
     wandb = raw.get("wandb", None)
+
+    for legacy_field in (
+        "panovggt_spatial_memory",
+        "panovggt_spatial_memory_frames",
+        "panovggt_patch_token_cache",
+        "panovggt_patch_token_cache_size",
+    ):
+        if legacy_field in model and legacy_field not in memory:
+            memory[legacy_field] = model.pop(legacy_field)
 
     return TrainConfig(
         model=ModelConfig(**model),
+        memory=MemoryConfig(**memory),
         data=DataConfig(**data),
         training=TrainingConfig(**training),
         run=RunConfig(**run),

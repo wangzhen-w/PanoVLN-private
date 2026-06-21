@@ -564,24 +564,11 @@ class PanoVGGTGeometryMLP(nn.Module):
             dtype=dtype,
         )
 
-    def forward(
+    def encode_patch_tokens(
         self,
         panovggt_pixel_values: torch.Tensor,
         panovggt_model: nn.Module,
-        target_grid_thw: torch.Tensor,
-        target_lengths: list[int],
-        image_erp_geometry: torch.Tensor | None,
-        output_device: torch.device,
-        output_dtype: torch.dtype,
-    ) -> list[torch.Tensor]:
-        if (
-            not self.enabled
-            or panovggt_model is None
-            or panovggt_pixel_values is None
-            or panovggt_pixel_values.numel() == 0
-        ):
-            return []
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if panovggt_pixel_values.ndim == 4:
             panovggt_pixel_values = panovggt_pixel_values.unsqueeze(1)
         if panovggt_pixel_values.ndim != 5:
@@ -590,20 +577,195 @@ class PanoVGGTGeometryMLP(nn.Module):
                 f"or [B, 3, H, W], got {tuple(panovggt_pixel_values.shape)}"
             )
 
+        encoder_param = next(panovggt_model.parameters())
+        images = panovggt_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
+        batch_size, sequence_length, channel_count, image_h, image_w = images.shape
+        if channel_count != 3:
+            raise AssertionError(f"Expected 3 PanoVGGT input channels, got {channel_count}")
+
+        aggregator = panovggt_model.aggregator
+        with torch.no_grad():
+            normalized = (images - aggregator._resnet_mean) / aggregator._resnet_std
+            flat_images = normalized.view(batch_size * sequence_length, channel_count, image_h, image_w)
+            patch_tokens = aggregator.patch_embed(flat_images)
+            if isinstance(patch_tokens, dict):
+                patch_tokens = patch_tokens["x_norm_patchtokens"]
+            if getattr(aggregator, "needs_projection", False):
+                patch_tokens = aggregator.patch_embed_projection(patch_tokens)
+        patch_tokens = patch_tokens.view(batch_size, sequence_length, patch_tokens.shape[-2], patch_tokens.shape[-1])
+        image_hw = torch.tensor(
+            [[int(image_h), int(image_w)]] * batch_size,
+            device=patch_tokens.device,
+            dtype=torch.long,
+        )
+        return patch_tokens, image_hw
+
+    def _decode_patch_tokens(
+        self,
+        panovggt_patch_tokens: torch.Tensor,
+        panovggt_patch_token_hw: torch.Tensor,
+        panovggt_model: nn.Module,
+    ) -> tuple[torch.Tensor, int, int, int]:
+        if panovggt_patch_tokens.ndim != 4:
+            raise AssertionError(
+                "Expected panovggt_patch_tokens shape [B, S, P, C], "
+                f"got {tuple(panovggt_patch_tokens.shape)}"
+            )
+        if panovggt_patch_token_hw is None:
+            raise AssertionError("panovggt_patch_token_hw is required with panovggt_patch_tokens")
+
+        batch_size, sequence_length, patch_count, context_dim = panovggt_patch_tokens.shape
+        if context_dim != panovggt_model.aggregator.dec_embed_dim:
+            raise AssertionError(
+                "PanoVGGT patch-token dim mismatch: "
+                f"expected {panovggt_model.aggregator.dec_embed_dim}, got {context_dim}"
+            )
+
+        patch_hw = panovggt_patch_token_hw.to(device="cpu", dtype=torch.long)
+        if patch_hw.ndim == 1:
+            patch_hw = patch_hw.unsqueeze(0)
+        if int(patch_hw.shape[0]) != batch_size or int(patch_hw.shape[1]) != 2:
+            raise AssertionError(
+                "Expected panovggt_patch_token_hw shape [B, 2], "
+                f"got {tuple(panovggt_patch_token_hw.shape)}"
+            )
+        if not torch.equal(patch_hw, patch_hw[:1].expand_as(patch_hw)):
+            raise AssertionError("Mixed PanoVGGT patch-token image sizes are not supported")
+        image_h, image_w = [int(value) for value in patch_hw[0].tolist()]
+
+        patch_size = int(getattr(panovggt_model, "patch_size", 0))
+        patch_h, patch_w = self._infer_patch_grid(
+            patch_count=patch_count,
+            image_height=image_h,
+            image_width=image_w,
+            patch_size=patch_size,
+        )
+        if patch_h * patch_w != patch_count:
+            raise AssertionError(
+                "PanoVGGT patch-token count does not match inferred image grid: "
+                f"patch_count={patch_count}, patch_h={patch_h}, patch_w={patch_w}"
+            )
+
+        flat_patch_tokens = panovggt_patch_tokens.reshape(
+            batch_size * sequence_length,
+            patch_count,
+            context_dim,
+        )
+        with torch.no_grad():
+            hidden_cat, _ = panovggt_model.aggregator._decode(
+                flat_patch_tokens,
+                batch_size,
+                sequence_length,
+                image_h,
+                image_w,
+            )
+        tokens = hidden_cat.view(batch_size, sequence_length, hidden_cat.shape[-2], hidden_cat.shape[-1])
+        return tokens, int(panovggt_model.aggregator.patch_start_idx), image_h, image_w
+
+    def forward(
+        self,
+        panovggt_pixel_values: torch.Tensor | None,
+        panovggt_model: nn.Module,
+        target_grid_thw: torch.Tensor,
+        target_lengths: list[int],
+        image_erp_geometry: torch.Tensor | None,
+        output_device: torch.device,
+        output_dtype: torch.dtype,
+        panovggt_patch_tokens: torch.Tensor | None = None,
+        panovggt_patch_token_hw: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        if (
+            not self.enabled
+            or panovggt_model is None
+        ):
+            return []
+        pixel_values_are_list = isinstance(panovggt_pixel_values, (list, tuple))
+        has_pixel_values = (
+            len(panovggt_pixel_values) > 0
+            if pixel_values_are_list
+            else panovggt_pixel_values is not None and panovggt_pixel_values.numel() > 0
+        )
+        has_patch_tokens = panovggt_patch_tokens is not None and panovggt_patch_tokens.numel() > 0
+        if (
+            not has_pixel_values
+            and not has_patch_tokens
+        ):
+            return []
+        if pixel_values_are_list and not has_patch_tokens:
+            if len(panovggt_pixel_values) != len(target_lengths):
+                raise AssertionError(
+                    "PanoVGGT variable-length batch size mismatch: "
+                    f"panovggt_items={len(panovggt_pixel_values)}, target_lengths={len(target_lengths)}"
+                )
+            grouped_items: dict[int, list[tuple[int, torch.Tensor]]] = {}
+            for sample_index, sample_pixel_values in enumerate(panovggt_pixel_values):
+                if sample_pixel_values.ndim == 4:
+                    sample_pixel_values = sample_pixel_values.unsqueeze(0)
+                if sample_pixel_values.ndim != 5 or int(sample_pixel_values.shape[0]) != 1:
+                    raise AssertionError(
+                        "Variable-length PanoVGGT items must have shape [1, S, 3, H, W] "
+                        f"or [S, 3, H, W], got {tuple(sample_pixel_values.shape)}"
+                    )
+                sequence_length = int(sample_pixel_values.shape[1])
+                grouped_items.setdefault(sequence_length, []).append((sample_index, sample_pixel_values))
+
+            deltas: list[torch.Tensor | None] = [None] * len(panovggt_pixel_values)
+            for grouped_sequence_length, items in grouped_items.items():
+                del grouped_sequence_length
+                group_indices = [sample_index for sample_index, _ in items]
+                group_pixel_values = torch.cat([value for _, value in items], dim=0)
+                group_grid_thw = target_grid_thw[group_indices]
+                group_lengths = [target_lengths[index] for index in group_indices]
+                group_geometry = (
+                    None
+                    if image_erp_geometry is None
+                    else image_erp_geometry[group_indices]
+                )
+                group_deltas = self.forward(
+                    group_pixel_values,
+                    panovggt_model=panovggt_model,
+                    target_grid_thw=group_grid_thw,
+                    target_lengths=group_lengths,
+                    image_erp_geometry=group_geometry,
+                    output_device=output_device,
+                    output_dtype=output_dtype,
+                )
+                for sample_index, delta in zip(group_indices, group_deltas):
+                    deltas[sample_index] = delta
+            if any(delta is None for delta in deltas):
+                raise AssertionError("PanoVGGT variable-length batch produced missing deltas")
+            return [delta for delta in deltas if delta is not None]
+
         encoder = panovggt_model
         encoder_param = next(encoder.parameters())
         param = next(self.mlp.parameters())
-        images = panovggt_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
-
-        with torch.no_grad():
-            aggregated = encoder.aggregator(images)
-        if isinstance(aggregated, (list, tuple)):
-            token_list = aggregated[0]
-            patch_start_idx = int(aggregated[1])
-            tokens = token_list[self.layer] if isinstance(token_list, list) else token_list
+        if panovggt_patch_tokens is not None and panovggt_patch_tokens.numel() > 0:
+            patch_tokens = panovggt_patch_tokens.to(device=encoder_param.device, dtype=encoder_param.dtype)
+            tokens, patch_start_idx, image_h, image_w = self._decode_patch_tokens(
+                patch_tokens,
+                panovggt_patch_token_hw,
+                encoder,
+            )
         else:
-            tokens = aggregated
-            patch_start_idx = 0
+            if panovggt_pixel_values.ndim == 4:
+                panovggt_pixel_values = panovggt_pixel_values.unsqueeze(1)
+            if panovggt_pixel_values.ndim != 5:
+                raise AssertionError(
+                    "Expected panovggt_pixel_values shape [B, S, 3, H, W] "
+                    f"or [B, 3, H, W], got {tuple(panovggt_pixel_values.shape)}"
+                )
+
+            images = panovggt_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
+            with torch.no_grad():
+                aggregated = encoder.aggregator(images)
+            if isinstance(aggregated, (list, tuple)):
+                token_list = aggregated[0]
+                patch_start_idx = int(aggregated[1])
+                tokens = token_list[self.layer] if isinstance(token_list, list) else token_list
+            else:
+                tokens = aggregated
+                patch_start_idx = 0
+            _, _, _, image_h, image_w = images.shape
 
         if tokens.ndim != 4:
             raise AssertionError(f"Expected PanoVGGT tokens [B, S, P, C], got {tuple(tokens.shape)}")
@@ -613,7 +775,6 @@ class PanoVGGTGeometryMLP(nn.Module):
                 f"PanoVGGT context dim mismatch: expected {self.context_dim}, got {tokens.shape[-1]}"
             )
 
-        _, _, _, image_h, image_w = images.shape
         patch_size = int(getattr(encoder, "patch_size", 0))
         patch_h, patch_w = self._infer_patch_grid(
             patch_count=int(tokens.shape[1]),
@@ -954,6 +1115,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
+        self._pano_runtime_panovggt_patch_tokens = None
+        self._pano_runtime_panovggt_patch_token_hw = None
         self._install_erp_position_hook()
         self._install_image_feature_hook()
         self._install_action_bearing_kv_hook()
@@ -1038,23 +1201,50 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 return vision_output
 
             panovggt_pixel_values = owner._pano_runtime_panovggt_pixel_values
+            panovggt_patch_tokens = owner._pano_runtime_panovggt_patch_tokens
+            panovggt_patch_token_hw = owner._pano_runtime_panovggt_patch_token_hw
             if owner._panovggt_enabled():
-                if panovggt_pixel_values is None or panovggt_pixel_values.numel() == 0:
-                    raise AssertionError("PanoVGGT is enabled but panovggt_pixel_values is missing")
-                if int(panovggt_pixel_values.shape[0]) != len(current_items):
+                panovggt_pixel_values_are_list = isinstance(panovggt_pixel_values, (list, tuple))
+                has_panovggt_pixels = (
+                    len(panovggt_pixel_values) > 0
+                    if panovggt_pixel_values_are_list
+                    else panovggt_pixel_values is not None and panovggt_pixel_values.numel() > 0
+                )
+                has_panovggt_patch_tokens = (
+                    panovggt_patch_tokens is not None and panovggt_patch_tokens.numel() > 0
+                )
+                if not has_panovggt_pixels and not has_panovggt_patch_tokens:
+                    raise AssertionError(
+                        "PanoVGGT is enabled but panovggt_pixel_values or panovggt_patch_tokens is missing"
+                    )
+                panovggt_batch_size = (
+                    int(panovggt_patch_tokens.shape[0])
+                    if has_panovggt_patch_tokens
+                    else len(panovggt_pixel_values)
+                    if panovggt_pixel_values_are_list
+                    else int(panovggt_pixel_values.shape[0])
+                )
+                if panovggt_batch_size != len(current_items):
                     raise AssertionError(
                         "PanoVGGT current-image batch size mismatch: "
-                        f"panovggt_batch={int(panovggt_pixel_values.shape[0])}, "
+                        f"panovggt_batch={panovggt_batch_size}, "
                         f"current_items={len(current_items)}"
-                    )
+                )
                 panovggt_items = list(current_items)
                 if panovggt_items:
+                    target_indices = [item[1] for item in panovggt_items]
+                    batch_index_device = (
+                        panovggt_patch_tokens.device
+                        if has_panovggt_patch_tokens
+                        else image_embeds[target_indices[0]].device
+                        if panovggt_pixel_values_are_list
+                        else panovggt_pixel_values.device
+                    )
                     batch_indices = torch.tensor(
                         [item[0] for item in panovggt_items],
-                        device=panovggt_pixel_values.device,
+                        device=batch_index_device,
                         dtype=torch.long,
                     )
-                    target_indices = [item[1] for item in panovggt_items]
                     target_grid_thw = image_grid_thw[target_indices].detach().to(device="cpu", dtype=torch.long)
                     target_lengths = [int(image_embeds[index].shape[0]) for index in target_indices]
                     geometry = owner._pano_runtime_image_geometry
@@ -1068,13 +1258,32 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                     if panovggt_model is None or owner.panovggt_mlp is None:
                         return vision_output
                     deltas = owner.panovggt_mlp(
-                        panovggt_pixel_values.index_select(0, batch_indices),
+                        (
+                            [panovggt_pixel_values[int(index)] for index in batch_indices.detach().cpu().tolist()]
+                            if panovggt_pixel_values_are_list
+                            else panovggt_pixel_values.index_select(0, batch_indices)
+                            if has_panovggt_pixels
+                            else None
+                        ),
                         panovggt_model=panovggt_model,
                         target_grid_thw=target_grid_thw,
                         target_lengths=target_lengths,
                         image_erp_geometry=geometry,
                         output_device=image_embeds[target_indices[0]].device,
                         output_dtype=image_embeds[target_indices[0]].dtype,
+                        panovggt_patch_tokens=(
+                            panovggt_patch_tokens.index_select(0, batch_indices)
+                            if has_panovggt_patch_tokens
+                            else None
+                        ),
+                        panovggt_patch_token_hw=(
+                            panovggt_patch_token_hw.index_select(
+                                0,
+                                batch_indices.to(device=panovggt_patch_token_hw.device),
+                            )
+                            if has_panovggt_patch_tokens and panovggt_patch_token_hw is not None
+                            else None
+                        ),
                     )
                     for image_index, delta in zip(target_indices, deltas):
                         if delta.shape != image_embeds[image_index].shape:
@@ -1212,12 +1421,16 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_current_index: torch.Tensor | None,
         image_erp_geometry: torch.Tensor | None,
         panovggt_pixel_values: torch.Tensor | None,
+        panovggt_patch_tokens: torch.Tensor | None,
+        panovggt_patch_token_hw: torch.Tensor | None,
     ) -> None:
         self._pano_runtime_grid_thw = image_grid_thw
         self._pano_runtime_image_num_images = image_num_images
         self._pano_runtime_image_current_index = image_current_index
         self._pano_runtime_image_geometry = image_erp_geometry
         self._pano_runtime_panovggt_pixel_values = panovggt_pixel_values
+        self._pano_runtime_panovggt_patch_tokens = panovggt_patch_tokens
+        self._pano_runtime_panovggt_patch_token_hw = panovggt_patch_token_hw
 
     def _clear_runtime_pano_context(self) -> None:
         self._pano_runtime_grid_thw = None
@@ -1225,6 +1438,29 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
+        self._pano_runtime_panovggt_patch_tokens = None
+        self._pano_runtime_panovggt_patch_token_hw = None
+
+    def encode_panovggt_patch_tokens(
+        self,
+        panovggt_pixel_values: torch.Tensor,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._panovggt_enabled() or self.panovggt_mlp is None:
+            raise AssertionError("PanoVGGT patch-token encoding requires panovggt_enabled=true")
+        if device is None or dtype is None:
+            param = next(self.parameters())
+            device = param.device if device is None else device
+            dtype = param.dtype if dtype is None else dtype
+        panovggt_model = self._ensure_panovggt_model(device=device, dtype=dtype)
+        if panovggt_model is None:
+            raise AssertionError("PanoVGGT model is not available for patch-token encoding")
+        return self.panovggt_mlp.encode_patch_tokens(
+            panovggt_pixel_values,
+            panovggt_model=panovggt_model,
+        )
 
     def _load_external_panovggt_weights(self) -> None:
         if not self._panovggt_enabled():
@@ -1626,6 +1862,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images: torch.LongTensor | None = None,
         image_current_index: torch.LongTensor | None = None,
         panovggt_pixel_values: torch.Tensor | None = None,
+        panovggt_patch_tokens: torch.Tensor | None = None,
+        panovggt_patch_token_hw: torch.Tensor | None = None,
         **kwargs,
     ):
         if self._erp_pos_enabled() or self._panovggt_enabled() or self._action_bearing_enabled():
@@ -1635,6 +1873,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 image_current_index=image_current_index,
                 image_erp_geometry=image_erp_geometry,
                 panovggt_pixel_values=panovggt_pixel_values,
+                panovggt_patch_tokens=panovggt_patch_tokens,
+                panovggt_patch_token_hw=panovggt_patch_token_hw,
             )
         action_bearing_context = self._build_action_bearing_context(input_ids, image_grid_thw)
         try:
@@ -1792,6 +2032,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images=None,
         image_current_index=None,
         panovggt_pixel_values=None,
+        panovggt_patch_tokens=None,
+        panovggt_patch_token_hw=None,
         **kwargs,
     ):
         model_inputs = super().prepare_inputs_for_generation(
@@ -1810,11 +2052,17 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             image_num_images=image_num_images,
             image_current_index=image_current_index,
             panovggt_pixel_values=panovggt_pixel_values,
+            panovggt_patch_tokens=panovggt_patch_tokens,
+            panovggt_patch_token_hw=panovggt_patch_token_hw,
             **kwargs,
         )
+        model_inputs["panovggt_patch_tokens"] = panovggt_patch_tokens
+        model_inputs["panovggt_patch_token_hw"] = panovggt_patch_token_hw
         if not is_first_iteration and use_cache:
             model_inputs["image_erp_geometry"] = None
             model_inputs["image_num_images"] = None
             model_inputs["image_current_index"] = None
             model_inputs["panovggt_pixel_values"] = None
+            model_inputs["panovggt_patch_tokens"] = None
+            model_inputs["panovggt_patch_token_hw"] = None
         return model_inputs

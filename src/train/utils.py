@@ -123,6 +123,12 @@ def _load_model_config(cfg):
         "panovggt_sampling_mode",
         "panovggt_force_fp32",
     )
+    memory_fields = (
+        "panovggt_spatial_memory",
+        "panovggt_spatial_memory_frames",
+        "panovggt_patch_token_cache",
+        "panovggt_patch_token_cache_size",
+    )
     action_bearing_fields = (
         "action_bearing_enabled",
         "action_bearing_key_alpha_value",
@@ -181,6 +187,8 @@ def _load_model_config(cfg):
         if not hasattr(config, field_name):
             setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
+    for field_name in memory_fields:
+        setattr(config, field_name, getattr(cfg.memory, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config
 
