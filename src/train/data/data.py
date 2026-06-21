@@ -237,18 +237,45 @@ def _select_with_forward_gap(
     return selected
 
 
+def _fill_with_recent_real_frames(
+    *,
+    selected: List[int],
+    current_frame_index: int,
+    target_count: int,
+) -> List[int]:
+    selected_set = set(selected)
+    for frame_index in range(current_frame_index - 1, -1, -1):
+        if len(selected) >= target_count:
+            break
+        if frame_index in selected_set:
+            continue
+        selected.append(frame_index)
+        selected_set.add(frame_index)
+    return selected
+
+
+def _pad_indices_at_front(indices: List[int], target_count: int) -> List[int]:
+    if not indices:
+        return []
+    target_count = max(1, int(target_count))
+    if len(indices) >= target_count:
+        return indices[-target_count:]
+    return [indices[0]] * (target_count - len(indices)) + indices
+
+
 def build_panovggt_spatial_memory_selection(
     *,
     num_frames: int,
     history_actions: Any,
     total_frames: int = DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
 ) -> List[int]:
-    """Select current-centric forward-spaced spatial memory for PanoVGGT.
+    """Select a fixed-size current-centric spatial window for PanoVGGT.
 
-    The window always includes the current frame and walks backward through
-    frames produced by forward actions, keeping one frame every two forward
-    moves. It returns fewer than ``total_frames`` when there are not enough
-    valid spatial keyframes; no turn-frame filling or duplicate padding is used.
+    The window always ends with the current frame. It first selects
+    forward-produced spatial keyframes backwards with a two-forward-step gap.
+    If that yields too few frames, it fills with the nearest real history
+    frames, including turn-produced frames. Only trajectories shorter than the
+    requested window are padded by repeating the earliest available frame.
     """
     num_frames = int(num_frames)
     total_frames = max(1, int(total_frames))
@@ -275,7 +302,13 @@ def build_panovggt_spatial_memory_selection(
         target_count=total_frames,
         min_forward_gap=PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP,
     )
-    return sorted(selected[-total_frames:])
+    if len(selected) < total_frames:
+        selected = _fill_with_recent_real_frames(
+            selected=selected,
+            current_frame_index=current_frame_index,
+            target_count=total_frames,
+        )
+    return _pad_indices_at_front(sorted(selected[-total_frames:]), total_frames)
 
 
 def select_panovggt_spatial_memory_paths(
