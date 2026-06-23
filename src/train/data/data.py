@@ -27,14 +27,19 @@ DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
 PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP = 2
 QWEN_MEMORY_POLICY_UNIFORM = "uniform"
 QWEN_MEMORY_POLICY_PROGRESS_EVENT = "progress_event"
+QWEN_MEMORY_POLICY_SLOWFAST = "slowfast"
 QWEN_MEMORY_POLICIES = {
     QWEN_MEMORY_POLICY_UNIFORM,
     QWEN_MEMORY_POLICY_PROGRESS_EVENT,
+    QWEN_MEMORY_POLICY_SLOWFAST,
 }
 DEFAULT_QWEN_MEMORY_POLICY = QWEN_MEMORY_POLICY_UNIFORM
 DEFAULT_QWEN_MEMORY_EVENT_BUDGET = 3
 DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD = 3
 DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION = True
+DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES = 3
+DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO = 0.25
+DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY = 30
 DEFAULT_QWEN_MEMORY_COMPRESSED_MIN_PIXELS = 32768
 DEFAULT_QWEN_MEMORY_COMPRESSED_MAX_PIXELS = 16777216
 VLN_IMAGE_ROLE_STANDARD = "standard"
@@ -417,6 +422,39 @@ def _select_with_current_anchor(
     return [candidates[position] for position in selected_positions]
 
 
+def _select_uniform_from_candidates(
+    candidate_indices: Sequence[int],
+    target_count: int,
+) -> List[int]:
+    target_count = max(0, int(target_count))
+    if target_count <= 0:
+        return []
+
+    candidates = sorted({int(frame_index) for frame_index in candidate_indices})
+    if len(candidates) <= target_count:
+        return candidates
+
+    selected_positions = [
+        (slot * len(candidates)) // target_count
+        for slot in range(target_count)
+    ]
+    return [candidates[position] for position in selected_positions]
+
+
+def _resolve_slowfast_fast_budget(
+    *,
+    max_memory_images: int,
+    target_fast_images: int,
+    fast_candidate_count: int,
+) -> int:
+    max_memory_images = max(0, int(max_memory_images))
+    target_fast_images = max(0, int(target_fast_images))
+    fast_candidate_count = max(0, int(fast_candidate_count))
+    if max_memory_images <= 0 or target_fast_images <= 0 or fast_candidate_count <= 0:
+        return 0
+    return min(max_memory_images, fast_candidate_count, target_fast_images)
+
+
 def _detect_large_turn_events(
     *,
     history_actions: Sequence[str],
@@ -550,6 +588,89 @@ def build_vln_progress_event_memory_selection(
     return selected_items
 
 
+def build_vln_slowfast_memory_selection(
+    current_step: int,
+    last_frame_index: int,
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+    fast_images: int = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES,
+    fast_region_ratio: float = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO,
+    min_history: int = DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY,
+) -> List[Tuple[int, str]]:
+    max_memory_images = max(0, int(max_memory_images))
+    memory_pool_window_frames = max(1, int(memory_pool_window_frames))
+    fast_images = max(0, int(fast_images))
+    fast_region_ratio = min(max(float(fast_region_ratio), 0.0), 1.0)
+    min_history = max(0, int(min_history))
+    current_frame_index = min(max(0, int(current_step)), int(last_frame_index))
+    if current_frame_index < 0:
+        return []
+
+    total_selected_images = max_memory_images + 1
+    pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
+    candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
+    if total_selected_images <= 0 or not candidate_frame_indices:
+        return [(current_frame_index, VLN_IMAGE_ROLE_CURRENT)]
+    if len(candidate_frame_indices) <= total_selected_images:
+        return list(zip(
+            candidate_frame_indices,
+            _selection_roles_for_indices(candidate_frame_indices),
+        ))
+
+    history_pool_indices = list(range(pool_start_frame, current_frame_index))
+    if len(history_pool_indices) < min_history:
+        selected_indices = build_vln_image_selection(
+            current_step=current_frame_index,
+            last_frame_index=current_frame_index,
+            max_memory_images=max_memory_images,
+            memory_pool_window_frames=memory_pool_window_frames,
+        )
+        return list(zip(selected_indices, _selection_roles_for_indices(selected_indices)))
+
+    fast_region_size = max(1, int(round(len(history_pool_indices) * fast_region_ratio)))
+    fast_region_size = min(fast_region_size, len(history_pool_indices))
+    fast_start_frame = current_frame_index - fast_region_size
+    slow_candidates = [
+        frame_index
+        for frame_index in history_pool_indices
+        if frame_index < fast_start_frame
+    ]
+    fast_candidates = [
+        frame_index
+        for frame_index in history_pool_indices
+        if frame_index >= fast_start_frame
+    ]
+
+    fast_budget = _resolve_slowfast_fast_budget(
+        max_memory_images=max_memory_images,
+        target_fast_images=fast_images,
+        fast_candidate_count=len(fast_candidates),
+    )
+    slow_budget = max_memory_images - fast_budget
+    selected_indices = (
+        _select_uniform_from_candidates(slow_candidates, slow_budget)
+        + _select_uniform_from_candidates(fast_candidates, fast_budget)
+    )
+
+    if len(selected_indices) < max_memory_images:
+        selected_set = set(selected_indices)
+        fallback_candidates = [
+            frame_index
+            for frame_index in history_pool_indices
+            if frame_index not in selected_set
+        ]
+        selected_indices.extend(
+            _select_uniform_from_candidates(
+                fallback_candidates,
+                max_memory_images - len(selected_indices),
+            )
+        )
+
+    selected_indices = sorted(set(selected_indices))[:max_memory_images]
+    selected_indices.append(current_frame_index)
+    return list(zip(selected_indices, _selection_roles_for_indices(selected_indices)))
+
+
 def build_vln_image_selection_with_roles(
     current_step: int,
     last_frame_index: int,
@@ -560,6 +681,9 @@ def build_vln_image_selection_with_roles(
     event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
     event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
     event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+    slowfast_fast_images: int = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES,
+    slowfast_fast_region_ratio: float = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO,
+    slowfast_min_history: int = DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY,
 ) -> List[Tuple[int, str]]:
     qwen_memory_policy = str(qwen_memory_policy or DEFAULT_QWEN_MEMORY_POLICY).strip().lower()
     if qwen_memory_policy not in QWEN_MEMORY_POLICIES:
@@ -577,6 +701,16 @@ def build_vln_image_selection_with_roles(
             event_budget=event_budget,
             event_compression=event_compression,
             event_turn_threshold=event_turn_threshold,
+        )
+    if qwen_memory_policy == QWEN_MEMORY_POLICY_SLOWFAST:
+        return build_vln_slowfast_memory_selection(
+            current_step=current_step,
+            last_frame_index=last_frame_index,
+            max_memory_images=max_memory_images,
+            memory_pool_window_frames=memory_pool_window_frames,
+            fast_images=slowfast_fast_images,
+            fast_region_ratio=slowfast_fast_region_ratio,
+            min_history=slowfast_min_history,
         )
 
     selected_indices = build_vln_image_selection(
@@ -614,6 +748,9 @@ def select_vln_image_paths_with_roles(
     event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
     event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
     event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+    slowfast_fast_images: int = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES,
+    slowfast_fast_region_ratio: float = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO,
+    slowfast_min_history: int = DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY,
 ) -> Tuple[List[str], List[str], List[int]]:
     if not image_paths:
         return [], [], []
@@ -628,6 +765,9 @@ def select_vln_image_paths_with_roles(
         event_budget=event_budget,
         event_compression=event_compression,
         event_turn_threshold=event_turn_threshold,
+        slowfast_fast_images=slowfast_fast_images,
+        slowfast_fast_region_ratio=slowfast_fast_region_ratio,
+        slowfast_min_history=slowfast_min_history,
     )
     selected_indices = [frame_index for frame_index, _ in selection]
     selected_roles = [role for _, role in selection]
@@ -816,6 +956,9 @@ def apply_vln_memory_policy(
     qwen_memory_event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
     qwen_memory_event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
     qwen_memory_event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+    qwen_memory_slowfast_fast_images: int = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES,
+    qwen_memory_slowfast_fast_region_ratio: float = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO,
+    qwen_memory_slowfast_min_history: int = DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY,
 ) -> Dict[str, Any]:
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
@@ -833,6 +976,9 @@ def apply_vln_memory_policy(
         event_budget=qwen_memory_event_budget,
         event_compression=qwen_memory_event_compression,
         event_turn_threshold=qwen_memory_event_turn_threshold,
+        slowfast_fast_images=qwen_memory_slowfast_fast_images,
+        slowfast_fast_region_ratio=qwen_memory_slowfast_fast_region_ratio,
+        slowfast_min_history=qwen_memory_slowfast_min_history,
     )
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example)
@@ -938,6 +1084,9 @@ class SupervisedDataset(Dataset):
         qwen_memory_event_budget: int = DEFAULT_QWEN_MEMORY_EVENT_BUDGET,
         qwen_memory_event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
         qwen_memory_event_turn_threshold: int = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
+        qwen_memory_slowfast_fast_images: int = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES,
+        qwen_memory_slowfast_fast_region_ratio: float = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO,
+        qwen_memory_slowfast_min_history: int = DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY,
     ):
         self.jsonl_path = jsonl_path
         self.processor = processor
@@ -960,6 +1109,12 @@ class SupervisedDataset(Dataset):
         self.qwen_memory_event_budget = max(0, int(qwen_memory_event_budget))
         self.qwen_memory_event_compression = bool(qwen_memory_event_compression)
         self.qwen_memory_event_turn_threshold = max(1, int(qwen_memory_event_turn_threshold))
+        self.qwen_memory_slowfast_fast_images = max(0, int(qwen_memory_slowfast_fast_images))
+        self.qwen_memory_slowfast_fast_region_ratio = min(
+            max(float(qwen_memory_slowfast_fast_region_ratio), 0.0),
+            1.0,
+        )
+        self.qwen_memory_slowfast_min_history = max(0, int(qwen_memory_slowfast_min_history))
         self.prompt_format = prompt_format
         self._fp = None
         self.episode_keys = None
@@ -1101,6 +1256,9 @@ class SupervisedDataset(Dataset):
             qwen_memory_event_budget=self.qwen_memory_event_budget,
             qwen_memory_event_compression=self.qwen_memory_event_compression,
             qwen_memory_event_turn_threshold=self.qwen_memory_event_turn_threshold,
+            qwen_memory_slowfast_fast_images=self.qwen_memory_slowfast_fast_images,
+            qwen_memory_slowfast_fast_region_ratio=self.qwen_memory_slowfast_fast_region_ratio,
+            qwen_memory_slowfast_min_history=self.qwen_memory_slowfast_min_history,
         )
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,

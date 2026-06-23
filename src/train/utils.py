@@ -134,6 +134,9 @@ def _load_model_config(cfg):
         "qwen_memory_event_budget",
         "qwen_memory_event_compression",
         "qwen_memory_event_turn_threshold",
+        "qwen_memory_slowfast_fast_images",
+        "qwen_memory_slowfast_fast_region_ratio",
+        "qwen_memory_slowfast_min_history",
     )
     action_bearing_fields = (
         "action_bearing_enabled",

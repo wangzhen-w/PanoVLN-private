@@ -231,6 +231,9 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"qwen_memory_event_budget: {_config_value(cfg.memory.qwen_memory_event_budget)}")
     rank0_print(RANK, f"qwen_memory_event_compression: {_config_value(cfg.memory.qwen_memory_event_compression)}")
     rank0_print(RANK, f"qwen_memory_event_turn_threshold: {_config_value(cfg.memory.qwen_memory_event_turn_threshold)}")
+    rank0_print(RANK, f"qwen_memory_slowfast_fast_images: {_config_value(cfg.memory.qwen_memory_slowfast_fast_images)}")
+    rank0_print(RANK, f"qwen_memory_slowfast_fast_region_ratio: {_config_value(cfg.memory.qwen_memory_slowfast_fast_region_ratio)}")
+    rank0_print(RANK, f"qwen_memory_slowfast_min_history: {_config_value(cfg.memory.qwen_memory_slowfast_min_history)}")
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_key_alpha_value: {_config_value(cfg.model.action_bearing_key_alpha_value)}")
     rank0_print(RANK, f"action_bearing_value_alpha_value: {_config_value(cfg.model.action_bearing_value_alpha_value)}")
@@ -348,6 +351,27 @@ def main():
             cfg.memory.qwen_memory_event_turn_threshold,
         )
     )
+    effective_qwen_memory_slowfast_fast_images = int(
+        getattr(
+            model_config,
+            "qwen_memory_slowfast_fast_images",
+            cfg.memory.qwen_memory_slowfast_fast_images,
+        )
+    )
+    effective_qwen_memory_slowfast_fast_region_ratio = float(
+        getattr(
+            model_config,
+            "qwen_memory_slowfast_fast_region_ratio",
+            cfg.memory.qwen_memory_slowfast_fast_region_ratio,
+        )
+    )
+    effective_qwen_memory_slowfast_min_history = int(
+        getattr(
+            model_config,
+            "qwen_memory_slowfast_min_history",
+            cfg.memory.qwen_memory_slowfast_min_history,
+        )
+    )
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
     )
@@ -369,6 +393,9 @@ def main():
         rank0_print(RANK, f"qwen_memory_event_budget: {_config_value(effective_qwen_memory_event_budget)}")
         rank0_print(RANK, f"qwen_memory_event_compression: {_config_value(effective_qwen_memory_event_compression)}")
         rank0_print(RANK, f"qwen_memory_event_turn_threshold: {_config_value(effective_qwen_memory_event_turn_threshold)}")
+        rank0_print(RANK, f"qwen_memory_slowfast_fast_images: {_config_value(effective_qwen_memory_slowfast_fast_images)}")
+        rank0_print(RANK, f"qwen_memory_slowfast_fast_region_ratio: {_config_value(effective_qwen_memory_slowfast_fast_region_ratio)}")
+        rank0_print(RANK, f"qwen_memory_slowfast_min_history: {_config_value(effective_qwen_memory_slowfast_min_history)}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(RANK, f"action_bearing_enabled: {_config_value(getattr(model_config, 'action_bearing_enabled', None))}")
@@ -394,6 +421,9 @@ def main():
         qwen_memory_event_budget=effective_qwen_memory_event_budget,
         qwen_memory_event_compression=effective_qwen_memory_event_compression,
         qwen_memory_event_turn_threshold=effective_qwen_memory_event_turn_threshold,
+        qwen_memory_slowfast_fast_images=effective_qwen_memory_slowfast_fast_images,
+        qwen_memory_slowfast_fast_region_ratio=effective_qwen_memory_slowfast_fast_region_ratio,
+        qwen_memory_slowfast_min_history=effective_qwen_memory_slowfast_min_history,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
         prompt_format=cfg.data.prompt_format,
@@ -420,6 +450,9 @@ def main():
             qwen_memory_event_budget=effective_qwen_memory_event_budget,
             qwen_memory_event_compression=effective_qwen_memory_event_compression,
             qwen_memory_event_turn_threshold=effective_qwen_memory_event_turn_threshold,
+            qwen_memory_slowfast_fast_images=effective_qwen_memory_slowfast_fast_images,
+            qwen_memory_slowfast_fast_region_ratio=effective_qwen_memory_slowfast_fast_region_ratio,
+            qwen_memory_slowfast_min_history=effective_qwen_memory_slowfast_min_history,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,

@@ -31,6 +31,9 @@ from src.train.data.data import (
     DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
     DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD,
     DEFAULT_QWEN_MEMORY_POLICY,
+    DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES,
+    DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO,
+    DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY,
     DEFAULT_QWEN_MEMORY_COMPRESSED_MAX_PIXELS,
     DEFAULT_QWEN_MEMORY_COMPRESSED_MIN_PIXELS,
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
@@ -169,6 +172,9 @@ def select_vln_eval_image_selection(
     event_budget: int,
     event_compression: bool,
     event_turn_threshold: int,
+    slowfast_fast_images: int,
+    slowfast_fast_region_ratio: float,
+    slowfast_min_history: int,
 ) -> List[tuple[int, str]]:
     last_frame_index = history_length - 1
     if last_frame_index < 0:
@@ -183,6 +189,9 @@ def select_vln_eval_image_selection(
         event_budget=event_budget,
         event_compression=event_compression,
         event_turn_threshold=event_turn_threshold,
+        slowfast_fast_images=slowfast_fast_images,
+        slowfast_fast_region_ratio=slowfast_fast_region_ratio,
+        slowfast_min_history=slowfast_min_history,
     )
 
 
@@ -474,6 +483,9 @@ class PanoVLN_Agent(Agent):
         self.qwen_memory_event_budget = DEFAULT_QWEN_MEMORY_EVENT_BUDGET
         self.qwen_memory_event_compression = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION
         self.qwen_memory_event_turn_threshold = DEFAULT_QWEN_MEMORY_EVENT_TURN_THRESHOLD
+        self.qwen_memory_slowfast_fast_images = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_IMAGES
+        self.qwen_memory_slowfast_fast_region_ratio = DEFAULT_QWEN_MEMORY_SLOWFAST_FAST_REGION_RATIO
+        self.qwen_memory_slowfast_min_history = DEFAULT_QWEN_MEMORY_SLOWFAST_MIN_HISTORY
         self.attn_implementation = attn_implementation
         os.makedirs(self.result_path, exist_ok=True)
         if self.save_topdown:
@@ -565,6 +577,39 @@ class PanoVLN_Agent(Agent):
                 )
             ),
         )
+        self.qwen_memory_slowfast_fast_images = max(
+            0,
+            int(
+                getattr(
+                    self.model.config,
+                    "qwen_memory_slowfast_fast_images",
+                    self.qwen_memory_slowfast_fast_images,
+                )
+            ),
+        )
+        self.qwen_memory_slowfast_fast_region_ratio = min(
+            max(
+                float(
+                    getattr(
+                        self.model.config,
+                        "qwen_memory_slowfast_fast_region_ratio",
+                        self.qwen_memory_slowfast_fast_region_ratio,
+                    )
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        self.qwen_memory_slowfast_min_history = max(
+            0,
+            int(
+                getattr(
+                    self.model.config,
+                    "qwen_memory_slowfast_min_history",
+                    self.qwen_memory_slowfast_min_history,
+                )
+            ),
+        )
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -611,7 +656,10 @@ class PanoVLN_Agent(Agent):
             f"qwen_memory_pool_window_frames={self.memory_pool_window_frames}, "
             f"qwen_memory_event_budget={self.qwen_memory_event_budget}, "
             f"qwen_memory_event_compression={self.qwen_memory_event_compression}, "
-            f"qwen_memory_event_turn_threshold={self.qwen_memory_event_turn_threshold})"
+            f"qwen_memory_event_turn_threshold={self.qwen_memory_event_turn_threshold}, "
+            f"qwen_memory_slowfast_fast_images={self.qwen_memory_slowfast_fast_images}, "
+            f"qwen_memory_slowfast_fast_region_ratio={self.qwen_memory_slowfast_fast_region_ratio}, "
+            f"qwen_memory_slowfast_min_history={self.qwen_memory_slowfast_min_history})"
         )
         
         self.rgb_history = []
@@ -705,6 +753,9 @@ class PanoVLN_Agent(Agent):
             event_budget=self.qwen_memory_event_budget,
             event_compression=self.qwen_memory_event_compression,
             event_turn_threshold=self.qwen_memory_event_turn_threshold,
+            slowfast_fast_images=self.qwen_memory_slowfast_fast_images,
+            slowfast_fast_region_ratio=self.qwen_memory_slowfast_fast_region_ratio,
+            slowfast_min_history=self.qwen_memory_slowfast_min_history,
         )
 
     def _prepare_selected_images(self, selected_selection):

@@ -45,6 +45,9 @@ class MemoryConfig:
     qwen_memory_event_budget: int = 3
     qwen_memory_event_compression: bool = True
     qwen_memory_event_turn_threshold: int = 3
+    qwen_memory_slowfast_fast_images: int = 3
+    qwen_memory_slowfast_fast_region_ratio: float = 0.25
+    qwen_memory_slowfast_min_history: int = 30
 
 
 @dataclass
@@ -155,9 +158,14 @@ def load_config(path: str) -> TrainConfig:
         "qwen_memory_event_budget",
         "qwen_memory_event_compression",
         "qwen_memory_event_turn_threshold",
+        "qwen_memory_slowfast_fast_images",
+        "qwen_memory_slowfast_fast_region_ratio",
+        "qwen_memory_slowfast_min_history",
     ):
         if legacy_field in model and legacy_field not in memory:
             memory[legacy_field] = model.pop(legacy_field)
+    if "qwen_memory_slowfast_fast_window_frames" in memory:
+        memory.pop("qwen_memory_slowfast_fast_window_frames")
 
     return TrainConfig(
         model=ModelConfig(**model),
