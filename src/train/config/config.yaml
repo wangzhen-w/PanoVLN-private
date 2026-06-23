@@ -33,7 +33,7 @@ memory:
   panovggt_spatial_memory_frames: 3
   panovggt_patch_token_cache: true
   panovggt_patch_token_cache_size: 100
-  qwen_memory_policy: "slowfast"  # choices: "uniform", "progress_event", "slowfast"
+  qwen_memory_policy: "place_exit"  # choices: "uniform", "progress_event", "slowfast", "place_exit"
   qwen_memory_max_images: 10
   qwen_memory_pool_window_frames: 100
   qwen_memory_event_budget: 3
@@ -42,7 +42,7 @@ memory:
 
   qwen_memory_slowfast_fast_images: 3
   qwen_memory_slowfast_fast_region_ratio: 0.25
-  qwen_memory_slowfast_min_history: 30
+  qwen_memory_slowfast_min_history: 36
 
 data:
   train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
@@ -58,7 +58,7 @@ data:
   trace_enable: false
 
 training:
-  output_dir: "/workspace/code/a_property/model/panovggt_0.05_grouping_current_qwen_slowfast_ratio25_f3_min30_8card"
+  output_dir: "/workspace/code/a_property/model/panovggt_0.05_grouping_current_qwen_place_exit_8card"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -89,7 +89,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovggt_0.05_grouping_current_qwen_slowfast_ratio25_f3_min30_8card_seed42"
+  run_name: "panovggt_0.05_grouping_current_qwen_place_exit_8card_seed42"
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
@@ -103,10 +103,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovggt_0.05_grouping_current_qwen_slowfast_ratio25_f3_min30_8card_seed42"
-  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "panovggt", "panovggt-alpha-0.05", "panovggt-grouping", "panovggt-current-only", "qwen-slowfast-memory", "qwen-slowfast-ratio", "qwen-memory-10", "qwen-fast-images-3", "qwen-fast-ratio-0.25", "qwen-slowfast-min-history-30", "ebs-event050-bg005-tail080", "history-actions-patched", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-mlp-lr-1e-5", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
+  name: "panovggt_0.05_grouping_current_qwen_place_exit_8card_seed42"
+  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "panovggt", "panovggt-alpha-0.05", "panovggt-grouping", "panovggt-current-only", "qwen-place-exit-memory", "qwen-memory-10", "ebs-event050-bg005-tail080", "history-actions-patched", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-mlp-lr-1e-5", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "PanoVGGT is enabled as current-frame geometric residual only: alpha=0.05, grouping sampling, spatial memory disabled, trace_enable=false. Qwen memory uses ratio slowfast policy as a stabilization baseline, not the paper innovation: recent 100-frame pool, 10 history images, short histories under 30 frames fall back to uniform, and longer histories split the pool into a recent 25 percent fast region plus an older slow region. The fast region receives 3 images and the slow region receives 7 images, preserving a mild recency bias while keeping action distribution close to uniform. Uses patched train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with history_actions, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, visual_lr=2e-6, visual_merger_lr=1e-5, panovggt_mlp_lr=1e-5, language_model_lr=2e-5."
+  notes: "PanoVGGT is enabled as current-frame geometric residual only: alpha=0.05, grouping sampling, spatial memory disabled, trace_enable=false. Qwen memory uses place_exit policy: recent 100-frame pool, up to 10 history images, short histories are kept unchanged, and longer histories are grouped by forward-defined places; each place contributes its last historical frame, so turn-in-place is represented by the exit/decision view before the next forward rather than multiple redundant frames. Uses patched train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with history_actions, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, visual_lr=2e-6, visual_merger_lr=1e-5, panovggt_mlp_lr=1e-5, language_model_lr=2e-5."
   id: null
   resume: "never"

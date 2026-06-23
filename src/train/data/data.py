@@ -28,10 +28,12 @@ PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP = 2
 QWEN_MEMORY_POLICY_UNIFORM = "uniform"
 QWEN_MEMORY_POLICY_PROGRESS_EVENT = "progress_event"
 QWEN_MEMORY_POLICY_SLOWFAST = "slowfast"
+QWEN_MEMORY_POLICY_PLACE_EXIT = "place_exit"
 QWEN_MEMORY_POLICIES = {
     QWEN_MEMORY_POLICY_UNIFORM,
     QWEN_MEMORY_POLICY_PROGRESS_EVENT,
     QWEN_MEMORY_POLICY_SLOWFAST,
+    QWEN_MEMORY_POLICY_PLACE_EXIT,
 }
 DEFAULT_QWEN_MEMORY_POLICY = QWEN_MEMORY_POLICY_UNIFORM
 DEFAULT_QWEN_MEMORY_EVENT_BUDGET = 3
@@ -671,6 +673,67 @@ def build_vln_slowfast_memory_selection(
     return list(zip(selected_indices, _selection_roles_for_indices(selected_indices)))
 
 
+def build_vln_place_exit_memory_selection(
+    current_step: int,
+    last_frame_index: int,
+    history_actions: Any,
+    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
+    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+) -> List[Tuple[int, str]]:
+    max_memory_images = max(0, int(max_memory_images))
+    memory_pool_window_frames = max(1, int(memory_pool_window_frames))
+    current_frame_index = min(max(0, int(current_step)), int(last_frame_index))
+    if current_frame_index < 0:
+        return []
+
+    total_selected_images = max_memory_images + 1
+    pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
+    candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
+    if total_selected_images <= 0 or not candidate_frame_indices:
+        return [(current_frame_index, VLN_IMAGE_ROLE_CURRENT)]
+
+    normalized_actions = normalize_history_actions(
+        history_actions,
+        feature_name="Qwen place-exit memory",
+    )
+    if len(normalized_actions) != int(last_frame_index):
+        raise ValueError(
+            "Qwen place-exit memory requires len(history_actions) == num_frames - 1, "
+            f"got len(history_actions)={len(normalized_actions)} for num_frames={int(last_frame_index) + 1}"
+        )
+
+    forward_counts = build_forward_counts_by_frame(
+        num_frames=current_frame_index + 1,
+        history_actions=normalized_actions,
+    )
+    place_representatives: List[int] = []
+    last_place_id: Optional[int] = None
+    last_frame_in_place: Optional[int] = None
+    for frame_index in range(pool_start_frame, current_frame_index):
+        place_id = forward_counts[frame_index]
+        if last_place_id is None:
+            last_place_id = place_id
+            last_frame_in_place = frame_index
+            continue
+        if place_id == last_place_id:
+            last_frame_in_place = frame_index
+            continue
+        if last_frame_in_place is not None:
+            place_representatives.append(last_frame_in_place)
+        last_place_id = place_id
+        last_frame_in_place = frame_index
+
+    if last_frame_in_place is not None:
+        place_representatives.append(last_frame_in_place)
+
+    selected_indices = _select_uniform_from_candidates(
+        place_representatives,
+        target_count=max_memory_images,
+    )
+    selected_indices.append(current_frame_index)
+    return list(zip(selected_indices, _selection_roles_for_indices(selected_indices)))
+
+
 def build_vln_image_selection_with_roles(
     current_step: int,
     last_frame_index: int,
@@ -711,6 +774,14 @@ def build_vln_image_selection_with_roles(
             fast_images=slowfast_fast_images,
             fast_region_ratio=slowfast_fast_region_ratio,
             min_history=slowfast_min_history,
+        )
+    if qwen_memory_policy == QWEN_MEMORY_POLICY_PLACE_EXIT:
+        return build_vln_place_exit_memory_selection(
+            current_step=current_step,
+            last_frame_index=last_frame_index,
+            history_actions=history_actions,
+            max_memory_images=max_memory_images,
+            memory_pool_window_frames=memory_pool_window_frames,
         )
 
     selected_indices = build_vln_image_selection(

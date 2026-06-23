@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/code/a_property/model/panovggt_0.05_grouping_current_qwen_slowfast_ratio25_f3_min30_8card"
+OUTPUT_DIR="/workspace/code/a_property/model/panovggt_0.05_grouping_current_qwen_place_exit_8card"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
