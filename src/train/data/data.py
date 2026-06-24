@@ -26,11 +26,13 @@ DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
 PANOVGGT_SPATIAL_MEMORY_MIN_FORWARD_GAP = 2
 QWEN_MEMORY_POLICY_UNIFORM = "uniform"
+QWEN_MEMORY_POLICY_UNIFORM_YAW_ALIGN = "uniform_yaw_align"
 QWEN_MEMORY_POLICY_PROGRESS_EVENT = "progress_event"
 QWEN_MEMORY_POLICY_SLOWFAST = "slowfast"
 QWEN_MEMORY_POLICY_PLACE_EXIT = "place_exit"
 QWEN_MEMORY_POLICIES = {
     QWEN_MEMORY_POLICY_UNIFORM,
+    QWEN_MEMORY_POLICY_UNIFORM_YAW_ALIGN,
     QWEN_MEMORY_POLICY_PROGRESS_EVENT,
     QWEN_MEMORY_POLICY_SLOWFAST,
     QWEN_MEMORY_POLICY_PLACE_EXIT,
@@ -179,6 +181,21 @@ def preprocess_vln_event_memory_image(
     )
 
 
+def roll_erp_image_yaw(image: Image.Image, yaw_offset_degrees: float) -> Image.Image:
+    width, height = image.size
+    if width <= 1:
+        return image.copy()
+
+    shift_pixels = int(round(float(yaw_offset_degrees) * width / 360.0)) % width
+    if shift_pixels == 0:
+        return image.copy()
+
+    rolled = Image.new(image.mode, (width, height))
+    rolled.paste(image.crop((width - shift_pixels, 0, width, height)), (0, 0))
+    rolled.paste(image.crop((0, 0, width - shift_pixels, height)), (shift_pixels, 0))
+    return rolled
+
+
 def preprocess_panovggt_current_image(image: Image.Image) -> torch.Tensor:
     processed_image = image.convert("RGB").resize(
         DEFAULT_PANOVGGT_IMAGE_SIZE,
@@ -249,6 +266,60 @@ def build_forward_counts_by_frame(
             count += 1
         forward_counts.append(count)
     return forward_counts
+
+
+def _yaw_delta_degrees_between_frames(
+    *,
+    start_frame_index: int,
+    end_frame_index: int,
+    history_actions: Sequence[str],
+    turn_degrees: float = 15.0,
+) -> float:
+    start_frame_index = max(0, int(start_frame_index))
+    end_frame_index = max(start_frame_index, int(end_frame_index))
+    delta_turns = 0
+    for action in history_actions[start_frame_index:end_frame_index]:
+        if action == "right":
+            delta_turns += 1
+        elif action == "left":
+            delta_turns -= 1
+    return float(delta_turns) * float(turn_degrees)
+
+
+def build_vln_yaw_alignment_offsets(
+    selected_indices: Sequence[int],
+    history_actions: Any,
+    turn_degrees: float = 15.0,
+) -> List[float]:
+    if not selected_indices:
+        return []
+
+    current_frame_index = int(selected_indices[-1])
+    normalized_actions = normalize_history_actions(
+        history_actions,
+        feature_name="Qwen yaw-aligned uniform memory",
+    )
+    if len(normalized_actions) < current_frame_index:
+        raise ValueError(
+            "Qwen yaw-aligned uniform memory requires enough history_actions to "
+            "align selected frames, got len(history_actions)="
+            f"{len(normalized_actions)} for current_frame_index={current_frame_index}"
+        )
+
+    offsets = []
+    for frame_index in selected_indices:
+        frame_index = int(frame_index)
+        if frame_index == current_frame_index:
+            offsets.append(0.0)
+            continue
+        yaw_delta_to_current = _yaw_delta_degrees_between_frames(
+            start_frame_index=frame_index,
+            end_frame_index=current_frame_index,
+            history_actions=normalized_actions,
+            turn_degrees=turn_degrees,
+        )
+        offsets.append(-yaw_delta_to_current)
+    return offsets
 
 
 def _select_with_forward_gap(
@@ -1038,10 +1109,13 @@ def apply_vln_memory_policy(
         if not isinstance(image_path, str) or not image_path:
             raise ValueError("VLN example field 'images' must contain non-empty string paths")
 
+    normalized_qwen_memory_policy = str(
+        qwen_memory_policy or DEFAULT_QWEN_MEMORY_POLICY
+    ).strip().lower()
     selected_images, selected_roles, selected_indices = select_vln_image_paths_with_roles(
         raw_images,
         history_actions=example.get("history_actions"),
-        qwen_memory_policy=qwen_memory_policy,
+        qwen_memory_policy=normalized_qwen_memory_policy,
         max_memory_images=qwen_memory_max_images,
         memory_pool_window_frames=qwen_memory_pool_window_frames,
         event_budget=qwen_memory_event_budget,
@@ -1058,6 +1132,11 @@ def apply_vln_memory_policy(
     normalized["images"] = selected_images
     normalized["image_memory_roles"] = selected_roles
     normalized["image_memory_indices"] = selected_indices
+    if normalized_qwen_memory_policy == QWEN_MEMORY_POLICY_UNIFORM_YAW_ALIGN:
+        normalized["image_yaw_offsets_degrees"] = build_vln_yaw_alignment_offsets(
+            selected_indices=selected_indices,
+            history_actions=example.get("history_actions"),
+        )
     normalized["messages"] = [
         {
             "role": "system",
@@ -1252,13 +1331,23 @@ class SupervisedDataset(Dataset):
         handle.seek(self.offsets[index])
         return json.loads(handle.readline())
 
-    def _load_images(self, image_paths: List[str], image_roles: Optional[List[str]] = None):
+    def _load_images(
+        self,
+        image_paths: List[str],
+        image_roles: Optional[List[str]] = None,
+        image_yaw_offsets_degrees: Optional[List[float]] = None,
+    ):
         images = []
         num_images = len(image_paths)
         if image_roles is not None and len(image_roles) != num_images:
             raise ValueError(
                 "Qwen image memory roles must match the number of selected image paths, "
                 f"got {len(image_roles)} roles for {num_images} images"
+            )
+        if image_yaw_offsets_degrees is not None and len(image_yaw_offsets_degrees) != num_images:
+            raise ValueError(
+                "Qwen image yaw offsets must match the number of selected image paths, "
+                f"got {len(image_yaw_offsets_degrees)} offsets for {num_images} images"
             )
         for image_index, image_path in enumerate(image_paths):
             with Image.open(image_path) as image:
@@ -1272,9 +1361,15 @@ class SupervisedDataset(Dataset):
                     )
                 )
                 is_current_observation = image_role == VLN_IMAGE_ROLE_CURRENT or image_index == num_images - 1
+                raw_image = image.convert("RGB")
+                if not is_current_observation and image_yaw_offsets_degrees is not None:
+                    raw_image = roll_erp_image_yaw(
+                        raw_image,
+                        image_yaw_offsets_degrees[image_index],
+                    )
                 if is_current_observation:
                     processed_image = preprocess_vln_current_image(
-                        image,
+                        raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
                     )
@@ -1283,13 +1378,13 @@ class SupervisedDataset(Dataset):
                     and self.qwen_memory_event_compression
                 ):
                     processed_image = preprocess_vln_event_memory_image(
-                        image,
+                        raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
                     )
                 else:
                     processed_image = preprocess_vln_memory_image(
-                        image,
+                        raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
                     )
@@ -1336,6 +1431,7 @@ class SupervisedDataset(Dataset):
             image_root=self.image_root,
         )
         vision_roles = example.get("image_memory_roles")
+        vision_yaw_offsets_degrees = example.get("image_yaw_offsets_degrees")
         prompt_and_target = build_prompt_and_target(
             messages,
             self.prompt_format,
@@ -1353,6 +1449,7 @@ class SupervisedDataset(Dataset):
                 images=self._load_images(
                     image_paths=vision_paths,
                     image_roles=vision_roles,
+                    image_yaw_offsets_degrees=vision_yaw_offsets_degrees,
                 ),
                 return_tensors="pt",
                 truncation=self.model_max_length is not None,

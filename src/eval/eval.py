@@ -39,6 +39,7 @@ from src.train.data.data import (
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
     DEFAULT_PANOVGGT_SPATIAL_MEMORY_FRAMES,
+    QWEN_MEMORY_POLICY_UNIFORM_YAW_ALIGN,
     VLN_IMAGE_ROLE_CURRENT,
     VLN_IMAGE_ROLE_EVENT,
     VLN_IMAGE_ROLE_STANDARD,
@@ -47,12 +48,14 @@ from src.train.data.data import (
     build_panovggt_spatial_memory_selection,
     build_vln_image_selection,
     build_vln_image_selection_with_roles,
+    build_vln_yaw_alignment_offsets,
     build_vln_user_content,
     preprocess_panovggt_current_image,
     preprocess_vln_current_image,
     preprocess_vln_event_memory_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
+    roll_erp_image_yaw,
 )
 from src.qwen_vl import Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.utils import build_prompt_and_target
@@ -199,10 +202,20 @@ def preprocess_vln_eval_images(
     rgb_history: Sequence[Image.Image],
     selected_indices: Sequence[int],
     selected_roles: Sequence[str] | None = None,
+    selected_yaw_offsets_degrees: Sequence[float] | None = None,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
     event_compression: bool = DEFAULT_QWEN_MEMORY_EVENT_COMPRESSION,
 ) -> List[Image.Image]:
+    if (
+        selected_yaw_offsets_degrees is not None
+        and len(selected_yaw_offsets_degrees) != len(selected_indices)
+    ):
+        raise ValueError(
+            "Qwen eval image yaw offsets must match selected indices, got "
+            f"{len(selected_yaw_offsets_degrees)} offsets for {len(selected_indices)} images"
+        )
+
     selected_images = []
     for image_position, frame_index in enumerate(selected_indices):
         raw_image = rgb_history[frame_index]
@@ -219,6 +232,11 @@ def preprocess_vln_eval_images(
             image_role == VLN_IMAGE_ROLE_CURRENT
             or image_position == len(selected_indices) - 1
         )
+        if not is_current_observation and selected_yaw_offsets_degrees is not None:
+            raw_image = roll_erp_image_yaw(
+                raw_image,
+                selected_yaw_offsets_degrees[image_position],
+            )
         if is_current_observation:
             selected_images.append(
                 preprocess_vln_current_image(
@@ -761,10 +779,17 @@ class PanoVLN_Agent(Agent):
     def _prepare_selected_images(self, selected_selection):
         selected_indices = [frame_index for frame_index, _ in selected_selection]
         selected_roles = [role for _, role in selected_selection]
+        selected_yaw_offsets_degrees = None
+        if self.qwen_memory_policy == QWEN_MEMORY_POLICY_UNIFORM_YAW_ALIGN:
+            selected_yaw_offsets_degrees = build_vln_yaw_alignment_offsets(
+                selected_indices=selected_indices,
+                history_actions=self.executed_action_history,
+            )
         return preprocess_vln_eval_images(
             rgb_history=self.rgb_history,
             selected_indices=selected_indices,
             selected_roles=selected_roles,
+            selected_yaw_offsets_degrees=selected_yaw_offsets_degrees,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
             event_compression=self.qwen_memory_event_compression,
