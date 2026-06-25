@@ -93,6 +93,15 @@ class PredictionResult:
     latency_s: float
 
 
+def _log_stage(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} [realworld.inference] {message}", flush=True)
+
+
+def _format_elapsed(start: float) -> str:
+    return f"{time.perf_counter() - start:.2f}s"
+
+
 def _load_image(image: Image.Image | bytes | bytearray | str | os.PathLike[str]) -> Image.Image:
     if isinstance(image, Image.Image):
         return image.convert("RGB")
@@ -213,27 +222,33 @@ class PanoVLNPredictor:
 
     def _resolve_panovggt_checkpoint(self, model_config: Any) -> None:
         if not bool(getattr(model_config, "panovggt_enabled", False)):
+            _log_stage("PanoVGGT disabled in model config")
             return
 
+        _log_stage("PanoVGGT enabled; checking saved panovggt.* weights in VLN checkpoint")
         has_saved_panovggt_weights = self._checkpoint_has_weight_prefix(
             self.config.model_path,
             "panovggt.",
         )
         if has_saved_panovggt_weights is True:
+            _log_stage("PanoVGGT weights found inside VLN checkpoint")
             return
 
         selected = self.config.panovggt_checkpoint_path
         if selected:
             if Path(str(selected)).exists():
                 setattr(model_config, "panovggt_checkpoint_path", str(selected))
+                _log_stage(f"Using explicit PanoVGGT checkpoint: {selected}")
                 return
             raise FileNotFoundError(f"Explicit PanoVGGT checkpoint does not exist: {selected}")
 
         config_checkpoint = getattr(model_config, "panovggt_checkpoint_path", None)
         if config_checkpoint and Path(str(config_checkpoint)).exists():
+            _log_stage(f"Using PanoVGGT checkpoint from config: {config_checkpoint}")
             return
 
         if has_saved_panovggt_weights is None:
+            _log_stage("Could not determine whether VLN checkpoint contains PanoVGGT weights")
             return
 
         raise FileNotFoundError(
@@ -243,44 +258,98 @@ class PanoVLNPredictor:
         )
 
     def _load(self) -> None:
+        load_start = time.perf_counter()
         model_path = self.config.model_path
-        self.processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=True,
+        _log_stage(
+            "model load started "
+            f"model_path={model_path} device={self.device} "
+            f"attn_implementation={self.config.attn_implementation}"
         )
-        if hasattr(self.processor, "tokenizer"):
-            self.tokenizer = self.processor.tokenizer
+        if torch.cuda.is_available():
+            try:
+                _log_stage(
+                    "CUDA available "
+                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+                    f"torch_device_count={torch.cuda.device_count()} "
+                    f"selected_device={torch.cuda.get_device_name(0)}"
+                )
+            except Exception as exc:
+                _log_stage(f"CUDA available, but device details failed: {type(exc).__name__}: {exc}")
         else:
-            raise ValueError("Real-world inference requires a processor tokenizer")
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            _log_stage("CUDA is not available; model will load on CPU")
 
-        model_config = Qwen3_5Config.from_pretrained(model_path)
-        self._resolve_panovggt_checkpoint(model_config)
+        try:
+            step_start = time.perf_counter()
+            _log_stage("loading processor/tokenizer")
+            self.processor = AutoProcessor.from_pretrained(
+                model_path,
+                use_fast=True,
+            )
+            if hasattr(self.processor, "tokenizer"):
+                self.tokenizer = self.processor.tokenizer
+            else:
+                raise ValueError("Real-world inference requires a processor tokenizer")
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            _log_stage(f"processor/tokenizer loaded in {_format_elapsed(step_start)}")
 
-        kwargs: dict[str, Any] = {
-            "config": model_config,
-            "torch_dtype": torch.bfloat16,
-        }
-        if self.config.attn_implementation:
-            kwargs["attn_implementation"] = self.config.attn_implementation
+            step_start = time.perf_counter()
+            _log_stage("loading model config")
+            model_config = Qwen3_5Config.from_pretrained(model_path)
+            _log_stage(
+                "model config loaded "
+                f"panovggt_enabled={bool(getattr(model_config, 'panovggt_enabled', False))} "
+                f"in {_format_elapsed(step_start)}"
+            )
 
-        self.model = Qwen3_5ForConditionalGenerationForPanoVLN.from_pretrained(
-            model_path,
-            **kwargs,
-        )
-        self.model.to(self.device)
-        self.model.eval()
-        self.model.config.use_cache = True
-        if hasattr(self.model.config, "text_config") and self.model.config.text_config is not None:
-            self.model.config.text_config.use_cache = True
-        sync_model_special_tokens(self.model, self.tokenizer)
-        self.erp_top_crop_degrees = float(
-            getattr(self.model.config, "erp_top_crop_degrees", DEFAULT_ERP_TOP_CROP_DEGREES)
-        )
-        self.erp_bottom_crop_degrees = float(
-            getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
-        )
+            step_start = time.perf_counter()
+            self._resolve_panovggt_checkpoint(model_config)
+            _log_stage(f"PanoVGGT checkpoint resolved in {_format_elapsed(step_start)}")
+
+            kwargs: dict[str, Any] = {
+                "config": model_config,
+                "torch_dtype": torch.bfloat16,
+            }
+            if self.config.attn_implementation:
+                kwargs["attn_implementation"] = self.config.attn_implementation
+
+            step_start = time.perf_counter()
+            _log_stage("loading model weights with from_pretrained")
+            self.model = Qwen3_5ForConditionalGenerationForPanoVLN.from_pretrained(
+                model_path,
+                **kwargs,
+            )
+            _log_stage(f"model weights loaded in {_format_elapsed(step_start)}")
+
+            step_start = time.perf_counter()
+            _log_stage(f"moving model to {self.device}")
+            self.model.to(self.device)
+            self.model.eval()
+            self.model.config.use_cache = True
+            if hasattr(self.model.config, "text_config") and self.model.config.text_config is not None:
+                self.model.config.text_config.use_cache = True
+            sync_model_special_tokens(self.model, self.tokenizer)
+            self.erp_top_crop_degrees = float(
+                getattr(self.model.config, "erp_top_crop_degrees", DEFAULT_ERP_TOP_CROP_DEGREES)
+            )
+            self.erp_bottom_crop_degrees = float(
+                getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
+            )
+            _log_stage(
+                "model moved and initialized "
+                f"device={self._input_device()} "
+                f"dtype={next(self.model.parameters()).dtype} "
+                f"crop_top={self.erp_top_crop_degrees} "
+                f"crop_bottom={self.erp_bottom_crop_degrees} "
+                f"in {_format_elapsed(step_start)}"
+            )
+            _log_stage(f"model load finished in {_format_elapsed(load_start)}")
+        except Exception as exc:
+            _log_stage(
+                "model load failed "
+                f"after {_format_elapsed(load_start)}: {type(exc).__name__}: {exc}"
+            )
+            raise
 
     def _input_device(self) -> torch.device:
         return next(self.model.parameters()).device
@@ -331,6 +400,7 @@ class PanoVLNPredictor:
         if not instruction:
             raise ValueError("instruction must be non-empty")
         start = time.perf_counter()
+        _log_stage(f"predict started raw_images={len(images)} instruction_chars={len(instruction)}")
 
         loaded_images = [_load_image(image) for image in images]
         selected_images = _select_images(
@@ -338,7 +408,13 @@ class PanoVLNPredictor:
             max_memory_images=self.config.max_memory_images,
             memory_pool_window_frames=self.config.memory_pool_window_frames,
         )
+        _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
         processed_images, panovggt_pixel_values = self._prepare_images(selected_images)
+        _log_stage(
+            "images preprocessed "
+            f"prompt_images={len(processed_images)} "
+            f"panovggt_enabled={panovggt_pixel_values is not None}"
+        )
 
         messages = [
             {
@@ -383,6 +459,11 @@ class PanoVLNPredictor:
         batch = self._move_batch_to_device(dict(encoded))
         input_len = int(batch["input_ids"].shape[-1])
         generation_kwargs = dict(DEFAULT_REALWORLD_GENERATION_KWARGS)
+        _log_stage(
+            "generation started "
+            f"input_tokens={input_len} "
+            f"max_new_tokens={generation_kwargs['max_new_tokens']}"
+        )
 
         with torch.inference_mode():
             generated = self.model.generate(
@@ -407,6 +488,11 @@ class PanoVLNPredictor:
         raw_text = raw_text.strip()
 
         actions = parse_action_sequence(raw_text)
+        _log_stage(
+            "predict finished "
+            f"latency_s={time.perf_counter() - start:.3f} "
+            f"actions={actions} raw_text={raw_text!r}"
+        )
         return PredictionResult(
             actions=actions,
             executable_actions=build_executable_action_queue(actions),

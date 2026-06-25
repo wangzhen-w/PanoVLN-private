@@ -8,8 +8,8 @@ echo "Switched to directory: $PROJECT_ROOT"
 
 HOST="0.0.0.0"
 PORT="8000"
-MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_grouping_8card"
-GPU_IDS="0"
+MODEL_PATH="/workspace/data/wz_data/model/ablation_new/panovggt_new/panovggt_0.05_grouping_8card"
+GPU_IDS="4"
 PANOVGGT_CHECKPOINT=""
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES="10"
@@ -51,4 +51,6 @@ if [[ -n "$PANOVGGT_CHECKPOINT" ]]; then
     CMD+=(--panovggt-checkpoint "$PANOVGGT_CHECKPOINT")
 fi
 
+echo "Starting server; model will load before the HTTP interface is available..."
+echo "CUDA_VISIBLE_DEVICES=$GPU_IDS ${CMD[*]}"
 CUDA_VISIBLE_DEVICES="$GPU_IDS" "${CMD[@]}"

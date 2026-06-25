@@ -22,6 +22,8 @@ bash realworld/run_server.sh
 All server parameters are assigned at the top of `run_server.sh`. Edit
 `ATTN_IMPLEMENTATION="eager"` there if the server environment does not have
 flash attention installed. Use `GPU_IDS="0"` to choose the visible GPU.
+The model loads before the HTTP server starts, and startup prints stage-by-stage
+loading logs.
 Crop degrees, dtype, device, and generation length are not script parameters:
 they follow the same defaults as Habitat eval, with crop read from the model
 `config.json`.

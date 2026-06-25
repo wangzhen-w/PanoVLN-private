@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import os
 import threading
+import time
 from dataclasses import asdict
 
 import uvicorn
@@ -11,6 +11,11 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .inference import DEFAULT_MODEL_PATH, InferenceConfig, PanoVLNPredictor
+
+
+def _log_stage(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} [realworld.server] {message}", flush=True)
 
 
 class PredictJsonRequest(BaseModel):
@@ -21,51 +26,23 @@ class PredictJsonRequest(BaseModel):
     )
 
 
-def _env(name: str, default: str | None = None) -> str | None:
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return default
-    return value
-
-
-def _env_int(name: str, default: int) -> int:
-    value = _env(name)
-    return default if value is None else int(value)
-
-
-def settings_from_env() -> InferenceConfig:
-    return InferenceConfig(
-        model_path=_env("VLN_MODEL_PATH", DEFAULT_MODEL_PATH),
-        panovggt_checkpoint_path=_env("VLN_PANOVGGT_CHECKPOINT"),
-        attn_implementation=_env("VLN_ATTN_IMPLEMENTATION", "flash_attention_2"),
-        max_memory_images=_env_int("VLN_MAX_MEMORY_IMAGES", 10),
-        memory_pool_window_frames=_env_int("VLN_MEMORY_POOL_WINDOW_FRAMES", 100),
-    )
-
-
-def create_app(settings: InferenceConfig | None = None) -> FastAPI:
+def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAPI:
     app = FastAPI(title="PanoVLN Real-world Server")
-    app.state.settings = settings or settings_from_env()
-    app.state.predictor = None
+    app.state.settings = settings
+    app.state.predictor = predictor
     app.state.model_lock = threading.RLock()
-
-    def predictor() -> PanoVLNPredictor:
-        with app.state.model_lock:
-            if app.state.predictor is None:
-                app.state.predictor = PanoVLNPredictor(app.state.settings)
-        return app.state.predictor
 
     @app.get("/health")
     def health():
         return {
             "ok": True,
-            "model_loaded": app.state.predictor is not None,
+            "model_loaded": True,
             "model_path": app.state.settings.model_path,
         }
 
     @app.get("/ready")
     def ready():
-        predictor()
+        _log_stage("/ready requested")
         return {
             "ok": True,
             "model_loaded": True,
@@ -74,6 +51,7 @@ def create_app(settings: InferenceConfig | None = None) -> FastAPI:
 
     @app.post("/predict")
     async def predict_multipart(request: Request):
+        request_start = time.perf_counter()
         form = await request.form()
         instruction = str(form.get("instruction", "")).strip()
         if not instruction:
@@ -88,12 +66,26 @@ def create_app(settings: InferenceConfig | None = None) -> FastAPI:
                 image_bytes.append(await upload.read())
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Upload at least one image file")
+        _log_stage(
+            "/predict received "
+            f"images={len(image_bytes)} instruction_chars={len(instruction)}"
+        )
 
         try:
             with app.state.model_lock:
-                result = predictor().predict(instruction=instruction, images=image_bytes)
+                result = app.state.predictor.predict(instruction=instruction, images=image_bytes)
         except Exception as exc:
+            _log_stage(
+                "/predict failed "
+                f"after {time.perf_counter() - request_start:.3f}s: {type(exc).__name__}: {exc}"
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        _log_stage(
+            "/predict finished "
+            f"total_s={time.perf_counter() - request_start:.3f} "
+            f"model_latency_s={result.latency_s:.3f} "
+            f"actions={result.actions}"
+        )
 
         return {
             "actions": result.actions,
@@ -105,17 +97,32 @@ def create_app(settings: InferenceConfig | None = None) -> FastAPI:
 
     @app.post("/predict_json")
     def predict_json(payload: PredictJsonRequest):
+        request_start = time.perf_counter()
         if not payload.instruction.strip():
             raise HTTPException(status_code=400, detail="instruction must be non-empty")
         if not payload.images:
             raise HTTPException(status_code=400, detail="images must be non-empty")
+        _log_stage(
+            "/predict_json received "
+            f"images={len(payload.images)} instruction_chars={len(payload.instruction.strip())}"
+        )
 
         try:
             image_bytes = [base64.b64decode(image) for image in payload.images]
             with app.state.model_lock:
-                result = predictor().predict(instruction=payload.instruction, images=image_bytes)
+                result = app.state.predictor.predict(instruction=payload.instruction, images=image_bytes)
         except Exception as exc:
+            _log_stage(
+                "/predict_json failed "
+                f"after {time.perf_counter() - request_start:.3f}s: {type(exc).__name__}: {exc}"
+            )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        _log_stage(
+            "/predict_json finished "
+            f"total_s={time.perf_counter() - request_start:.3f} "
+            f"model_latency_s={result.latency_s:.3f} "
+            f"actions={result.actions}"
+        )
 
         return {
             "actions": result.actions,
@@ -126,9 +133,6 @@ def create_app(settings: InferenceConfig | None = None) -> FastAPI:
         }
 
     return app
-
-
-app = create_app()
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,8 +157,12 @@ def main() -> None:
         max_memory_images=args.max_memory_images,
         memory_pool_window_frames=args.memory_pool_window_frames,
     )
-    server_app = create_app(settings)
-    print({"server_settings": asdict(settings)}, flush=True)
+    _log_stage(f"server_settings={asdict(settings)}")
+    start = time.perf_counter()
+    _log_stage("loading model before starting HTTP server")
+    predictor = PanoVLNPredictor(settings)
+    _log_stage(f"model ready in {time.perf_counter() - start:.2f}s; starting HTTP server")
+    server_app = create_app(settings, predictor)
     uvicorn.run(server_app, host=args.host, port=args.port, reload=args.reload)
 
 
