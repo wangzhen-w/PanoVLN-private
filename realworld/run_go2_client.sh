@@ -7,7 +7,7 @@ cd "$PROJECT_ROOT"
 echo "Switched to directory: $PROJECT_ROOT"
 
 # Server
-SERVER_BASE_URL="http://10.14.114.132:8000"
+SERVER_BASE_URL="http://10.14.114.132:23264"
 
 # Instruction
 INSTRUCTION=""

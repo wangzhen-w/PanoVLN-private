@@ -20,6 +20,7 @@ ACTION_WORDS = {"stop", "forward", "left", "right"}
 DEFAULT_REQUEST_TIMEOUT_S = 180.0
 DEFAULT_SDK_TIMEOUT_S = 10.0
 DEFAULT_JPEG_QUALITY = 90
+DEFAULT_CAMERA_FOURCC = "MJPG"
 DEFAULT_CAMERA_WARMUP_FRAMES = 10
 DEFAULT_CAPTURE_FLUSH_FRAMES = 2
 DEFAULT_MAX_MEMORY_IMAGES = 10
@@ -157,15 +158,21 @@ class OpenCVCamera:
         height: Optional[int],
         fps: Optional[int],
         jpeg_quality: int,
+        fourcc: Optional[str],
         warmup_frames: int,
     ):
         import cv2
 
         self.cv2 = cv2
         self.jpeg_quality = int(jpeg_quality)
-        self.cap = cv2.VideoCapture(source)
+        self.cap, self.backend_name = self._open_capture(cv2, source)
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera source: {source}")
+        if fourcc:
+            fourcc = str(fourcc).strip().upper()
+            if len(fourcc) != 4:
+                raise ValueError(f"camera fourcc must be four characters, got {fourcc!r}")
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if width:
@@ -179,11 +186,18 @@ class OpenCVCamera:
         actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         actual_fps = self.cap.get(cv2.CAP_PROP_FPS) or 0.0
+        actual_fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC) or 0)
+        actual_fourcc_text = actual_fourcc.to_bytes(4, "little", signed=False).decode(
+            "latin1",
+            errors="replace",
+        )
         print(
             {
+                "camera_backend": self.backend_name,
                 "camera_width": actual_width,
                 "camera_height": actual_height,
                 "camera_fps": actual_fps,
+                "camera_fourcc": actual_fourcc_text,
             },
             flush=True,
         )
@@ -196,6 +210,19 @@ class OpenCVCamera:
                     file=sys.stderr,
                     flush=True,
                 )
+
+    @staticmethod
+    def _is_v4l2_source(source: str | int) -> bool:
+        return isinstance(source, int) or str(source).startswith("/dev/video")
+
+    @classmethod
+    def _open_capture(cls, cv2, source: str | int):
+        if cls._is_v4l2_source(source) and hasattr(cv2, "CAP_V4L2"):
+            cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+            if cap.isOpened():
+                return cap, "v4l2"
+            cap.release()
+        return cv2.VideoCapture(source), "default"
 
     def read_jpeg(self, flush_frames: int = 0) -> bytes:
         for _ in range(max(0, int(flush_frames))):
@@ -266,9 +293,23 @@ class Sdk2SportBackend(RobotBackend):
     def stop(self) -> None:
         method = getattr(self.client, "StopMove", None)
         if method is not None:
-            method()
-        else:
-            self.move(0.0, 0.0, 0.0)
+            try:
+                result = method()
+                if result == 0:
+                    return
+                print(
+                    f"warning: StopMove returned {result}; falling back to Move(0,0,0)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"warning: StopMove failed with {type(exc).__name__}: {exc}; "
+                    "falling back to Move(0,0,0)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        self.move(0.0, 0.0, 0.0)
 
 
 class Ros2SportBackend(RobotBackend):
@@ -420,6 +461,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-height", type=int, default=None)
     parser.add_argument("--camera-fps", type=int, default=None)
     parser.add_argument("--jpeg-quality", type=int, default=DEFAULT_JPEG_QUALITY)
+    parser.add_argument("--camera-fourcc", default=DEFAULT_CAMERA_FOURCC)
     parser.add_argument("--camera-warmup-frames", type=int, default=DEFAULT_CAMERA_WARMUP_FRAMES)
     parser.add_argument("--capture-flush-frames", type=int, default=DEFAULT_CAPTURE_FLUSH_FRAMES)
     parser.add_argument("--history-limit", type=int, default=DEFAULT_HISTORY_LIMIT)
@@ -471,6 +513,7 @@ def main() -> None:
         height=args.frame_height,
         fps=args.camera_fps,
         jpeg_quality=args.jpeg_quality,
+        fourcc=args.camera_fourcc,
         warmup_frames=args.camera_warmup_frames,
     )
     backend = build_backend(args)
