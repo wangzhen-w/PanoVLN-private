@@ -45,7 +45,7 @@ def write_jsonl_item(handle, item: Dict) -> None:
 
 
 def build_dataset_config(input_root: str) -> Dict[str, Dict[str, str]]:
-    dataset_names = ["r2r", "rxr", "envdrop", "scalevln", "scalevln_150k"]
+    dataset_names = ["r2r", "rxr", "envdrop", "scalevln", "scalevln_150k", "dagger"]
     return {
         dataset_name: {
             "image_path": os.path.join(input_root, "images", dataset_name),

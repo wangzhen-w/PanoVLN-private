@@ -1,5 +1,5 @@
 model:
-  name_or_path: "/workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_grouping_8card"
+  name_or_path: "/workspace/code/a_property/model/Qwen3.5-4B"
   trust_remote_code: false
   torch_dtype: "bfloat16"
   attn_implementation: "flash_attention_2"
@@ -7,29 +7,29 @@ model:
   image_token: "<|image_pad|>"
   model_max_length: null
   trainable_modules:
-    visual: false
+    visual: true
     visual_merger: true
     language_model: true
     erp_position_mlp: false
     panovggt_mlp: false
-    action_bearing_kv: true
+    action_bearing_kv: false
   erp_pos_enabled: false
   erp_pos_alpha_value: 0.02
   erp_apply_to_current_only: true
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
-  panovggt_enabled: true
+  panovggt_enabled: false
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.05
   panovggt_sampling_mode: "grouping"    #"singlepoint"每个 Qwen token 采一个 PanoVGGT C token / "grouping"2x2 四个 C 拼接
   panovggt_force_fp32: false
-  action_bearing_enabled: true
+  action_bearing_enabled: false
   action_bearing_key_alpha_value: 0.01
   action_bearing_value_alpha_value: 0.03
   action_bearing_inject_layers: [3, 7, 11, 15, 19, 23, 27, 31]   #32  Both writing styles are compatible.
 
 data:
-  train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
+  train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_e1_ebs_event050_bg005_no_tail_dense.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -42,15 +42,15 @@ data:
   trace_enable: false
 
 training:
-  output_dir: "/workspace/code/a_property/model/panovggt_0.05_grouping_plus_actionkv_other1e-6_no_visual_8card"
+  output_dir: "/workspace/code/a_property/model/event050_bg005_no_tail_dense_8card"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4
-  learning_rate: 1.0e-6
-  language_model_lr: 1.0e-6
-  visual_lr: null
-  visual_merger_lr: 1.0e-6
+  learning_rate: 2.0e-5
+  language_model_lr: 2.0e-5
+  visual_lr: 5e-6
+  visual_merger_lr: 2.0e-5
   erp_position_mlp_lr: 1.0e-5
   panovggt_mlp_lr: null
   action_bearing_kv_lr: 1.0e-5

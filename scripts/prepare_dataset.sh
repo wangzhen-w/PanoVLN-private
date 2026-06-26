@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
+INPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 OUTPUT_PATH="/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
 DATASET_NAMES=(r2r rxr)
 MAX_EPISODES_PER_SUBSET=""
