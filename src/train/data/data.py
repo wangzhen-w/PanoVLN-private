@@ -5,7 +5,7 @@ import random
 from typing import Any, Dict, List, Optional
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
@@ -22,6 +22,23 @@ DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
+LONGITUDE_PROMPT_STEP_DEG = 15
+LONGITUDE_PROMPT_LABEL_STEP_DEG = 30
+LONGITUDE_PROMPT_LINE_WIDTH_PX = 1
+LONGITUDE_PROMPT_COLOR = (0, 255, 80)
+LONGITUDE_PROMPT_ALPHA = 56
+LONGITUDE_PROMPT_LABEL_BOTTOM_MARGIN_PX = 4
+LONGITUDE_PROMPT_LABEL_FONT_SIZE = 11
+LONGITUDE_PROMPT_LABEL_PADDING_PX = 1
+LONGITUDE_PROMPT_LABEL_SHADOW_ALPHA = 120
+LONGITUDE_PROMPT_FONT_PATHS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+)
+DEGREE_SYMBOL = "\N{DEGREE SIGN}"
 VLN_ACTION_WORDS = {"forward", "left", "right", "stop"}
 VLN_ACTION_ALIASES = {
     "move_forward": "forward",
@@ -67,6 +84,75 @@ def crop_erp_latitude(
         return image
 
     return image.crop((0, top_crop_pixels, width, crop_bottom))
+
+
+def resolve_longitude_prompt_font():
+    for font_path in LONGITUDE_PROMPT_FONT_PATHS:
+        if os.path.exists(font_path):
+            return ImageFont.truetype(font_path, LONGITUDE_PROMPT_LABEL_FONT_SIZE)
+    return ImageFont.load_default()
+
+
+def format_longitude_label(longitude_deg: int) -> str:
+    if longitude_deg > 0:
+        return f"+{longitude_deg}{DEGREE_SYMBOL}"
+    return f"{longitude_deg}{DEGREE_SYMBOL}"
+
+
+def add_longitude_visual_prompt(
+    image: Image.Image,
+    line_step_deg: int = LONGITUDE_PROMPT_STEP_DEG,
+) -> Image.Image:
+    width, height = image.size
+    if width <= 1 or height <= 0:
+        return image
+
+    base = image.convert("RGBA")
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = resolve_longitude_prompt_font()
+
+    longitude_deg = -180
+    while longitude_deg <= 180:
+        x_position = round((longitude_deg + 180) / 360 * (width - 1))
+        draw.line(
+            ((x_position, 0), (x_position, height - 1)),
+            fill=(*LONGITUDE_PROMPT_COLOR, LONGITUDE_PROMPT_ALPHA),
+            width=LONGITUDE_PROMPT_LINE_WIDTH_PX,
+        )
+        if longitude_deg % LONGITUDE_PROMPT_LABEL_STEP_DEG == 0 and abs(longitude_deg) != 180:
+            label_text = format_longitude_label(longitude_deg)
+            text_bbox = draw.textbbox((0, 0), label_text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            box_width = text_width + 2 * LONGITUDE_PROMPT_LABEL_PADDING_PX
+            box_height = text_height + 2 * LONGITUDE_PROMPT_LABEL_PADDING_PX
+            box_left = x_position - box_width // 2
+            box_left = min(max(0, box_left), max(0, width - box_width - 1))
+            box_top = height - box_height - LONGITUDE_PROMPT_LABEL_BOTTOM_MARGIN_PX
+            box_top = max(0, box_top)
+            box_right = box_left + box_width
+            box_bottom = box_top + box_height
+            draw.rounded_rectangle(
+                ((box_left, box_top), (box_right, box_bottom)),
+                radius=2,
+                fill=(0, 0, 0, LONGITUDE_PROMPT_LABEL_SHADOW_ALPHA),
+            )
+            text_x = box_left + (box_width - text_width) / 2 - text_bbox[0]
+            text_y = box_top + (box_height - text_height) / 2 - text_bbox[1]
+            draw.text(
+                (text_x, text_y),
+                label_text,
+                font=font,
+                fill=LONGITUDE_PROMPT_COLOR,
+            )
+        longitude_deg += line_step_deg
+
+    return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def visual_prompt_enabled_from_config(config: Any) -> bool:
+    return bool(getattr(config, "visual_prompt_enabled", False))
 
 
 def build_erp_image_geometry(
@@ -119,13 +205,17 @@ def preprocess_vln_current_image(
     image: Image.Image,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    add_visual_prompt: bool = False,
 ) -> Image.Image:
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
-    return crop_erp_latitude(
+    processed_image = crop_erp_latitude(
         processed_image,
         top_crop_degrees=top_crop_degrees,
         bottom_crop_degrees=bottom_crop_degrees,
     )
+    if add_visual_prompt:
+        processed_image = add_longitude_visual_prompt(processed_image)
+    return processed_image
 
 
 def preprocess_vln_memory_image(
@@ -201,7 +291,11 @@ def image_content() -> Dict[str, str]:
     return {"type": "image"}
 
 
-def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, str]]:
+def build_vln_user_content(
+    instruction: str,
+    num_images: int,
+    current_observation_visual_prompt_enabled: bool = False,
+) -> List[Dict[str, str]]:
     if num_images <= 0:
         raise ValueError("VLN samples require at least one image")
 
@@ -216,9 +310,19 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
         )
         content.extend(image_content() for _ in range(num_memory_images))
 
+    current_observation_text = "\nCurrent observation (panoramic view):"
+    if current_observation_visual_prompt_enabled:
+        current_observation_text = (
+            "\nCurrent observation (panoramic view with green longitude reference lines):"
+            "\nThe green longitude labels indicate relative bearing in the current "
+            "panorama: 0 degrees is straight ahead, negative angles are left, "
+            "and positive angles are right. Use them to estimate the direction "
+            "of the relevant target or path when deciding the next action."
+        )
+
     content.extend(
         [
-            text_content("\nCurrent observation (panoramic view):"),
+            text_content(current_observation_text),
             image_content(),
             text_content("\nDevise the next action sequence."),
         ]
@@ -367,7 +471,10 @@ def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
     return normalized_actions
 
 
-def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
+def apply_vln_memory_policy(
+    example: Dict[str, Any],
+    visual_prompt_enabled: bool = False,
+) -> Dict[str, Any]:
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
         raise ValueError("VLN example field 'images' must contain the full image history")
@@ -391,6 +498,7 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
             "content": build_vln_user_content(
                 instruction=instruction,
                 num_images=len(selected_images),
+                current_observation_visual_prompt_enabled=visual_prompt_enabled,
             ),
         },
         {
@@ -465,6 +573,7 @@ class SupervisedDataset(Dataset):
         model_max_length: Optional[int],
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+        visual_prompt_enabled: bool = False,
         panovggt_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
@@ -483,6 +592,7 @@ class SupervisedDataset(Dataset):
         self.model_max_length = model_max_length
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
+        self.visual_prompt_enabled = bool(visual_prompt_enabled)
         self.panovggt_enabled = bool(panovggt_enabled)
         self.prompt_format = prompt_format
         self._fp = None
@@ -561,6 +671,7 @@ class SupervisedDataset(Dataset):
                         image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                        add_visual_prompt=self.visual_prompt_enabled,
                     )
                 else:
                     processed_image = preprocess_vln_memory_image(
@@ -572,7 +683,10 @@ class SupervisedDataset(Dataset):
         return images
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        example = apply_vln_memory_policy(self._load_example(index))
+        example = apply_vln_memory_policy(
+            self._load_example(index),
+            visual_prompt_enabled=self.visual_prompt_enabled,
+        )
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
             image_root=self.image_root,

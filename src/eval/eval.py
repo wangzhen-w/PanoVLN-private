@@ -37,6 +37,7 @@ from src.train.data.data import (
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
+    visual_prompt_enabled_from_config,
 )
 from src.qwen_vl import Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.utils import build_prompt_and_target
@@ -99,10 +100,15 @@ def validate_eval_model_path(model_path: str) -> str:
     return resolved_model_path
 
 
-def build_eval_messages(instruction: str, images: List[Image.Image]):
+def build_eval_messages(
+    instruction: str,
+    images: List[Image.Image],
+    visual_prompt_enabled: bool = False,
+):
     user_content_template = build_vln_user_content(
         instruction=instruction,
         num_images=len(images),
+        current_observation_visual_prompt_enabled=visual_prompt_enabled,
     )
 
     messages = [
@@ -152,6 +158,7 @@ def preprocess_vln_eval_images(
     selected_indices: Sequence[int],
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    add_visual_prompt: bool = False,
 ) -> List[Image.Image]:
     selected_images = []
     for image_position, frame_index in enumerate(selected_indices):
@@ -163,6 +170,7 @@ def preprocess_vln_eval_images(
                     raw_image,
                     top_crop_degrees=top_crop_degrees,
                     bottom_crop_degrees=bottom_crop_degrees,
+                    add_visual_prompt=add_visual_prompt,
                 )
             )
         else:
@@ -442,6 +450,7 @@ class PanoVLN_Agent(Agent):
         self.erp_bottom_crop_degrees = float(
             getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
         )
+        self.visual_prompt_enabled = visual_prompt_enabled_from_config(self.model.config)
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -476,7 +485,11 @@ class PanoVLN_Agent(Agent):
                 setattr(text_config, "bos_token_id", self.bos_token_id)
             if getattr(self.model, "generation_config", None) is not None:
                 self.model.generation_config.bos_token_id = self.bos_token_id
-        print(f"Initialization Complete (attn_implementation={self.attn_implementation})")
+        print(
+            "Initialization Complete "
+            f"(attn_implementation={self.attn_implementation}, "
+            f"visual_prompt_enabled={self.visual_prompt_enabled})"
+        )
         
         self.rgb_history = []
         self.current_images = []
@@ -562,6 +575,7 @@ class PanoVLN_Agent(Agent):
             selected_indices=selected_indices,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
+            add_visual_prompt=self.visual_prompt_enabled,
         )
 
     def _predict_action_sequence_from_images(self, instruction, selected_images):
@@ -569,6 +583,7 @@ class PanoVLN_Agent(Agent):
         self.conversations = build_eval_messages(
             instruction=instruction,
             images=selected_images,
+            visual_prompt_enabled=self.visual_prompt_enabled,
         )
 
         navigation = self.predict_inference()

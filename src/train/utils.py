@@ -116,6 +116,9 @@ def _load_model_config(cfg):
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
     )
+    visual_prompt_fields = (
+        "visual_prompt_enabled",
+    )
     panovggt_fields = (
         "panovggt_enabled",
         "panovggt_checkpoint_path",
@@ -180,6 +183,8 @@ def _load_model_config(cfg):
     for field_name in erp_crop_fields:
         if not hasattr(config, field_name):
             setattr(config, field_name, getattr(cfg.model, field_name))
+    for field_name in visual_prompt_fields:
+        setattr(config, field_name, bool(getattr(cfg.model, field_name)))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     apply_module_fields_preserve_checkpoint(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config

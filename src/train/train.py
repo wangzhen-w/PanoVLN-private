@@ -8,7 +8,7 @@ import yaml
 
 from config.config import load_config
 from data.collator import MultiModalDataCollator
-from data.data import SupervisedDataset
+from data.data import SupervisedDataset, visual_prompt_enabled_from_config
 from data.sampler import TraceSampler
 from utils import (
     build_action_accuracy,
@@ -217,6 +217,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"erp_apply_to_current_only: {_config_value(cfg.model.erp_apply_to_current_only)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
+    rank0_print(RANK, f"visual_prompt_enabled: {_config_value(cfg.model.visual_prompt_enabled)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
@@ -294,6 +295,7 @@ def main():
     effective_erp_bottom_crop_degrees = float(
         getattr(model_config, "erp_bottom_crop_degrees", cfg.model.erp_bottom_crop_degrees)
     )
+    effective_visual_prompt_enabled = visual_prompt_enabled_from_config(model_config)
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
@@ -301,6 +303,7 @@ def main():
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
+        rank0_print(RANK, f"visual_prompt_enabled: {_config_value(effective_visual_prompt_enabled)}")
         rank0_print(RANK, f"action_bearing_enabled: {_config_value(getattr(model_config, 'action_bearing_enabled', None))}")
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
@@ -315,6 +318,7 @@ def main():
         model_max_length=cfg.model.model_max_length,
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
+        visual_prompt_enabled=effective_visual_prompt_enabled,
         panovggt_enabled=effective_panovggt_enabled,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle,
@@ -333,6 +337,7 @@ def main():
             model_max_length=cfg.model.model_max_length,
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
+            visual_prompt_enabled=effective_visual_prompt_enabled,
             panovggt_enabled=effective_panovggt_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,

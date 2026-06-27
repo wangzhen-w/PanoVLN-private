@@ -18,6 +18,7 @@ model:
   erp_apply_to_current_only: true
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
+  visual_prompt_enabled: true
   panovggt_enabled: false
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.05
@@ -25,11 +26,11 @@ model:
   panovggt_force_fp32: false
   action_bearing_enabled: false
   action_bearing_key_alpha_value: 0.01
-  action_bearing_value_alpha_value: 0.03
+  action_bearing_value_alpha_value: 0.04
   action_bearing_inject_layers: [3, 7, 11, 15, 19, 23, 27, 31]   #32  Both writing styles are compatible.
 
 data:
-  train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_e1_ebs_event050_bg005_no_tail_dense.jsonl"
+  train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -42,15 +43,15 @@ data:
   trace_enable: false
 
 training:
-  output_dir: "/workspace/code/a_property/model/event050_bg005_no_tail_dense_8card"
+  output_dir: "/workspace/code/a_property/model/ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-5
   language_model_lr: 2.0e-5
-  visual_lr: 5e-6
-  visual_merger_lr: 2.0e-5
+  visual_lr: 2e-6
+  visual_merger_lr: 1.0e-5
   erp_position_mlp_lr: 1.0e-5
   panovggt_mlp_lr: null
   action_bearing_kv_lr: 1.0e-5
@@ -73,7 +74,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "panovggt_0.05_grouping_plus_actionkv_lm1e-6_merger5e-7_no_panomlp_1600_8card_seed42"
+  run_name: "ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card_seed42"
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
@@ -87,10 +88,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "panovggt_0.05_grouping_plus_actionkv_lm1e-6_merger5e-7_no_panomlp_1600_8card_seed42"
-  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "panovggt", "panovggt-alpha-0.05", "panovggt-grouping", "panovggt-current-only", "action-bearing-kv", "action-kv-lr-1e-5", "language-lr-1e-6", "merger-lr-5e-7", "visual-frozen", "panovggt-mlp-frozen", "max-steps-1600", "ebs-event050-bg005-tail080", "history-actions-patched", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
+  name: "ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card_seed42"
+  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "ebs-event050-bg005-tail080", "visual-prompt", "green-longitude-lines", "language-lr-2e-5", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-disabled", "action-bearing-disabled", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
   mode: "offline"
   group: null
-  notes: "Second-stage action-bearing KV continuation from /workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_grouping_8card on main branch. PanoVGGT remains enabled as current-frame geometric residual only: alpha=0.05, grouping sampling, trace_enable=false. Trainable modules are language_model, visual_merger, and action_bearing_kv; visual backbone and panovggt_mlp are frozen. Uses patched train_r2r_rxr_ebs_event050_bg005_tail080.jsonl with history_actions, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, language_model_lr=1e-6, visual_merger_lr=5e-7, action_bearing_kv_lr=1e-5, max_steps=1600, max_grad_norm=0.5, load_best_model_at_end=true."
+  notes: "Visual prompt ablation run on main branch, trained from the base model /workspace/code/a_property/model/Qwen3.5-4B rather than continuing from an EBS checkpoint. Uses the higher-success ebs_visual2e-6_merger1e-5_050_005_080_8card hyperparameter/data setup: tail080 JSONL, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, learning_rate=2e-5, language_model_lr=2e-5, visual_lr=2e-6, visual_merger_lr=1e-5, num_train_epochs=1, warmup_steps=0.03, max_grad_norm=0.5. Visual prompt is enabled for the current panoramic observation; PanoVGGT and action bearing are disabled."
   id: null
   resume: "never"
