@@ -18,7 +18,6 @@ model:
   erp_apply_to_current_only: true
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
-  visual_prompt_enabled: true
   panovggt_enabled: false
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.05
@@ -43,7 +42,7 @@ data:
   trace_enable: false
 
 training:
-  output_dir: "/workspace/code/a_property/model/ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card"
+  output_dir: "/workspace/code/a_property/model/ebs_visual2e-6_merger1e-5_050_005_080_8card_repeat"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -74,7 +73,7 @@ training:
   bf16: true
   optim: "adamw_torch_fused"
   report_to: ["wandb"]
-  run_name: "ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card_seed42"
+  run_name: null
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
@@ -88,10 +87,10 @@ run:
 wandb:
   project: "PanoVLN"
   entity: null
-  name: "ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card_seed42"
-  tags: ["qwen3.5-4b", "r2r-rxr", "module-ablation", "seed-42", "ebs-event050-bg005-tail080", "visual-prompt", "green-longitude-lines", "language-lr-2e-5", "visual-lr-2e-6", "merger-lr-1e-5", "panovggt-disabled", "action-bearing-disabled", "4-action", "word-action", "stop-pad", "bf16", "flash", "8gpu", "global-batch-128"]
+  name: null
+  tags: null
   mode: "offline"
   group: null
-  notes: "Visual prompt ablation run on main branch, trained from the base model /workspace/code/a_property/model/Qwen3.5-4B rather than continuing from an EBS checkpoint. Uses the higher-success ebs_visual2e-6_merger1e-5_050_005_080_8card hyperparameter/data setup: tail080 JSONL, seed=42, per_device_train_batch_size=4, gradient_accumulation_steps=4, 8 GPUs, global batch 128, learning_rate=2e-5, language_model_lr=2e-5, visual_lr=2e-6, visual_merger_lr=1e-5, num_train_epochs=1, warmup_steps=0.03, max_grad_norm=0.5. Visual prompt is enabled for the current panoramic observation; PanoVGGT and action bearing are disabled."
+  notes: null
   id: null
   resume: "never"

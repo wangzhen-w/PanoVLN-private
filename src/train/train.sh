@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/code/a_property/model/ebs_vprompt_visual2e-6_merger1e-5_050_005_080_8card"
+OUTPUT_DIR="/workspace/code/a_property/model/ebs_visual2e-6_merger1e-5_050_005_080_8card_repeat"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"

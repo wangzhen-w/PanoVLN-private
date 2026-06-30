@@ -36,7 +36,6 @@ from src.train.data.data import (
     preprocess_vln_memory_image,
     resolve_current_image_index,
     text_content,
-    visual_prompt_enabled_from_config,
 )
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
@@ -175,7 +174,6 @@ class PanoVLNPredictor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.erp_top_crop_degrees = DEFAULT_ERP_TOP_CROP_DEGREES
         self.erp_bottom_crop_degrees = DEFAULT_ERP_BOTTOM_CROP_DEGREES
-        self.visual_prompt_enabled = False
         self._load()
 
     @staticmethod
@@ -337,14 +335,12 @@ class PanoVLNPredictor:
             self.erp_bottom_crop_degrees = float(
                 getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
             )
-            self.visual_prompt_enabled = visual_prompt_enabled_from_config(self.model.config)
             _log_stage(
                 "model moved and initialized "
                 f"device={self._input_device()} "
                 f"dtype={next(self.model.parameters()).dtype} "
                 f"crop_top={self.erp_top_crop_degrees} "
                 f"crop_bottom={self.erp_bottom_crop_degrees} "
-                f"visual_prompt_enabled={self.visual_prompt_enabled} "
                 f"in {_format_elapsed(step_start)}"
             )
             _log_stage(f"model load finished in {_format_elapsed(load_start)}")
@@ -368,7 +364,6 @@ class PanoVLNPredictor:
                         image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
-                        add_visual_prompt=self.visual_prompt_enabled,
                     )
                 )
             else:
@@ -431,7 +426,6 @@ class PanoVLNPredictor:
                 "content": build_vln_user_content(
                     instruction=instruction,
                     num_images=len(processed_images),
-                    current_observation_visual_prompt_enabled=self.visual_prompt_enabled,
                 ),
             },
         ]
