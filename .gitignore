@@ -211,3 +211,8 @@ wandb/
 **/wandb/
 *.wandb
 **/__pycache__/
+
+# Local ROS2 message workspace build artifacts
+realworld/ros2_unitree_api_ws/build/
+realworld/ros2_unitree_api_ws/install/
+realworld/ros2_unitree_api_ws/log/
