@@ -7,96 +7,16 @@ from types import MethodType
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    ALL_ATTENTION_FUNCTIONS,
-    Qwen3_5ForConditionalGeneration,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 
 PANOVGGT_AGGREGATOR_LAYER = -1
 PANOVGGT_CONTEXT_DIM = 2048
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
-ACTION_BEARING_HIDDEN_SIZE = 2048
-ACTION_BEARING_TURN_ANGLE_DEG = 15.0
-ACTION_BEARING_MAX_STEPS = 4
-ACTION_BEARING_SIGMA_STEPS = 0.6
-ACTION_BEARING_LEFT_TOKEN_ID = 2282
-ACTION_BEARING_RIGHT_TOKEN_ID = 1246
-ACTION_BEARING_FRONT_TOKEN_ID = 6735
-ACTION_BEARING_ONE_TOKEN_ID = 799
-ACTION_BEARING_TWO_TOKEN_ID = 1330
-ACTION_BEARING_THREE_TOKEN_ID = 2250
-ACTION_BEARING_FOUR_TOKEN_ID = 2943
-ACTION_BEARING_BIN_TOKEN_IDS = (
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_TWO_TOKEN_ID),
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_ONE_TOKEN_ID),
-    (ACTION_BEARING_FRONT_TOKEN_ID,),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_ONE_TOKEN_ID),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_TWO_TOKEN_ID),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
-)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
 VENDORED_PANOVGGT_CONFIG_PATH = VENDORED_PANOVGGT_DIR / "training" / "config" / "default.yaml"
-
-
-def _inverse_sigmoid(value: float) -> float:
-    value = min(max(float(value), 1e-6), 1.0 - 1e-6)
-    return math.log(value / (1.0 - value))
-
-
-def _bounded_raw_alpha(alpha_init: float, alpha_max: float) -> torch.Tensor:
-    alpha_max = float(alpha_max)
-    alpha_init = float(alpha_init)
-    if alpha_max <= 0.0:
-        return torch.tensor(0.0, dtype=torch.float32)
-    alpha_init = min(max(alpha_init, 1e-6), alpha_max * (1.0 - 1e-6))
-    return torch.tensor(_inverse_sigmoid(alpha_init / alpha_max), dtype=torch.float32)
-
-
-def _parse_action_bearing_inject_layers(raw_layers) -> tuple[int | None, tuple[int, ...] | None]:
-    if raw_layers is None:
-        return None, None
-    if isinstance(raw_layers, bool):
-        raise TypeError(f"action_bearing_inject_layers must be an int or a list of ints, got {raw_layers!r}")
-    if isinstance(raw_layers, int):
-        if raw_layers < 0:
-            raise ValueError(f"action_bearing_inject_layers must be >= 0, got {raw_layers}")
-        return int(raw_layers), None
-    if isinstance(raw_layers, str):
-        raw_layers = raw_layers.strip()
-        if raw_layers.lower() in {"", "all", "none", "null"}:
-            return None, None
-        raw_layers = raw_layers.strip("[]")
-        raw_layers = [part.strip() for part in raw_layers.split(",") if part.strip()]
-    if not isinstance(raw_layers, (list, tuple)):
-        raise TypeError(
-            "action_bearing_inject_layers must be an int legacy count or an explicit list of decoder layer indices, "
-            f"got {type(raw_layers).__name__}"
-        )
-
-    indices = []
-    for layer_idx in raw_layers:
-        if isinstance(layer_idx, str):
-            layer_idx = layer_idx.strip()
-            if not layer_idx:
-                continue
-            layer_idx = int(layer_idx)
-        if isinstance(layer_idx, bool) or not isinstance(layer_idx, int):
-            raise TypeError(
-                "action_bearing_inject_layers explicit mode expects integer decoder layer indices, "
-                f"got {layer_idx!r}"
-            )
-        if layer_idx < 0:
-            raise ValueError(f"action_bearing_inject_layers layer indices must be >= 0, got {layer_idx}")
-        indices.append(int(layer_idx))
-    return None, tuple(dict.fromkeys(indices))
 
 
 def ensure_erp_vision_config(vision_config) -> None:
@@ -270,6 +190,201 @@ class ERPPositionMLP(nn.Module):
                 device=tokens.device,
                 dtype=tokens.dtype,
             )
+
+        return torch.cat(token_splits, dim=0)
+
+
+def ensure_erp_spatial_config(vision_config) -> None:
+    defaults = {
+        "erp_spatial_enabled": False,
+        "erp_spatial_alpha_value": 0.01,
+    }
+    for field_name, default_value in defaults.items():
+        if not hasattr(vision_config, field_name):
+            setattr(vision_config, field_name, default_value)
+
+
+class ERPSphericalCrossAttentionAdapter(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        ensure_erp_spatial_config(config)
+
+        self.enabled = bool(getattr(config, "erp_spatial_enabled", False))
+        self.output_hidden_size = int(config.hidden_size)
+        self.num_heads = 8
+        self.alpha_init = float(getattr(config, "erp_spatial_alpha_value", 0.01))
+        self.apply_to_current_only = True
+        if self.enabled and self.alpha_init <= 0.0:
+            raise ValueError(
+                "erp_spatial_alpha_value must be positive when ERP SSCA is enabled; "
+                "use erp_spatial_enabled=false to disable the adapter."
+            )
+
+        if self.output_hidden_size % self.num_heads != 0:
+            raise ValueError(
+                "ERP SSCA requires vision hidden size to be divisible by num_heads: "
+                f"hidden_size={self.output_hidden_size}, num_heads={self.num_heads}"
+            )
+
+        self.q_norm = nn.LayerNorm(self.output_hidden_size)
+        self.kv_norm = nn.LayerNorm(self.output_hidden_size)
+        self.output_norm = nn.LayerNorm(self.output_hidden_size)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=self.output_hidden_size,
+            num_heads=self.num_heads,
+            dropout=0.0,
+            bias=False,
+            batch_first=True,
+        )
+        self.gate = nn.Parameter(torch.full((self.output_hidden_size,), self.alpha_init, dtype=torch.float32))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        self.q_norm.reset_parameters()
+        self.kv_norm.reset_parameters()
+        self.output_norm.reset_parameters()
+        nn.init.xavier_uniform_(self.attn.in_proj_weight)
+        nn.init.zeros_(self.attn.out_proj.weight)
+        self.gate.data.fill_(self.alpha_init)
+
+    def _build_base_angles(
+        self,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+        vertical_fov: float,
+        center_latitude: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not (0.0 < vertical_fov <= math.pi):
+            raise AssertionError(f"Invalid ERP vertical_fov={vertical_fov}")
+        if abs(center_latitude) > (0.5 * math.pi):
+            raise AssertionError(f"Invalid ERP center_latitude={center_latitude}")
+
+        ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
+        xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
+        pitch = (ys[:, None] / float(height) - 0.5) * vertical_fov + center_latitude
+        yaw = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
+        return pitch.expand(height, width), yaw.expand(height, width)
+
+    def _build_spherical_embeddings(
+        self,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        vertical_fov: float,
+        center_latitude: float,
+    ) -> torch.Tensor:
+        pitch, yaw = self._build_base_angles(
+            height=height,
+            width=width,
+            device=device,
+            vertical_fov=vertical_fov,
+            center_latitude=center_latitude,
+        )
+        angle_field = torch.stack([yaw, pitch], dim=-1).reshape(height * width, 2)
+        features_per_band = 4
+        num_bands = max(1, math.ceil(self.output_hidden_size / features_per_band))
+        max_freq = max(float(max(height, width)), 1.0)
+        scales = 2.0 ** torch.linspace(
+            0.0,
+            math.log2(max_freq),
+            steps=num_bands,
+            device=device,
+            dtype=torch.float32,
+        )
+        expanded = angle_field.unsqueeze(-1) * scales
+        embeddings = torch.stack([expanded.sin(), expanded.cos()], dim=-1).reshape(height * width, -1)
+        if embeddings.shape[-1] > self.output_hidden_size:
+            embeddings = embeddings[:, : self.output_hidden_size]
+        elif embeddings.shape[-1] < self.output_hidden_size:
+            embeddings = F.pad(embeddings, (0, self.output_hidden_size - embeddings.shape[-1]))
+        if num_frames > 1:
+            embeddings = embeddings.repeat(num_frames, 1)
+        return embeddings.to(dtype=dtype)
+
+    def apply_to_patch_tokens(
+        self,
+        patch_tokens: torch.Tensor,
+        grid_thw: torch.Tensor | None,
+        image_apply_mask: torch.Tensor | None = None,
+        image_erp_geometry: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.enabled or grid_thw is None or grid_thw.numel() == 0:
+            return patch_tokens
+        if grid_thw.ndim != 2 or int(grid_thw.shape[-1]) != 3:
+            raise AssertionError(f"Expected image_grid_thw shape [N, 3], got {tuple(grid_thw.shape)}")
+
+        param = self.gate
+        param_device = param.device
+        param_dtype = self.attn.in_proj_weight.dtype
+        default_center_latitude = 0.0
+
+        num_images = int(grid_thw.shape[0])
+        if image_apply_mask is not None:
+            if image_apply_mask.ndim != 1 or int(image_apply_mask.shape[0]) != num_images:
+                raise AssertionError(
+                    f"Expected image_apply_mask to have shape [{num_images}], got {tuple(image_apply_mask.shape)}"
+                )
+            apply_mask_list = image_apply_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
+        else:
+            apply_mask_list = [True] * num_images
+
+        geometry_list = None
+        if image_erp_geometry is not None:
+            if image_erp_geometry.ndim != 2 or tuple(image_erp_geometry.shape) != (num_images, 2):
+                raise AssertionError(
+                    "Expected image_erp_geometry to have shape "
+                    f"[{num_images}, 2], got {tuple(image_erp_geometry.shape)}"
+                )
+            geometry_list = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32).tolist()
+
+        split_sizes = [
+            int(size)
+            for size in grid_thw.prod(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+        ]
+        if sum(split_sizes) != int(patch_tokens.shape[0]):
+            raise AssertionError(
+                "Patch token count does not match image_grid_thw for ERP SSCA: "
+                f"tokens={int(patch_tokens.shape[0])}, expected={sum(split_sizes)}"
+            )
+
+        token_splits = list(patch_tokens.split(split_sizes, dim=0))
+        for image_index, (tokens, (num_frames, height, width)) in enumerate(zip(token_splits, grid_thw.tolist())):
+            if not apply_mask_list[image_index] or int(height) <= 0 or int(width) <= 0:
+                continue
+
+            if geometry_list is not None:
+                vertical_fov = float(geometry_list[image_index][0])
+                center_latitude = float(geometry_list[image_index][1])
+            else:
+                vertical_fov = ERPPositionMLP.infer_vertical_fov_radians(int(height), int(width))
+                center_latitude = default_center_latitude
+
+            query_tokens = tokens.to(device=param_device, dtype=param_dtype)
+            spherical_tokens = self._build_spherical_embeddings(
+                num_frames=int(num_frames),
+                height=int(height),
+                width=int(width),
+                device=param_device,
+                dtype=param_dtype,
+                vertical_fov=vertical_fov,
+                center_latitude=center_latitude,
+            )
+            if int(spherical_tokens.shape[0]) != int(query_tokens.shape[0]):
+                raise AssertionError(
+                    "ERP SSCA spherical token count mismatch: "
+                    f"spherical={int(spherical_tokens.shape[0])}, tokens={int(query_tokens.shape[0])}"
+                )
+            query = self.q_norm(query_tokens).unsqueeze(0)
+            key_value = self.kv_norm(spherical_tokens).unsqueeze(0)
+            delta, _ = self.attn(query, key_value, key_value, need_weights=False)
+            delta = self.output_norm(delta.squeeze(0))
+            delta = delta * self.gate.to(dtype=delta.dtype).tanh()
+            token_splits[image_index] = tokens + delta.to(device=tokens.device, dtype=tokens.dtype)
 
         return torch.cat(token_splits, dim=0)
 
@@ -680,210 +795,6 @@ class PanoVGGTGeometryMLP(nn.Module):
         return deltas
 
 
-def ensure_action_bearing_config(config) -> None:
-    vision_config = config.vision_config
-    text_config = getattr(config, "text_config", None)
-    text_hidden_size = getattr(text_config, "hidden_size", getattr(vision_config, "out_hidden_size", 3584))
-    output_dim = int(text_hidden_size)
-    defaults = {
-        "action_bearing_enabled": False,
-        "action_bearing_key_alpha_value": 0.02,
-        "action_bearing_value_alpha_value": 0.05,
-        "action_bearing_inject_layers": None,
-        "action_bearing_output_dim": output_dim,
-    }
-    for field_name, default_value in defaults.items():
-        if not hasattr(config, field_name):
-            setattr(config, field_name, default_value)
-
-
-class ActionBearingKV(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        ensure_action_bearing_config(config)
-
-        self.enabled = bool(getattr(config, "action_bearing_enabled", False))
-        self.output_dim = int(getattr(config, "action_bearing_output_dim", config.text_config.hidden_size))
-        self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
-        self.key_alpha_init = float(getattr(config, "action_bearing_key_alpha_value", 0.02))
-        self.value_alpha_init = float(getattr(config, "action_bearing_value_alpha_value", 0.05))
-        self.register_buffer(
-            "key_alpha_value",
-            torch.tensor(self.key_alpha_init, dtype=torch.float32),
-        )
-        self.register_buffer(
-            "value_alpha_value",
-            torch.tensor(self.value_alpha_init, dtype=torch.float32),
-        )
-        self.inject_layers, self.inject_layer_indices = _parse_action_bearing_inject_layers(
-            getattr(config, "action_bearing_inject_layers", 16)
-        )
-        self.inject_layer_index_set = frozenset(self.inject_layer_indices or ())
-        self.turn_angle_deg = ACTION_BEARING_TURN_ANGLE_DEG
-        self.max_steps = ACTION_BEARING_MAX_STEPS
-        self.sigma_steps = ACTION_BEARING_SIGMA_STEPS
-        self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
-
-        if self.turn_angle_deg <= 0.0:
-            raise ValueError(f"action_bearing_turn_angle_deg must be positive, got {self.turn_angle_deg}")
-        if self.max_steps < 1:
-            raise ValueError(f"action_bearing_max_steps must be >= 1, got {self.max_steps}")
-        if self.sigma_steps <= 0.0:
-            raise ValueError(f"action_bearing_sigma_steps must be positive, got {self.sigma_steps}")
-        self.num_bins = 2 * self.max_steps + 1
-        if len(ACTION_BEARING_BIN_TOKEN_IDS) != self.num_bins:
-            raise AssertionError(
-                "ACTION_BEARING_BIN_TOKEN_IDS must match the action-bearing bin count: "
-                f"token_id_rows={len(ACTION_BEARING_BIN_TOKEN_IDS)}, num_bins={self.num_bins}"
-            )
-        self.bin_embeddings = nn.Parameter(torch.empty(self.num_bins, self.output_dim))
-        self.input_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.adapter = nn.Sequential(
-            nn.Linear(self.output_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.output_dim),
-        )
-        self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.reset_parameters(float(getattr(config.vision_config, "initializer_range", 0.02)))
-
-    @property
-    def key_alpha(self) -> torch.Tensor:
-        return self.key_alpha_value
-
-    @property
-    def value_alpha(self) -> torch.Tensor:
-        return self.value_alpha_value
-
-    @property
-    def turn_angle_radians(self) -> float:
-        return math.radians(self.turn_angle_deg)
-
-    def should_inject_layer(self, layer_idx: int | None) -> bool:
-        if not self.enabled:
-            return False
-        if layer_idx is None:
-            return False
-        layer_idx = int(layer_idx)
-        if self.inject_layer_indices is not None:
-            return layer_idx in self.inject_layer_index_set
-        if self.inject_layers is None:
-            return True
-        if self.inject_layers <= 0:
-            return False
-        return layer_idx < self.inject_layers
-
-    def reset_parameters(self, init_std: float = 0.02) -> None:
-        nn.init.normal_(self.bin_embeddings, mean=0.0, std=float(init_std))
-        self.input_norm.reset_parameters()
-        self.output_norm.reset_parameters()
-        for module in self.adapter:
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=float(init_std))
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        self.key_alpha_value.fill_(self.key_alpha_init)
-        self.value_alpha_value.fill_(self.value_alpha_init)
-
-    def initialize_bin_embeddings_from_text(self, input_embeddings: nn.Embedding | None) -> bool:
-        if input_embeddings is None or not hasattr(input_embeddings, "weight"):
-            return False
-        weight = input_embeddings.weight
-        if int(weight.shape[1]) != self.output_dim:
-            return False
-
-        phrase_embeddings = []
-        vocab_size = int(weight.shape[0])
-        for phrase_token_ids in ACTION_BEARING_BIN_TOKEN_IDS:
-            token_ids = [self._valid_token_id(token_id, vocab_size) for token_id in phrase_token_ids]
-            if any(token_id is None for token_id in token_ids):
-                return False
-            ids = torch.tensor(token_ids, device=weight.device, dtype=torch.long)
-            phrase_embeddings.append(weight.index_select(0, ids).mean(dim=0))
-
-        with torch.no_grad():
-            init_values = torch.stack(phrase_embeddings, dim=0).to(
-                device=self.bin_embeddings.device,
-                dtype=self.bin_embeddings.dtype,
-            )
-            self.bin_embeddings.copy_(init_values)
-        return True
-
-    @staticmethod
-    def _valid_token_id(token_id, vocab_size: int) -> int | None:
-        if token_id is None:
-            return None
-        token_id = int(token_id)
-        if token_id < 0 or token_id >= vocab_size:
-            return None
-        return token_id
-
-    def compute_soft_action_scores(self, yaw: torch.Tensor) -> torch.Tensor:
-        steps = (yaw.to(dtype=torch.float32) / float(self.turn_angle_radians)).clamp(
-            min=-float(self.max_steps),
-            max=float(self.max_steps),
-        )
-        centers = torch.arange(
-            -self.max_steps,
-            self.max_steps + 1,
-            device=steps.device,
-            dtype=torch.float32,
-        )
-        distances = steps.unsqueeze(-1) - centers
-        scores = torch.exp(-0.5 * (distances / float(self.sigma_steps)).pow(2))
-        return scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-    def _build_grid_yaw(self, target_h: int, target_w: int, device: torch.device) -> torch.Tensor:
-        del target_h
-        xs = torch.arange(target_w, device=device, dtype=torch.float32) + 0.5
-        yaw = (xs / float(target_w) - 0.5) * (2.0 * math.pi)
-        return yaw.unsqueeze(0).expand(1, target_w)
-
-    def _target_grid_hw(self, grid_thw: list[int], target_len: int) -> tuple[int, int]:
-        num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
-        if num_frames != 1:
-            raise AssertionError(
-                "Action-Bearing KV expects a single current panorama per Qwen image, "
-                f"got image_grid_thw={grid_thw}"
-            )
-        if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
-            raise AssertionError(
-                "Action-Bearing KV target grid is not divisible by Qwen spatial_merge_size: "
-                f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}"
-            )
-        target_h = max(1, grid_h // self.spatial_merge_size)
-        target_w = max(1, grid_w // self.spatial_merge_size)
-        expected_len = target_h * target_w
-        if expected_len != int(target_len):
-            raise AssertionError(
-                "Cannot map Action-Bearing scores to the Qwen 2D visual-token grid: "
-                f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}, "
-                f"expected_len={expected_len}, qwen_len={int(target_len)}"
-            )
-        return target_h, target_w
-
-    def build_image_hidden(
-        self,
-        grid_thw: torch.Tensor,
-        target_len: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if not self.enabled or int(target_len) <= 0:
-            return torch.empty((0, self.output_dim), device=device, dtype=dtype)
-        target_h, target_w = self._target_grid_hw(
-            grid_thw.detach().to(device="cpu", dtype=torch.long).tolist(),
-            target_len=int(target_len),
-        )
-        yaw = self._build_grid_yaw(target_h, target_w, device=device).expand(target_h, target_w)
-        yaw_flat = yaw.reshape(-1)
-        scores = self.compute_soft_action_scores(yaw_flat).to(dtype=self.bin_embeddings.dtype)
-        action_prior = scores @ self.bin_embeddings
-        base = self.input_norm(action_prior)
-        hidden = self.output_norm(base + self.adapter(base))
-        return hidden.to(device=device, dtype=dtype)
-
-
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
     _keys_to_ignore_on_load_unexpected = list(
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
@@ -906,45 +817,37 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.mlp.2.bias",
         "panovggt_mlp.output_norm.weight",
     )
-    ACTION_BEARING_STATE_KEYS = (
-        "action_bearing_kv.key_alpha_value",
-        "action_bearing_kv.value_alpha_value",
-        "action_bearing_kv.bin_embeddings",
-        "action_bearing_kv.input_norm.weight",
-        "action_bearing_kv.adapter.0.weight",
-        "action_bearing_kv.adapter.0.bias",
-        "action_bearing_kv.adapter.2.weight",
-        "action_bearing_kv.adapter.2.bias",
-        "action_bearing_kv.output_norm.weight",
-    )
-
     def __init__(self, config):
         vision_config = getattr(config, "vision_config", None)
         erp_pos_enabled = bool(
             getattr(vision_config, "erp_pos_enabled", getattr(config, "erp_pos_enabled", False))
         )
+        erp_spatial_enabled = bool(
+            getattr(vision_config, "erp_spatial_enabled", getattr(config, "erp_spatial_enabled", False))
+        )
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
-        action_bearing_enabled = bool(getattr(config, "action_bearing_enabled", False))
         if erp_pos_enabled:
             ensure_erp_vision_config(config.vision_config)
+        if erp_spatial_enabled:
+            ensure_erp_spatial_config(config.vision_config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
-        if action_bearing_enabled:
-            ensure_action_bearing_config(config)
         super().__init__(config)
 
         if erp_pos_enabled:
             ensure_erp_vision_config(self.model.visual.config)
+        if erp_spatial_enabled:
+            ensure_erp_spatial_config(self.model.visual.config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
-        if action_bearing_enabled:
-            ensure_action_bearing_config(config)
 
         self.erp_position_mlp = ERPPositionMLP(self.model.visual.config) if erp_pos_enabled else None
+        self.erp_spatial_adapter = (
+            ERPSphericalCrossAttentionAdapter(self.model.visual.config)
+            if erp_spatial_enabled
+            else None
+        )
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
-        self.action_bearing_kv = ActionBearingKV(config) if action_bearing_enabled else None
-        if self.action_bearing_kv is not None:
-            self.action_bearing_kv.initialize_bin_embeddings_from_text(self.get_input_embeddings())
         self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
@@ -954,22 +857,32 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
-        self._install_erp_position_hook()
+        self._install_pano_patch_embed_hook()
         self._install_image_feature_hook()
-        self._install_action_bearing_kv_hook()
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
     def _erp_pos_enabled(self) -> bool:
         return self.erp_position_mlp is not None and bool(getattr(self.erp_position_mlp, "enabled", False))
 
+    def _erp_spatial_enabled(self) -> bool:
+        return self.erp_spatial_adapter is not None and bool(getattr(self.erp_spatial_adapter, "enabled", False))
+
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
 
-    def _action_bearing_enabled(self) -> bool:
-        return self.action_bearing_kv is not None and bool(getattr(self.action_bearing_kv, "enabled", False))
+    def _current_image_apply_mask(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        image_apply_mask = torch.zeros(
+            int(grid_thw.shape[0]),
+            device=grid_thw.device,
+            dtype=torch.bool,
+        )
+        for _, image_index in self._current_image_flat_indices(grid_thw):
+            if 0 <= image_index < int(image_apply_mask.shape[0]):
+                image_apply_mask[image_index] = True
+        return image_apply_mask
 
-    def _install_erp_position_hook(self) -> None:
-        if not self._erp_pos_enabled():
+    def _install_pano_patch_embed_hook(self) -> None:
+        if not self._erp_pos_enabled() and not self._erp_spatial_enabled():
             return
         visual = self.model.visual
         if hasattr(visual.patch_embed, "_pano_origin_forward"):
@@ -978,33 +891,37 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         visual.patch_embed._pano_origin_forward = visual.patch_embed.forward
         owner = self
 
-        def patch_embed_with_erp(this, hidden_states):
+        def patch_embed_with_pano_adapters(this, hidden_states):
             outputs = this._pano_origin_forward(hidden_states)
-            if not owner._erp_pos_enabled():
-                return outputs
             grid_thw = owner._pano_runtime_grid_thw
             if grid_thw is None or outputs.numel() == 0:
                 return outputs
 
-            image_apply_mask = None
-            if owner.erp_position_mlp.apply_to_current_only:
-                image_apply_mask = torch.zeros(
-                    int(grid_thw.shape[0]),
-                    device=grid_thw.device,
-                    dtype=torch.bool,
+            if owner._erp_pos_enabled():
+                image_apply_mask = None
+                if owner.erp_position_mlp.apply_to_current_only:
+                    image_apply_mask = owner._current_image_apply_mask(grid_thw)
+                outputs = owner.erp_position_mlp.apply_to_patch_tokens(
+                    patch_tokens=outputs,
+                    grid_thw=grid_thw,
+                    image_apply_mask=image_apply_mask,
+                    image_erp_geometry=owner._pano_runtime_image_geometry,
                 )
-                for _, image_index in owner._current_image_flat_indices(grid_thw):
-                    if 0 <= image_index < int(image_apply_mask.shape[0]):
-                        image_apply_mask[image_index] = True
 
-            return owner.erp_position_mlp.apply_to_patch_tokens(
-                patch_tokens=outputs,
-                grid_thw=grid_thw,
-                image_apply_mask=image_apply_mask,
-                image_erp_geometry=owner._pano_runtime_image_geometry,
-            )
+            if owner._erp_spatial_enabled():
+                image_apply_mask = None
+                if owner.erp_spatial_adapter.apply_to_current_only:
+                    image_apply_mask = owner._current_image_apply_mask(grid_thw)
+                outputs = owner.erp_spatial_adapter.apply_to_patch_tokens(
+                    patch_tokens=outputs,
+                    grid_thw=grid_thw,
+                    image_apply_mask=image_apply_mask,
+                    image_erp_geometry=owner._pano_runtime_image_geometry,
+                )
 
-        visual.patch_embed.forward = MethodType(patch_embed_with_erp, visual.patch_embed)
+            return outputs
+
+        visual.patch_embed.forward = MethodType(patch_embed_with_pano_adapters, visual.patch_embed)
 
     def _install_image_feature_hook(self) -> None:
         if not self._panovggt_enabled():
@@ -1088,121 +1005,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return vision_output
 
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
-
-    def _install_action_bearing_kv_hook(self) -> None:
-        if not self._action_bearing_enabled():
-            return
-        language_model = getattr(self.model, "language_model", None)
-        layers = getattr(language_model, "layers", None)
-        if layers is None:
-            return
-
-        action_bearing_kv = self.action_bearing_kv
-        full_attention_layers = tuple(
-            layer_index
-            for layer_index, decoder_layer in enumerate(layers)
-            if getattr(decoder_layer, "self_attn", None) is not None
-        )
-        self._pano_action_bearing_attention_layers = full_attention_layers
-        if action_bearing_kv is not None and action_bearing_kv.inject_layer_indices is not None:
-            full_attention_layer_set = set(full_attention_layers)
-            missing_layers = [
-                layer_index
-                for layer_index in action_bearing_kv.inject_layer_indices
-                if layer_index not in full_attention_layer_set
-            ]
-            if missing_layers:
-                raise ValueError(
-                    "Action-Bearing KV can only inject Qwen full-attention decoder layers. "
-                    f"Requested layers {missing_layers} are not full-attention layers; "
-                    f"available full-attention layers are {list(full_attention_layers)}."
-                )
-        self._pano_action_bearing_inject_layers = tuple(
-            layer_index
-            for layer_index in full_attention_layers
-            if action_bearing_kv is not None and action_bearing_kv.should_inject_layer(layer_index)
-        )
-
-        owner = self
-        for layer_index, decoder_layer in enumerate(layers):
-            attention = getattr(decoder_layer, "self_attn", None)
-            if attention is None or hasattr(attention, "_pano_origin_forward"):
-                continue
-
-            attention._pano_origin_forward = attention.forward
-            attention._pano_action_bearing_layer_index = layer_index
-
-            def forward_with_action_bearing_kv(
-                this,
-                hidden_states: torch.Tensor,
-                position_embeddings: tuple[torch.Tensor, torch.Tensor],
-                attention_mask: torch.Tensor | None,
-                past_key_values=None,
-                **kwargs,
-            ):
-                action_hidden = kwargs.pop("action_bearing_hidden", None)
-                action_batch_indices = kwargs.pop("action_bearing_batch_indices", None)
-                action_token_indices = kwargs.pop("action_bearing_token_indices", None)
-
-                input_shape = hidden_states.shape[:-1]
-                hidden_shape = (*input_shape, -1, this.head_dim)
-
-                query_states, gate = torch.chunk(
-                    this.q_proj(hidden_states).view(*input_shape, -1, this.head_dim * 2),
-                    2,
-                    dim=-1,
-                )
-                gate = gate.reshape(*input_shape, -1)
-
-                query_states = this.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-                key_states = this.k_norm(this.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-                value_states = this.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-                if (
-                    owner._action_bearing_enabled()
-                    and action_hidden is not None
-                    and action_batch_indices is not None
-                    and action_token_indices is not None
-                    and action_hidden.numel() > 0
-                ):
-                    key_states, value_states = owner._apply_action_bearing_to_kv(
-                        attention_module=this,
-                        key_states=key_states,
-                        value_states=value_states,
-                        action_hidden=action_hidden,
-                        action_batch_indices=action_batch_indices,
-                        action_token_indices=action_token_indices,
-                    )
-
-                cos, sin = position_embeddings
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-                if past_key_values is not None:
-                    key_states, value_states = past_key_values.update(key_states, value_states, this.layer_idx)
-
-                attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                    this.config._attn_implementation,
-                    eager_attention_forward,
-                )
-
-                attn_output, attn_weights = attention_interface(
-                    this,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    dropout=0.0 if not this.training else this.attention_dropout,
-                    scaling=this.scaling,
-                    **kwargs,
-                )
-
-                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-                attn_output = attn_output * torch.sigmoid(gate)
-
-                attn_output = this.o_proj(attn_output)
-                return attn_output, attn_weights
-
-            attention.forward = MethodType(forward_with_action_bearing_kv, attention)
 
     def _set_runtime_pano_context(
         self,
@@ -1396,218 +1198,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if bool(valid[batch_index].item())
         ]
 
-    def _build_action_bearing_context(
-        self,
-        input_ids: torch.Tensor | None,
-        image_grid_thw: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor]:
-        action_bearing_kv = self.action_bearing_kv
-        if (
-            not self._action_bearing_enabled()
-            or action_bearing_kv is None
-            or input_ids is None
-            or image_grid_thw is None
-            or image_grid_thw.numel() == 0
-        ):
-            return {}
-        if (
-            not bool((action_bearing_kv.key_alpha_value > 0.0).detach().cpu().item())
-            and not bool((action_bearing_kv.value_alpha_value > 0.0).detach().cpu().item())
-        ):
-            return {}
-
-        if input_ids.ndim != 2:
-            raise AssertionError(f"Expected input_ids shape [B, L], got {tuple(input_ids.shape)}")
-
-        input_device = input_ids.device
-        image_token_id = int(self.config.image_token_id)
-        if not bool(torch.any(input_ids == image_token_id).item()):
-            return {}
-
-        image_grid_thw = image_grid_thw.to(device=input_device, dtype=torch.long)
-        num_images = int(image_grid_thw.shape[0])
-        spatial_merge_size = int(self.model.visual.spatial_merge_size)
-        if bool(torch.any(torch.remainder(image_grid_thw[:, 1], spatial_merge_size) != 0).item()) or bool(
-            torch.any(torch.remainder(image_grid_thw[:, 2], spatial_merge_size) != 0).item()
-        ):
-            raise AssertionError(
-                "image_grid_thw is not divisible by Qwen spatial_merge_size for action-bearing KV: "
-                f"image_grid_thw={image_grid_thw.tolist()}, spatial_merge_size={spatial_merge_size}"
-            )
-        split_sizes = (image_grid_thw.prod(-1) // spatial_merge_size**2).to(
-            device=input_device,
-            dtype=torch.long,
-        )
-
-        image_num_images = self._pano_runtime_image_num_images
-        if image_num_images is None:
-            batch_size = int(input_ids.shape[0])
-            if batch_size == 1:
-                image_num_images = torch.tensor([num_images], device=input_device, dtype=torch.long)
-            elif num_images == batch_size:
-                image_num_images = torch.ones(batch_size, device=input_device, dtype=torch.long)
-            else:
-                raise AssertionError(
-                    "image_num_images is required for batched multi-image action-bearing KV inputs: "
-                    f"input_batch={batch_size}, image_grid_rows={num_images}"
-                )
-        else:
-            image_num_images = image_num_images.to(device=input_device, dtype=torch.long)
-        if int(image_num_images.shape[0]) != int(input_ids.shape[0]):
-            raise AssertionError(
-                "image_num_images batch size does not match input_ids for action-bearing KV: "
-                f"counts_batch={int(image_num_images.shape[0])}, input_batch={int(input_ids.shape[0])}"
-            )
-        if int(image_num_images.sum().item()) != num_images:
-            raise AssertionError(
-                "image_num_images does not sum to image_grid_thw rows: "
-                f"counts={image_num_images.tolist()}, grids={num_images}"
-            )
-
-        image_current_index = self._pano_runtime_image_current_index
-        if image_current_index is None:
-            image_current_index = image_num_images - 1
-        else:
-            image_current_index = image_current_index.to(device=input_device, dtype=torch.long)
-
-        offsets = image_num_images.cumsum(0) - image_num_images
-        action_hidden_chunks = []
-        batch_index_chunks = []
-        token_index_chunks = []
-        param = action_bearing_kv.bin_embeddings
-
-        for batch_index in range(int(input_ids.shape[0])):
-            image_count = int(image_num_images[batch_index].item())
-            if image_count <= 0:
-                continue
-            current_index = int(image_current_index[batch_index].item())
-            if current_index < 0 or current_index >= image_count:
-                raise AssertionError(
-                    "image_current_index is out of range for at least one sample: "
-                    f"indices={image_current_index.tolist()}, counts={image_num_images.tolist()}"
-                )
-
-            image_offset = int(offsets[batch_index].item())
-            sample_lengths = split_sizes[image_offset:image_offset + image_count]
-            image_token_positions = torch.nonzero(
-                input_ids[batch_index] == image_token_id,
-                as_tuple=False,
-            ).flatten()
-            expected_tokens = int(sample_lengths.sum().item())
-            if int(image_token_positions.numel()) != expected_tokens:
-                raise AssertionError(
-                    "Image placeholder count does not match image_grid_thw for action-bearing KV: "
-                    f"batch={batch_index}, placeholders={int(image_token_positions.numel())}, "
-                    f"expected={expected_tokens}"
-                )
-
-            current_token_start = int(sample_lengths[:current_index].sum().item())
-            current_token_len = int(sample_lengths[current_index].item())
-            current_positions = image_token_positions[current_token_start:current_token_start + current_token_len]
-            if int(current_positions.numel()) != current_token_len:
-                raise AssertionError(
-                    "Current image token span is shorter than expected for action-bearing KV: "
-                    f"batch={batch_index}, span={int(current_positions.numel())}, expected={current_token_len}"
-                )
-            if current_token_len > 1 and not bool(torch.all(current_positions[1:] == current_positions[:-1] + 1).item()):
-                raise AssertionError(
-                    "Current image token span is not contiguous for action-bearing KV: "
-                    f"batch={batch_index}, token_positions={current_positions.tolist()}"
-                )
-
-            flat_image_index = image_offset + current_index
-            action_hidden = action_bearing_kv.build_image_hidden(
-                image_grid_thw[flat_image_index],
-                target_len=current_token_len,
-                device=param.device,
-                dtype=param.dtype,
-            )
-            action_hidden_chunks.append(action_hidden)
-            batch_index_chunks.append(
-                torch.full(
-                    (current_token_len,),
-                    batch_index,
-                    device=input_device,
-                    dtype=torch.long,
-                )
-            )
-            token_index_chunks.append(current_positions.to(device=input_device, dtype=torch.long))
-
-        if not action_hidden_chunks:
-            return {}
-
-        return {
-            "action_bearing_hidden": torch.cat(action_hidden_chunks, dim=0),
-            "action_bearing_batch_indices": torch.cat(batch_index_chunks, dim=0),
-            "action_bearing_token_indices": torch.cat(token_index_chunks, dim=0),
-        }
-
-    def _apply_action_bearing_to_kv(
-        self,
-        *,
-        attention_module: nn.Module,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        action_hidden: torch.Tensor,
-        action_batch_indices: torch.Tensor,
-        action_token_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        action_bearing_kv = self.action_bearing_kv
-        if not self._action_bearing_enabled() or action_bearing_kv is None:
-            return key_states, value_states
-
-        seq_len = int(key_states.shape[2])
-        action_batch_indices = action_batch_indices.to(device=key_states.device, dtype=torch.long)
-        action_token_indices = action_token_indices.to(device=key_states.device, dtype=torch.long)
-        valid = (
-            (action_batch_indices >= 0)
-            & (action_batch_indices < int(key_states.shape[0]))
-            & (action_token_indices >= 0)
-            & (action_token_indices < seq_len)
-        )
-        if not bool(torch.all(valid).item()):
-            action_batch_indices = action_batch_indices[valid]
-            action_token_indices = action_token_indices[valid]
-            action_hidden = action_hidden[valid.to(device=action_hidden.device)]
-        if int(action_token_indices.numel()) == 0:
-            return key_states, value_states
-
-        layer_idx = getattr(
-            attention_module,
-            "_pano_action_bearing_layer_index",
-            getattr(attention_module, "layer_idx", None),
-        )
-        if not action_bearing_kv.should_inject_layer(layer_idx):
-            return key_states, value_states
-
-        use_key_delta = bool((action_bearing_kv.key_alpha_value > 0.0).detach().cpu().item())
-        use_value_delta = bool((action_bearing_kv.value_alpha_value > 0.0).detach().cpu().item())
-        if not use_key_delta and not use_value_delta:
-            return key_states, value_states
-
-        action_hidden = action_hidden.to(device=key_states.device, dtype=key_states.dtype)
-        selected_count = int(action_hidden.shape[0])
-
-        if use_key_delta:
-            key_delta = attention_module.k_norm(
-                attention_module.k_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
-            )
-            key_delta = key_delta.to(dtype=key_states.dtype)
-            full_key_delta = torch.zeros_like(key_states)
-            full_key_delta[action_batch_indices, :, action_token_indices, :] = key_delta
-            key_alpha = action_bearing_kv.key_alpha.to(device=key_states.device, dtype=key_states.dtype)
-            key_states = key_states + key_alpha * full_key_delta
-
-        if use_value_delta:
-            value_delta = attention_module.v_proj(action_hidden).view(selected_count, -1, attention_module.head_dim)
-            value_delta = value_delta.to(dtype=value_states.dtype)
-            full_value_delta = torch.zeros_like(value_states)
-            full_value_delta[action_batch_indices, :, action_token_indices, :] = value_delta
-            value_alpha = action_bearing_kv.value_alpha.to(device=value_states.device, dtype=value_states.dtype)
-            value_states = value_states + value_alpha * full_value_delta
-
-        return key_states, value_states
-
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1628,7 +1218,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
-        if self._erp_pos_enabled() or self._panovggt_enabled() or self._action_bearing_enabled():
+        if self._erp_pos_enabled() or self._erp_spatial_enabled() or self._panovggt_enabled():
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
@@ -1636,7 +1226,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 image_erp_geometry=image_erp_geometry,
                 panovggt_pixel_values=panovggt_pixel_values,
             )
-        action_bearing_context = self._build_action_bearing_context(input_ids, image_grid_thw)
         try:
             return super().forward(
                 input_ids=input_ids,
@@ -1651,7 +1240,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 video_grid_thw=video_grid_thw,
                 mm_token_type_ids=mm_token_type_ids,
                 logits_to_keep=logits_to_keep,
-                **action_bearing_context,
                 **kwargs,
             )
         finally:
@@ -1668,6 +1256,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             and any(key.startswith("erp_position_mlp.") for key in missing_keys)
         ):
             erp_module.reset_parameters(erp_module.initializer_range)
+
+        erp_spatial_module = self.erp_spatial_adapter
+        if (
+            erp_spatial_module is not None
+            and erp_spatial_module.enabled
+            and any(key.startswith("erp_spatial_adapter.") for key in missing_keys)
+        ):
+            erp_spatial_module.reset_parameters()
 
         panovggt_module = self.panovggt_mlp
         if (
@@ -1686,6 +1282,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if self._erp_pos_enabled() and self.erp_position_mlp is not None:
             self.erp_position_mlp.reset_parameters(self.erp_position_mlp.initializer_range)
 
+    def _reset_erp_spatial_parameters_after_pretrained_load(self) -> None:
+        if self._erp_spatial_enabled() and self.erp_spatial_adapter is not None:
+            self.erp_spatial_adapter.reset_parameters()
+
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
         if self._panovggt_enabled() and self.panovggt_mlp is not None:
             self.panovggt_mlp.reset_parameters()
@@ -1698,9 +1298,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
         return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.PANOVGGT_STATE_KEYS)
 
-    @classmethod
-    def _checkpoint_has_action_bearing_weights(cls, pretrained_model_name_or_path) -> bool | None:
-        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.ACTION_BEARING_STATE_KEYS)
+    def _checkpoint_has_erp_spatial_weights(self, pretrained_model_name_or_path) -> bool | None:
+        if self.erp_spatial_adapter is None:
+            return None
+        state_keys = tuple(f"erp_spatial_adapter.{key}" for key in self.erp_spatial_adapter.state_dict().keys())
+        return self._checkpoint_has_any_weights(pretrained_model_name_or_path, state_keys)
 
     @classmethod
     def _checkpoint_has_any_weights(cls, pretrained_model_name_or_path, state_keys) -> bool | None:
@@ -1752,6 +1354,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         has_erp_weights = cls._checkpoint_has_erp_weights(pretrained_model_name_or_path)
         if has_erp_weights is False:
             model._reset_erp_parameters_after_pretrained_load()
+        has_erp_spatial_weights = model._checkpoint_has_erp_spatial_weights(pretrained_model_name_or_path)
+        if has_erp_spatial_weights is False:
+            model._reset_erp_spatial_parameters_after_pretrained_load()
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()
@@ -1763,16 +1368,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             )
             if not loaded_saved_panovggt and model.panovggt is None:
                 model._load_external_panovggt_weights()
-        has_action_bearing_weights = cls._checkpoint_has_action_bearing_weights(pretrained_model_name_or_path)
-        if (
-            model._action_bearing_enabled()
-            and model.action_bearing_kv is not None
-            and has_action_bearing_weights is False
-        ):
-            model.action_bearing_kv.reset_parameters(
-                float(getattr(model.config.vision_config, "initializer_range", 0.02))
-            )
-            model.action_bearing_kv.initialize_bin_embeddings_from_text(model.get_input_embeddings())
         return model
 
     def prepare_inputs_for_generation(

@@ -27,8 +27,8 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "erp_position_mlp": True,
+    "erp_spatial_adapter": True,
     "panovggt_mlp": True,
-    "action_bearing_kv": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -75,8 +75,8 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "erp_position_mlp": getattr(model, "erp_position_mlp", None),
+        "erp_spatial_adapter": getattr(model, "erp_spatial_adapter", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
-        "action_bearing_kv": getattr(model, "action_bearing_kv", None),
         "language_model": language_model,
     }
 
@@ -112,6 +112,10 @@ def _load_model_config(cfg):
         "erp_center_latitude_deg",
         "erp_apply_to_current_only",
     )
+    erp_spatial_fields = (
+        "erp_spatial_enabled",
+        "erp_spatial_alpha_value",
+    )
     erp_crop_fields = (
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
@@ -122,12 +126,6 @@ def _load_model_config(cfg):
         "panovggt_alpha_value",
         "panovggt_sampling_mode",
         "panovggt_force_fp32",
-    )
-    action_bearing_fields = (
-        "action_bearing_enabled",
-        "action_bearing_key_alpha_value",
-        "action_bearing_value_alpha_value",
-        "action_bearing_inject_layers",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -177,11 +175,11 @@ def _load_model_config(cfg):
         apply_module_fields(enabled, field_names)
 
     apply_vision_module_fields_preserve_checkpoint(bool(cfg.model.erp_pos_enabled), erp_fields)
+    apply_vision_module_fields(bool(cfg.model.erp_spatial_enabled), erp_spatial_fields)
     for field_name in erp_crop_fields:
         if not hasattr(config, field_name):
             setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
-    apply_module_fields_preserve_checkpoint(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config
 
 

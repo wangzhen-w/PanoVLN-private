@@ -35,8 +35,8 @@ class PanoVLNTrainer(Trainer):
         "visual",
         "visual_merger",
         "erp_position_mlp",
+        "erp_spatial_adapter",
         "panovggt_mlp",
-        "action_bearing_kv",
     )
 
     def __init__(
@@ -121,10 +121,10 @@ class PanoVLNTrainer(Trainer):
         return name == module_name or name.startswith(f"{module_name}.") or f".{module_name}." in name
 
     def _module_lr_key_for_parameter(self, name: str):
-        if self._name_has_module(name, "action_bearing_kv"):
-            return "action_bearing_kv"
         if self._name_has_module(name, "erp_position_mlp"):
             return "erp_position_mlp"
+        if self._name_has_module(name, "erp_spatial_adapter"):
+            return "erp_spatial_adapter"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -217,14 +217,12 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"erp_apply_to_current_only: {_config_value(cfg.model.erp_apply_to_current_only)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
+    rank0_print(RANK, f"erp_spatial_enabled: {_config_value(cfg.model.erp_spatial_enabled)}")
+    rank0_print(RANK, f"erp_spatial_alpha_value: {_config_value(cfg.model.erp_spatial_alpha_value)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
-    rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
-    rank0_print(RANK, f"action_bearing_key_alpha_value: {_config_value(cfg.model.action_bearing_key_alpha_value)}")
-    rank0_print(RANK, f"action_bearing_value_alpha_value: {_config_value(cfg.model.action_bearing_value_alpha_value)}")
-    rank0_print(RANK, f"action_bearing_inject_layers: {_config_value(cfg.model.action_bearing_inject_layers)}")
     rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
     rank0_print(RANK, f"trace_enable: {_config_value(cfg.data.trace_enable)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
@@ -234,8 +232,8 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"erp_position_mlp_lr: {_config_value(cfg.training.erp_position_mlp_lr)}")
+    rank0_print(RANK, f"erp_spatial_lr: {_config_value(cfg.training.erp_spatial_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
-    rank0_print(RANK, f"action_bearing_kv_lr: {_config_value(cfg.training.action_bearing_kv_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -287,6 +285,7 @@ def main():
     processor, tokenizer = load_processor_and_tokenizer(cfg)
     model = load_model(cfg)
     model_config = model.config
+    vision_config = getattr(model_config, "vision_config", None)
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
@@ -301,7 +300,14 @@ def main():
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
-        rank0_print(RANK, f"action_bearing_enabled: {_config_value(getattr(model_config, 'action_bearing_enabled', None))}")
+        rank0_print(
+            RANK,
+            f"erp_spatial_enabled: {_config_value(getattr(vision_config, 'erp_spatial_enabled', None))}",
+        )
+        rank0_print(
+            RANK,
+            f"erp_spatial_alpha_value: {_config_value(getattr(vision_config, 'erp_spatial_alpha_value', None))}",
+        )
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
     eval_image_root = cfg.data.eval_image_root or train_image_root
@@ -376,13 +382,6 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
-    if RANK == 0:
-        action_attention_layers = getattr(model, "_pano_action_bearing_attention_layers", None)
-        action_inject_layers = getattr(model, "_pano_action_bearing_inject_layers", None)
-        if action_attention_layers is not None:
-            rank0_print(RANK, f"action_bearing_full_attention_layers: {list(action_attention_layers)}")
-        if action_inject_layers is not None:
-            rank0_print(RANK, f"action_bearing_actual_inject_layers: {list(action_inject_layers)}")
     sync_model_special_tokens(model, tokenizer)
     set_model(cfg, model)
 
@@ -405,8 +404,8 @@ def main():
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "erp_position_mlp": cfg.training.erp_position_mlp_lr,
+            "erp_spatial_adapter": cfg.training.erp_spatial_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
-            "action_bearing_kv": cfg.training.action_bearing_kv_lr,
         },
         compute_metrics=(
             build_action_accuracy(
