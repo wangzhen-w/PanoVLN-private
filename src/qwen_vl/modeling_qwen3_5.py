@@ -17,6 +17,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
 VENDORED_PANOVGGT_CONFIG_PATH = VENDORED_PANOVGGT_DIR / "training" / "config" / "default.yaml"
+ERP_ANGLE_EPS = 1e-6
+
+
+def validate_erp_angles(vertical_fov: float, center_latitude: float) -> tuple[float, float]:
+    if not math.isfinite(vertical_fov) or not (0.0 < vertical_fov <= math.pi + ERP_ANGLE_EPS):
+        raise AssertionError(f"Invalid ERP vertical_fov={vertical_fov}")
+    half_pi = 0.5 * math.pi
+    if not math.isfinite(center_latitude) or abs(center_latitude) > half_pi + ERP_ANGLE_EPS:
+        raise AssertionError(f"Invalid ERP center_latitude={center_latitude}")
+    return min(vertical_fov, math.pi), max(-half_pi, min(half_pi, center_latitude))
 
 
 def ensure_erp_vision_config(vision_config) -> None:
@@ -90,10 +100,7 @@ class ERPPositionMLP(nn.Module):
         vertical_fov: float,
         center_latitude: float,
     ) -> torch.Tensor:
-        if not (0.0 < vertical_fov <= math.pi):
-            raise AssertionError(f"Invalid ERP vertical_fov={vertical_fov}")
-        if abs(center_latitude) > (0.5 * math.pi):
-            raise AssertionError(f"Invalid ERP center_latitude={center_latitude}")
+        vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
 
         ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
         xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
@@ -256,10 +263,7 @@ class ERPSphericalCrossAttentionAdapter(nn.Module):
         vertical_fov: float,
         center_latitude: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not (0.0 < vertical_fov <= math.pi):
-            raise AssertionError(f"Invalid ERP vertical_fov={vertical_fov}")
-        if abs(center_latitude) > (0.5 * math.pi):
-            raise AssertionError(f"Invalid ERP center_latitude={center_latitude}")
+        vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
 
         ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
         xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
@@ -285,19 +289,30 @@ class ERPSphericalCrossAttentionAdapter(nn.Module):
             vertical_fov=vertical_fov,
             center_latitude=center_latitude,
         )
-        angle_field = torch.stack([yaw, pitch], dim=-1).reshape(height * width, 2)
         features_per_band = 4
         num_bands = max(1, math.ceil(self.output_hidden_size / features_per_band))
         max_freq = max(float(max(height, width)), 1.0)
-        scales = 2.0 ** torch.linspace(
+        # Yaw is a periodic longitude angle: only integer harmonics keep the
+        # ERP left/right boundary continuous under yaw +/- 2pi.
+        yaw_scales = torch.linspace(
+            1.0,
+            max_freq,
+            steps=num_bands,
+            device=device,
+            dtype=torch.float32,
+        ).round().clamp_min_(1.0)
+        pitch_scales = 2.0 ** torch.linspace(
             0.0,
             math.log2(max_freq),
             steps=num_bands,
             device=device,
             dtype=torch.float32,
         )
-        expanded = angle_field.unsqueeze(-1) * scales
-        embeddings = torch.stack([expanded.sin(), expanded.cos()], dim=-1).reshape(height * width, -1)
+        yaw_phase = yaw.reshape(height * width, 1) * yaw_scales
+        pitch_phase = pitch.reshape(height * width, 1) * pitch_scales
+        yaw_features = torch.stack([yaw_phase.sin(), yaw_phase.cos()], dim=-1).reshape(height * width, -1)
+        pitch_features = torch.stack([pitch_phase.sin(), pitch_phase.cos()], dim=-1).reshape(height * width, -1)
+        embeddings = torch.cat([yaw_features, pitch_features], dim=-1)
         if embeddings.shape[-1] > self.output_hidden_size:
             embeddings = embeddings[:, : self.output_hidden_size]
         elif embeddings.shape[-1] < self.output_hidden_size:

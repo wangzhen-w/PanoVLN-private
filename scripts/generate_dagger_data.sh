@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_grouping_8card"
+MODEL_PATH="/workspace/data1/model/ablation_new/action_new/SSCA_0.01"
 OUTPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 REFERENCE_INPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 DAGGER_DATASET_NAME="dagger"
