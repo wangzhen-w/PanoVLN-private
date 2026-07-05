@@ -40,10 +40,7 @@ from src.train.data.data import (
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
 
-DEFAULT_MODEL_PATH = (
-    "/workspace/data1/model/ablation_new/panovggt_new/"
-    "panovggt_0.05_grouping_8card"
-)
+DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/action_new/FourierLinear_0.005"
 ACTION_WORDS = ("stop", "forward", "left", "right")
 ACTION_SEQUENCE_LENGTH = 4
 REPLAN_ACTION_COUNT_WITHOUT_STOP = 4

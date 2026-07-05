@@ -29,176 +29,77 @@ def validate_erp_angles(vertical_fov: float, center_latitude: float) -> tuple[fl
     return min(vertical_fov, math.pi), max(-half_pi, min(half_pi, center_latitude))
 
 
-def ensure_erp_vision_config(vision_config) -> None:
-    defaults = {
-        "erp_pos_enabled": False,
-        "erp_pos_hidden_size": getattr(vision_config, "hidden_size", 1024),
-        "erp_pos_alpha_value": 0.02,
-        "erp_assume_centered": True,
-        "erp_center_latitude_deg": 0.0,
-        "erp_apply_to_current_only": True,
-    }
-    for field_name, default_value in defaults.items():
-        if not hasattr(vision_config, field_name):
-            setattr(vision_config, field_name, default_value)
+def build_erp_base_angles(
+    *,
+    height: int,
+    width: int,
+    device: torch.device,
+    vertical_fov: float,
+    center_latitude: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
+    ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
+    xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
+    pitch = (ys[:, None] / float(height) - 0.5) * vertical_fov + center_latitude
+    yaw = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
+    return pitch.expand(height, width), yaw.expand(height, width)
 
 
-class ERPPositionMLP(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        ensure_erp_vision_config(config)
+def build_erp_fourier_features(
+    *,
+    num_frames: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    vertical_fov: float,
+    center_latitude: float,
+    feature_size: int,
+) -> torch.Tensor:
+    pitch, yaw = build_erp_base_angles(
+        height=height,
+        width=width,
+        device=device,
+        vertical_fov=vertical_fov,
+        center_latitude=center_latitude,
+    )
+    features_per_band = 4
+    num_bands = max(1, math.ceil(int(feature_size) / features_per_band))
+    max_freq = max(float(max(height, width)), 1.0)
+    # Yaw is a periodic longitude angle: only integer harmonics keep the
+    # ERP left/right boundary continuous under yaw +/- 2pi.
+    yaw_scales = torch.linspace(
+        1.0,
+        max_freq,
+        steps=num_bands,
+        device=device,
+        dtype=torch.float32,
+    ).round().clamp_min_(1.0)
+    pitch_scales = 2.0 ** torch.linspace(
+        0.0,
+        math.log2(max_freq),
+        steps=num_bands,
+        device=device,
+        dtype=torch.float32,
+    )
+    yaw_phase = yaw.reshape(height * width, 1) * yaw_scales
+    pitch_phase = pitch.reshape(height * width, 1) * pitch_scales
+    yaw_features = torch.stack([yaw_phase.sin(), yaw_phase.cos()], dim=-1).reshape(height * width, -1)
+    pitch_features = torch.stack([pitch_phase.sin(), pitch_phase.cos()], dim=-1).reshape(height * width, -1)
+    embeddings = torch.cat([yaw_features, pitch_features], dim=-1)
+    if embeddings.shape[-1] > int(feature_size):
+        embeddings = embeddings[:, : int(feature_size)]
+    elif embeddings.shape[-1] < int(feature_size):
+        embeddings = F.pad(embeddings, (0, int(feature_size) - embeddings.shape[-1]))
+    if num_frames > 1:
+        embeddings = embeddings.repeat(num_frames, 1)
+    return embeddings.to(dtype=dtype)
 
-        self.enabled = bool(getattr(config, "erp_pos_enabled", False))
-        self.hidden_size = int(getattr(config, "erp_pos_hidden_size", config.hidden_size))
-        self.alpha_init = float(getattr(config, "erp_pos_alpha_value", 0.02))
-        self.register_buffer(
-            "alpha_value",
-            torch.tensor(self.alpha_init, dtype=torch.float32),
-        )
-        self.assume_centered = bool(getattr(config, "erp_assume_centered", True))
-        self.center_latitude_deg = float(getattr(config, "erp_center_latitude_deg", 0.0))
-        self.apply_to_current_only = bool(getattr(config, "erp_apply_to_current_only", True))
-        self.output_hidden_size = int(config.hidden_size)
-        self.initializer_range = float(getattr(config, "initializer_range", 0.02))
 
-        self.mlp = nn.Sequential(
-            nn.Linear(4, self.hidden_size),
-            nn.GELU(),
-            nn.Linear(self.hidden_size, self.output_hidden_size),
-        )
-        self.output_norm = nn.RMSNorm(self.output_hidden_size, eps=1e-6)
-        self.reset_parameters(self.initializer_range)
-
-    @property
-    def alpha(self) -> torch.Tensor:
-        return self.alpha_value
-
-    @staticmethod
-    def infer_vertical_fov_radians(height: int, width: int) -> float:
-        if height <= 0 or width <= 0:
-            return 0.0
-        return min(math.pi, 2.0 * math.pi * float(height) / float(width))
-
-    def reset_parameters(self, init_std: float | None = None) -> None:
-        init_std = self.initializer_range if init_std is None else float(init_std)
-        for module in self.mlp:
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=init_std)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        self.output_norm.reset_parameters()
-        self.alpha_value.fill_(self.alpha_init)
-
-    def _build_position_features(
-        self,
-        *,
-        num_frames: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        vertical_fov: float,
-        center_latitude: float,
-    ) -> torch.Tensor:
-        vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
-
-        ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
-        xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
-
-        lat = (ys[:, None] / float(height) - 0.5) * vertical_fov + center_latitude
-        lon = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
-        lat = lat.expand(height, width)
-        lon = lon.expand(height, width)
-
-        position_features = torch.stack(
-            [torch.sin(lat), torch.cos(lat), torch.sin(lon), torch.cos(lon)],
-            dim=-1,
-        ).reshape(height * width, 4)
-        if num_frames > 1:
-            position_features = position_features.repeat(num_frames, 1)
-        return position_features.to(dtype=dtype)
-
-    def apply_to_patch_tokens(
-        self,
-        patch_tokens: torch.Tensor,
-        grid_thw: torch.Tensor | None,
-        image_apply_mask: torch.Tensor | None = None,
-        image_erp_geometry: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if not self.enabled or grid_thw is None or grid_thw.numel() == 0:
-            return patch_tokens
-
-        mlp_param = next(self.mlp.parameters())
-        param_device = mlp_param.device
-        param_dtype = mlp_param.dtype
-        default_center_latitude = 0.0
-        if not self.assume_centered:
-            default_center_latitude = math.radians(self.center_latitude_deg)
-
-        if grid_thw.ndim != 2 or int(grid_thw.shape[-1]) != 3:
-            raise AssertionError(f"Expected image_grid_thw shape [N, 3], got {tuple(grid_thw.shape)}")
-        num_images = int(grid_thw.shape[0])
-        if image_apply_mask is not None:
-            if image_apply_mask.ndim != 1 or int(image_apply_mask.shape[0]) != num_images:
-                raise AssertionError(
-                    f"Expected image_apply_mask to have shape [{num_images}], "
-                    f"got {tuple(image_apply_mask.shape)}"
-                )
-            apply_mask_list = image_apply_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
-        else:
-            apply_mask_list = [True] * num_images
-
-        geometry_list = None
-        if image_erp_geometry is not None:
-            if image_erp_geometry.ndim != 2 or tuple(image_erp_geometry.shape) != (num_images, 2):
-                raise AssertionError(
-                    "Expected image_erp_geometry to have shape "
-                    f"[{num_images}, 2], got {tuple(image_erp_geometry.shape)}"
-                )
-            geometry_list = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32).tolist()
-
-        split_sizes = [
-            int(size)
-            for size in grid_thw.prod(-1).detach().to(device="cpu", dtype=torch.long).tolist()
-        ]
-        if sum(split_sizes) != int(patch_tokens.shape[0]):
-            raise AssertionError(
-                "Patch token count does not match image_grid_thw for ERP position MLP: "
-                f"tokens={int(patch_tokens.shape[0])}, expected={sum(split_sizes)}"
-            )
-        token_splits = list(patch_tokens.split(split_sizes, dim=0))
-        for image_index, (tokens, (num_frames, height, width)) in enumerate(
-            zip(token_splits, grid_thw.tolist())
-        ):
-            if not apply_mask_list[image_index]:
-                continue
-            if int(height) <= 0 or int(width) <= 0:
-                continue
-
-            if geometry_list is not None:
-                vertical_fov = float(geometry_list[image_index][0])
-                center_latitude = float(geometry_list[image_index][1])
-            else:
-                vertical_fov = self.infer_vertical_fov_radians(int(height), int(width))
-                center_latitude = default_center_latitude
-
-            position_features = self._build_position_features(
-                num_frames=int(num_frames),
-                height=int(height),
-                width=int(width),
-                device=param_device,
-                dtype=param_dtype,
-                vertical_fov=vertical_fov,
-                center_latitude=center_latitude,
-            )
-            position_delta = self.output_norm(self.mlp(position_features))
-            position_delta = self.alpha.to(dtype=position_delta.dtype) * position_delta
-            token_splits[image_index] = tokens + position_delta.to(
-                device=tokens.device,
-                dtype=tokens.dtype,
-            )
-
-        return torch.cat(token_splits, dim=0)
+def infer_erp_vertical_fov_radians(height: int, width: int) -> float:
+    if height <= 0 or width <= 0:
+        return 0.0
+    return min(math.pi, 2.0 * math.pi * float(height) / float(width))
 
 
 def ensure_erp_spatial_config(vision_config) -> None:
@@ -254,23 +155,6 @@ class ERPSphericalCrossAttentionAdapter(nn.Module):
         nn.init.zeros_(self.attn.out_proj.weight)
         self.gate.data.fill_(self.alpha_init)
 
-    def _build_base_angles(
-        self,
-        *,
-        height: int,
-        width: int,
-        device: torch.device,
-        vertical_fov: float,
-        center_latitude: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
-
-        ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
-        xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
-        pitch = (ys[:, None] / float(height) - 0.5) * vertical_fov + center_latitude
-        yaw = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
-        return pitch.expand(height, width), yaw.expand(height, width)
-
     def _build_spherical_embeddings(
         self,
         *,
@@ -282,44 +166,16 @@ class ERPSphericalCrossAttentionAdapter(nn.Module):
         vertical_fov: float,
         center_latitude: float,
     ) -> torch.Tensor:
-        pitch, yaw = self._build_base_angles(
+        return build_erp_fourier_features(
+            num_frames=num_frames,
             height=height,
             width=width,
             device=device,
+            dtype=dtype,
             vertical_fov=vertical_fov,
             center_latitude=center_latitude,
+            feature_size=self.output_hidden_size,
         )
-        features_per_band = 4
-        num_bands = max(1, math.ceil(self.output_hidden_size / features_per_band))
-        max_freq = max(float(max(height, width)), 1.0)
-        # Yaw is a periodic longitude angle: only integer harmonics keep the
-        # ERP left/right boundary continuous under yaw +/- 2pi.
-        yaw_scales = torch.linspace(
-            1.0,
-            max_freq,
-            steps=num_bands,
-            device=device,
-            dtype=torch.float32,
-        ).round().clamp_min_(1.0)
-        pitch_scales = 2.0 ** torch.linspace(
-            0.0,
-            math.log2(max_freq),
-            steps=num_bands,
-            device=device,
-            dtype=torch.float32,
-        )
-        yaw_phase = yaw.reshape(height * width, 1) * yaw_scales
-        pitch_phase = pitch.reshape(height * width, 1) * pitch_scales
-        yaw_features = torch.stack([yaw_phase.sin(), yaw_phase.cos()], dim=-1).reshape(height * width, -1)
-        pitch_features = torch.stack([pitch_phase.sin(), pitch_phase.cos()], dim=-1).reshape(height * width, -1)
-        embeddings = torch.cat([yaw_features, pitch_features], dim=-1)
-        if embeddings.shape[-1] > self.output_hidden_size:
-            embeddings = embeddings[:, : self.output_hidden_size]
-        elif embeddings.shape[-1] < self.output_hidden_size:
-            embeddings = F.pad(embeddings, (0, self.output_hidden_size - embeddings.shape[-1]))
-        if num_frames > 1:
-            embeddings = embeddings.repeat(num_frames, 1)
-        return embeddings.to(dtype=dtype)
 
     def apply_to_patch_tokens(
         self,
@@ -376,7 +232,7 @@ class ERPSphericalCrossAttentionAdapter(nn.Module):
                 vertical_fov = float(geometry_list[image_index][0])
                 center_latitude = float(geometry_list[image_index][1])
             else:
-                vertical_fov = ERPPositionMLP.infer_vertical_fov_radians(int(height), int(width))
+                vertical_fov = infer_erp_vertical_fov_radians(int(height), int(width))
                 center_latitude = default_center_latitude
 
             query_tokens = tokens.to(device=param_device, dtype=param_dtype)
@@ -398,6 +254,122 @@ class ERPSphericalCrossAttentionAdapter(nn.Module):
             key_value = self.kv_norm(spherical_tokens).unsqueeze(0)
             delta, _ = self.attn(query, key_value, key_value, need_weights=False)
             delta = self.output_norm(delta.squeeze(0))
+            delta = delta * self.gate.to(dtype=delta.dtype).tanh()
+            token_splits[image_index] = tokens + delta.to(device=tokens.device, dtype=tokens.dtype)
+
+        return torch.cat(token_splits, dim=0)
+
+
+def ensure_erp_fourier_linear_config(vision_config) -> None:
+    defaults = {
+        "erp_fourier_linear_enabled": False,
+        "erp_fourier_linear_alpha_value": 0.005,
+    }
+    for field_name, default_value in defaults.items():
+        if not hasattr(vision_config, field_name):
+            setattr(vision_config, field_name, default_value)
+
+
+class ERPFourierLinearAdapter(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        ensure_erp_fourier_linear_config(config)
+
+        self.enabled = bool(getattr(config, "erp_fourier_linear_enabled", False))
+        self.output_hidden_size = int(config.hidden_size)
+        self.fourier_feature_size = min(256, self.output_hidden_size)
+        self.alpha_init = float(getattr(config, "erp_fourier_linear_alpha_value", 0.005))
+        self.apply_to_current_only = True
+        if self.enabled and self.alpha_init <= 0.0:
+            raise ValueError(
+                "erp_fourier_linear_alpha_value must be positive when ERP Fourier linear is enabled; "
+                "use erp_fourier_linear_enabled=false to disable the adapter."
+            )
+
+        self.input_norm = nn.LayerNorm(self.fourier_feature_size)
+        self.proj = nn.Linear(self.fourier_feature_size, self.output_hidden_size, bias=False)
+        self.gate = nn.Parameter(torch.tensor(self.alpha_init, dtype=torch.float32))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        self.input_norm.reset_parameters()
+        nn.init.zeros_(self.proj.weight)
+        self.gate.data.fill_(self.alpha_init)
+
+    def apply_to_patch_tokens(
+        self,
+        patch_tokens: torch.Tensor,
+        grid_thw: torch.Tensor | None,
+        image_apply_mask: torch.Tensor | None = None,
+        image_erp_geometry: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.enabled or grid_thw is None or grid_thw.numel() == 0:
+            return patch_tokens
+        if grid_thw.ndim != 2 or int(grid_thw.shape[-1]) != 3:
+            raise AssertionError(f"Expected image_grid_thw shape [N, 3], got {tuple(grid_thw.shape)}")
+
+        param = self.proj.weight
+        param_device = param.device
+        param_dtype = param.dtype
+        default_center_latitude = 0.0
+
+        num_images = int(grid_thw.shape[0])
+        if image_apply_mask is not None:
+            if image_apply_mask.ndim != 1 or int(image_apply_mask.shape[0]) != num_images:
+                raise AssertionError(
+                    f"Expected image_apply_mask to have shape [{num_images}], got {tuple(image_apply_mask.shape)}"
+                )
+            apply_mask_list = image_apply_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
+        else:
+            apply_mask_list = [True] * num_images
+
+        geometry_list = None
+        if image_erp_geometry is not None:
+            if image_erp_geometry.ndim != 2 or tuple(image_erp_geometry.shape) != (num_images, 2):
+                raise AssertionError(
+                    "Expected image_erp_geometry to have shape "
+                    f"[{num_images}, 2], got {tuple(image_erp_geometry.shape)}"
+                )
+            geometry_list = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32).tolist()
+
+        split_sizes = [
+            int(size)
+            for size in grid_thw.prod(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+        ]
+        if sum(split_sizes) != int(patch_tokens.shape[0]):
+            raise AssertionError(
+                "Patch token count does not match image_grid_thw for ERP Fourier linear: "
+                f"tokens={int(patch_tokens.shape[0])}, expected={sum(split_sizes)}"
+            )
+
+        token_splits = list(patch_tokens.split(split_sizes, dim=0))
+        for image_index, (tokens, (num_frames, height, width)) in enumerate(zip(token_splits, grid_thw.tolist())):
+            if not apply_mask_list[image_index] or int(height) <= 0 or int(width) <= 0:
+                continue
+
+            if geometry_list is not None:
+                vertical_fov = float(geometry_list[image_index][0])
+                center_latitude = float(geometry_list[image_index][1])
+            else:
+                vertical_fov = infer_erp_vertical_fov_radians(int(height), int(width))
+                center_latitude = default_center_latitude
+
+            fourier_features = build_erp_fourier_features(
+                num_frames=int(num_frames),
+                height=int(height),
+                width=int(width),
+                device=param_device,
+                dtype=param_dtype,
+                vertical_fov=vertical_fov,
+                center_latitude=center_latitude,
+                feature_size=self.fourier_feature_size,
+            )
+            if int(fourier_features.shape[0]) != int(tokens.shape[0]):
+                raise AssertionError(
+                    "ERP Fourier linear feature count mismatch: "
+                    f"features={int(fourier_features.shape[0])}, tokens={int(tokens.shape[0])}"
+                )
+            delta = self.proj(self.input_norm(fourier_features))
             delta = delta * self.gate.to(dtype=delta.dtype).tanh()
             token_splits[image_index] = tokens + delta.to(device=tokens.device, dtype=tokens.dtype)
 
@@ -815,14 +787,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
     ) + [r"panovggt\..*"]
 
-    ERP_STATE_KEYS = (
-        "erp_position_mlp.alpha_value",
-        "erp_position_mlp.mlp.0.weight",
-        "erp_position_mlp.mlp.0.bias",
-        "erp_position_mlp.mlp.2.weight",
-        "erp_position_mlp.mlp.2.bias",
-        "erp_position_mlp.output_norm.weight",
-    )
     PANOVGGT_STATE_KEYS = (
         "panovggt_mlp.alpha_value",
         "panovggt_mlp.input_norm.weight",
@@ -834,32 +798,40 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     )
     def __init__(self, config):
         vision_config = getattr(config, "vision_config", None)
-        erp_pos_enabled = bool(
-            getattr(vision_config, "erp_pos_enabled", getattr(config, "erp_pos_enabled", False))
-        )
         erp_spatial_enabled = bool(
             getattr(vision_config, "erp_spatial_enabled", getattr(config, "erp_spatial_enabled", False))
         )
+        erp_fourier_linear_enabled = bool(
+            getattr(
+                vision_config,
+                "erp_fourier_linear_enabled",
+                getattr(config, "erp_fourier_linear_enabled", False),
+            )
+        )
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
-        if erp_pos_enabled:
-            ensure_erp_vision_config(config.vision_config)
         if erp_spatial_enabled:
             ensure_erp_spatial_config(config.vision_config)
+        if erp_fourier_linear_enabled:
+            ensure_erp_fourier_linear_config(config.vision_config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
         super().__init__(config)
 
-        if erp_pos_enabled:
-            ensure_erp_vision_config(self.model.visual.config)
         if erp_spatial_enabled:
             ensure_erp_spatial_config(self.model.visual.config)
+        if erp_fourier_linear_enabled:
+            ensure_erp_fourier_linear_config(self.model.visual.config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
 
-        self.erp_position_mlp = ERPPositionMLP(self.model.visual.config) if erp_pos_enabled else None
         self.erp_spatial_adapter = (
             ERPSphericalCrossAttentionAdapter(self.model.visual.config)
             if erp_spatial_enabled
+            else None
+        )
+        self.erp_fourier_linear_adapter = (
+            ERPFourierLinearAdapter(self.model.visual.config)
+            if erp_fourier_linear_enabled
             else None
         )
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
@@ -876,11 +848,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._install_image_feature_hook()
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
-    def _erp_pos_enabled(self) -> bool:
-        return self.erp_position_mlp is not None and bool(getattr(self.erp_position_mlp, "enabled", False))
-
     def _erp_spatial_enabled(self) -> bool:
         return self.erp_spatial_adapter is not None and bool(getattr(self.erp_spatial_adapter, "enabled", False))
+
+    def _erp_fourier_linear_enabled(self) -> bool:
+        return (
+            self.erp_fourier_linear_adapter is not None
+            and bool(getattr(self.erp_fourier_linear_adapter, "enabled", False))
+        )
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
@@ -897,7 +872,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         return image_apply_mask
 
     def _install_pano_patch_embed_hook(self) -> None:
-        if not self._erp_pos_enabled() and not self._erp_spatial_enabled():
+        if (
+            not self._erp_spatial_enabled()
+            and not self._erp_fourier_linear_enabled()
+        ):
             return
         visual = self.model.visual
         if hasattr(visual.patch_embed, "_pano_origin_forward"):
@@ -912,22 +890,22 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if grid_thw is None or outputs.numel() == 0:
                 return outputs
 
-            if owner._erp_pos_enabled():
+            if owner._erp_spatial_enabled():
                 image_apply_mask = None
-                if owner.erp_position_mlp.apply_to_current_only:
+                if owner.erp_spatial_adapter.apply_to_current_only:
                     image_apply_mask = owner._current_image_apply_mask(grid_thw)
-                outputs = owner.erp_position_mlp.apply_to_patch_tokens(
+                outputs = owner.erp_spatial_adapter.apply_to_patch_tokens(
                     patch_tokens=outputs,
                     grid_thw=grid_thw,
                     image_apply_mask=image_apply_mask,
                     image_erp_geometry=owner._pano_runtime_image_geometry,
                 )
 
-            if owner._erp_spatial_enabled():
+            if owner._erp_fourier_linear_enabled():
                 image_apply_mask = None
-                if owner.erp_spatial_adapter.apply_to_current_only:
+                if owner.erp_fourier_linear_adapter.apply_to_current_only:
                     image_apply_mask = owner._current_image_apply_mask(grid_thw)
-                outputs = owner.erp_spatial_adapter.apply_to_patch_tokens(
+                outputs = owner.erp_fourier_linear_adapter.apply_to_patch_tokens(
                     patch_tokens=outputs,
                     grid_thw=grid_thw,
                     image_apply_mask=image_apply_mask,
@@ -1233,7 +1211,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
-        if self._erp_pos_enabled() or self._erp_spatial_enabled() or self._panovggt_enabled():
+        if (
+            self._erp_spatial_enabled()
+            or self._erp_fourier_linear_enabled()
+            or self._panovggt_enabled()
+        ):
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
@@ -1264,14 +1246,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         del module
         missing_keys = set(incompatible_keys.missing_keys)
 
-        erp_module = self.erp_position_mlp
-        if (
-            erp_module is not None
-            and erp_module.enabled
-            and any(key.startswith("erp_position_mlp.") for key in missing_keys)
-        ):
-            erp_module.reset_parameters(erp_module.initializer_range)
-
         erp_spatial_module = self.erp_spatial_adapter
         if (
             erp_spatial_module is not None
@@ -1279,6 +1253,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             and any(key.startswith("erp_spatial_adapter.") for key in missing_keys)
         ):
             erp_spatial_module.reset_parameters()
+
+        erp_fourier_linear_module = self.erp_fourier_linear_adapter
+        if (
+            erp_fourier_linear_module is not None
+            and erp_fourier_linear_module.enabled
+            and any(key.startswith("erp_fourier_linear_adapter.") for key in missing_keys)
+        ):
+            erp_fourier_linear_module.reset_parameters()
 
         panovggt_module = self.panovggt_mlp
         if (
@@ -1293,21 +1275,17 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             else:
                 self._mark_panovggt_weights_ready()
 
-    def _reset_erp_parameters_after_pretrained_load(self) -> None:
-        if self._erp_pos_enabled() and self.erp_position_mlp is not None:
-            self.erp_position_mlp.reset_parameters(self.erp_position_mlp.initializer_range)
-
     def _reset_erp_spatial_parameters_after_pretrained_load(self) -> None:
         if self._erp_spatial_enabled() and self.erp_spatial_adapter is not None:
             self.erp_spatial_adapter.reset_parameters()
 
+    def _reset_erp_fourier_linear_parameters_after_pretrained_load(self) -> None:
+        if self._erp_fourier_linear_enabled() and self.erp_fourier_linear_adapter is not None:
+            self.erp_fourier_linear_adapter.reset_parameters()
+
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
         if self._panovggt_enabled() and self.panovggt_mlp is not None:
             self.panovggt_mlp.reset_parameters()
-
-    @classmethod
-    def _checkpoint_has_erp_weights(cls, pretrained_model_name_or_path) -> bool | None:
-        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.ERP_STATE_KEYS)
 
     @classmethod
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
@@ -1317,6 +1295,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if self.erp_spatial_adapter is None:
             return None
         state_keys = tuple(f"erp_spatial_adapter.{key}" for key in self.erp_spatial_adapter.state_dict().keys())
+        return self._checkpoint_has_any_weights(pretrained_model_name_or_path, state_keys)
+
+    def _checkpoint_has_erp_fourier_linear_weights(self, pretrained_model_name_or_path) -> bool | None:
+        if self.erp_fourier_linear_adapter is None:
+            return None
+        state_keys = tuple(
+            f"erp_fourier_linear_adapter.{key}"
+            for key in self.erp_fourier_linear_adapter.state_dict().keys()
+        )
         return self._checkpoint_has_any_weights(pretrained_model_name_or_path, state_keys)
 
     @classmethod
@@ -1366,12 +1353,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        has_erp_weights = cls._checkpoint_has_erp_weights(pretrained_model_name_or_path)
-        if has_erp_weights is False:
-            model._reset_erp_parameters_after_pretrained_load()
         has_erp_spatial_weights = model._checkpoint_has_erp_spatial_weights(pretrained_model_name_or_path)
         if has_erp_spatial_weights is False:
             model._reset_erp_spatial_parameters_after_pretrained_load()
+        has_erp_fourier_linear_weights = model._checkpoint_has_erp_fourier_linear_weights(
+            pretrained_model_name_or_path
+        )
+        if has_erp_fourier_linear_weights is False:
+            model._reset_erp_fourier_linear_parameters_after_pretrained_load()
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()

@@ -67,7 +67,7 @@ from src.eval.eval import (
 DEFAULT_ALPHA = 0.5
 DEFAULT_DAGGER_GOAL_RADIUS = 0.25
 DEFAULT_DAGGER_SUCCESS_RADIUS = 0.5
-DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/action_new/SSCA_0.01"
+DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/action_new/FourierLinear_0.005"
 DEFAULT_OUTPUT_ROOT = "/workspace/data1/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
 DEFAULT_SOURCE_DATASETS = ("r2r", "rxr")

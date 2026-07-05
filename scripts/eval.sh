@@ -11,9 +11,9 @@ export HABITAT_SIM_LOG=quiet
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-MODEL_PATH="/workspace/data1/model/ablation_new/action_new/SSCA_0.01"
+MODEL_PATH="/workspace/data1/model/ablation_new/action_new/FourierLinear_0.005"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/code/vln_result/ablation_new/action_new/SSCA_0.01"
+SAVE_PATH="/workspace/code/vln_result/ablation_new/action_new/FourierLinear_0.005"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
