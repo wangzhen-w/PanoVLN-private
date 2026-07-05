@@ -6,12 +6,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
-CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_grouping_lr1e-5_8card"
+CONFIG_PATH="/workspace/code/VLN/src/panoworld/config/config.yaml"
+OUTPUT_DIR="/workspace/data1/model/panoworld/panovln_panovggt_1e-6"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
-MASTER_PORT="29520"
+MASTER_PORT="29530"
 
 mkdir -p "$OUTPUT_DIR"
 
