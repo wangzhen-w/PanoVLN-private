@@ -152,8 +152,7 @@ def _load_model_config(cfg):
 
     apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:
-        if not hasattr(config, field_name):
-            setattr(config, field_name, getattr(cfg.model, field_name))
+        setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     return config
 

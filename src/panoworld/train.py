@@ -147,12 +147,6 @@ def apply_config_overrides(cfg, overrides) -> None:
         setattr(target, field_name, parsed_value)
 
 
-def _resolve_warmup_args(warmup_steps_value):
-    if isinstance(warmup_steps_value, float) and 0.0 < warmup_steps_value < 1.0:
-        return 0, warmup_steps_value
-    return warmup_steps_value, 0.0
-
-
 def _resolve_resume_checkpoint(resume_from_checkpoint, output_dir: str):
     if resume_from_checkpoint in (None, False, "false", "False", "0", 0):
         return None
@@ -205,6 +199,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
     rank0_print(RANK, f"erp_fourier_linear_enabled: {_config_value(cfg.model.erp_fourier_linear_enabled)}")
+    rank0_print(RANK, f"erp_fourier_linear_alpha_value: {_config_value(cfg.model.erp_fourier_linear_alpha_value)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
@@ -337,7 +332,6 @@ def main() -> None:
         for param in model.parameters():
             param.requires_grad = False
 
-    warmup_steps, warmup_ratio = _resolve_warmup_args(cfg.training.warmup_steps)
     load_best_model_at_end = bool(
         cfg.run.do_train
         and cfg.training.load_best_model_at_end
@@ -371,8 +365,7 @@ def main() -> None:
             cfg.training.greater_is_better if load_best_model_at_end else None
         ),
         save_total_limit=cfg.training.save_total_limit,
-        warmup_steps=warmup_steps,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=cfg.training.warmup_steps,
         lr_scheduler_type=cfg.training.lr_scheduler_type,
         fp16=cfg.training.fp16,
         bf16=cfg.training.bf16,
@@ -397,6 +390,11 @@ def main() -> None:
             RANK,
             "erp_fourier_linear_enabled: "
             f"{_config_value(getattr(vision_config, 'erp_fourier_linear_enabled', None))}",
+        )
+        rank0_print(
+            RANK,
+            "erp_fourier_linear_alpha_value: "
+            f"{_config_value(getattr(vision_config, 'erp_fourier_linear_alpha_value', None))}",
         )
         rank0_print(RANK, "==================================")
         print_model_parameters(model)

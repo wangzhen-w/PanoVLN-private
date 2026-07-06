@@ -10,12 +10,12 @@ model:
     visual: true
     visual_merger: true
     language_model: true
-    erp_fourier_linear_adapter: false
+    erp_fourier_linear_adapter: true
     panovggt_mlp: true
   erp_top_crop_degrees: 0.0
   erp_bottom_crop_degrees: 0.0
-  erp_fourier_linear_enabled: false
-  erp_fourier_linear_alpha_value: 0.005
+  erp_fourier_linear_enabled: true
+  erp_fourier_linear_alpha_value: 0.01
   panovggt_enabled: true
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.05
@@ -43,7 +43,7 @@ data:
       longest_edge: 460800
 
 training:
-  output_dir: "/workspace/data1/model/panoworld/panovln_panovggt_1e-6"
+  output_dir: "/workspace/data1/model/panoworld/panovln_panovggt_fourier"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4

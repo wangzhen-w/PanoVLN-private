@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="/workspace/code/VLN/src/panoworld/config/config.yaml"
-OUTPUT_DIR="/workspace/data1/model/panoworld/panovln_panovggt_1e-6"
+OUTPUT_DIR="/workspace/data1/model/panoworld/panovln_panovggt_fourier"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
@@ -31,5 +31,6 @@ CUDA_VISIBLE_DEVICES="$GPU_DEVICES" torchrun \
     --master_port="$MASTER_PORT" \
     train.py \
     --config "$CONFIG_PATH" \
+    --set "training.output_dir=$OUTPUT_DIR" \
     "$@" \
     2>&1 | tee "$OUTPUT_DIR/train.log"
