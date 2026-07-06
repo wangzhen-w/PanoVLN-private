@@ -16,8 +16,6 @@ class ModelConfig:
     trainable_modules: Optional[Dict[str, bool]] = None
     erp_top_crop_degrees: float = 20.0
     erp_bottom_crop_degrees: float = 20.0
-    erp_spatial_enabled: bool = False
-    erp_spatial_alpha_value: float = 0.01
     erp_fourier_linear_enabled: bool = False
     erp_fourier_linear_alpha_value: float = 0.005
     panovggt_enabled: bool = False
@@ -68,7 +66,7 @@ class TrainingConfig:
     language_model_lr: Optional[float] = None
     visual_lr: Optional[float] = None
     visual_merger_lr: Optional[float] = None
-    erp_spatial_lr: Optional[float] = None
+    erp_fourier_linear_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0

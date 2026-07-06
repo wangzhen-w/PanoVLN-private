@@ -30,14 +30,12 @@ RANK = int(os.environ.get("RANK", "0"))
 
 class PanoVLNTrainer(Trainer):
     RAW_ALPHA_NO_DECAY_SUFFIXES = (
-        "erp_spatial_adapter.gate",
         "erp_fourier_linear_adapter.gate",
     )
     MODULE_LR_KEYS = (
         "language_model",
         "visual",
         "visual_merger",
-        "erp_spatial_adapter",
         "erp_fourier_linear_adapter",
         "panovggt_mlp",
     )
@@ -68,8 +66,6 @@ class PanoVLNTrainer(Trainer):
         return name == module_name or name.startswith(f"{module_name}.") or f".{module_name}." in name
 
     def _module_lr_key_for_parameter(self, name: str):
-        if self._name_has_module(name, "erp_spatial_adapter"):
-            return "erp_spatial_adapter"
         if self._name_has_module(name, "erp_fourier_linear_adapter"):
             return "erp_fourier_linear_adapter"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
@@ -196,8 +192,6 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
-    rank0_print(RANK, f"erp_spatial_enabled: {_config_value(cfg.model.erp_spatial_enabled)}")
-    rank0_print(RANK, f"erp_spatial_alpha_value: {_config_value(cfg.model.erp_spatial_alpha_value)}")
     rank0_print(RANK, f"erp_fourier_linear_enabled: {_config_value(cfg.model.erp_fourier_linear_enabled)}")
     rank0_print(RANK, f"erp_fourier_linear_alpha_value: {_config_value(cfg.model.erp_fourier_linear_alpha_value)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
@@ -216,7 +210,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"language_model_lr: {_config_value(cfg.training.language_model_lr)}")
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
-    rank0_print(RANK, f"erp_spatial_lr: {_config_value(cfg.training.erp_spatial_lr)}")
+    rank0_print(RANK, f"erp_fourier_linear_lr: {_config_value(cfg.training.erp_fourier_linear_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
@@ -285,14 +279,6 @@ def main():
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
-        rank0_print(
-            RANK,
-            f"erp_spatial_enabled: {_config_value(getattr(vision_config, 'erp_spatial_enabled', None))}",
-        )
-        rank0_print(
-            RANK,
-            f"erp_spatial_alpha_value: {_config_value(getattr(vision_config, 'erp_spatial_alpha_value', None))}",
-        )
         rank0_print(
             RANK,
             "erp_fourier_linear_enabled: "
@@ -432,8 +418,7 @@ def main():
             "language_model": cfg.training.language_model_lr,
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
-            "erp_spatial_adapter": cfg.training.erp_spatial_lr,
-            "erp_fourier_linear_adapter": cfg.training.erp_spatial_lr,
+            "erp_fourier_linear_adapter": cfg.training.erp_fourier_linear_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
         },
         compute_metrics=(

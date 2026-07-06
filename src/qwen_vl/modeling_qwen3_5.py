@@ -102,164 +102,6 @@ def infer_erp_vertical_fov_radians(height: int, width: int) -> float:
     return min(math.pi, 2.0 * math.pi * float(height) / float(width))
 
 
-def ensure_erp_spatial_config(vision_config) -> None:
-    defaults = {
-        "erp_spatial_enabled": False,
-        "erp_spatial_alpha_value": 0.01,
-    }
-    for field_name, default_value in defaults.items():
-        if not hasattr(vision_config, field_name):
-            setattr(vision_config, field_name, default_value)
-
-
-class ERPSphericalCrossAttentionAdapter(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        ensure_erp_spatial_config(config)
-
-        self.enabled = bool(getattr(config, "erp_spatial_enabled", False))
-        self.output_hidden_size = int(config.hidden_size)
-        self.num_heads = 8
-        self.alpha_init = float(getattr(config, "erp_spatial_alpha_value", 0.01))
-        self.apply_to_current_only = True
-        if self.enabled and self.alpha_init <= 0.0:
-            raise ValueError(
-                "erp_spatial_alpha_value must be positive when ERP SSCA is enabled; "
-                "use erp_spatial_enabled=false to disable the adapter."
-            )
-
-        if self.output_hidden_size % self.num_heads != 0:
-            raise ValueError(
-                "ERP SSCA requires vision hidden size to be divisible by num_heads: "
-                f"hidden_size={self.output_hidden_size}, num_heads={self.num_heads}"
-            )
-
-        self.q_norm = nn.LayerNorm(self.output_hidden_size)
-        self.kv_norm = nn.LayerNorm(self.output_hidden_size)
-        self.output_norm = nn.LayerNorm(self.output_hidden_size)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=self.output_hidden_size,
-            num_heads=self.num_heads,
-            dropout=0.0,
-            bias=False,
-            batch_first=True,
-        )
-        self.gate = nn.Parameter(torch.full((self.output_hidden_size,), self.alpha_init, dtype=torch.float32))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        self.q_norm.reset_parameters()
-        self.kv_norm.reset_parameters()
-        self.output_norm.reset_parameters()
-        nn.init.xavier_uniform_(self.attn.in_proj_weight)
-        nn.init.zeros_(self.attn.out_proj.weight)
-        self.gate.data.fill_(self.alpha_init)
-
-    def _build_spherical_embeddings(
-        self,
-        *,
-        num_frames: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        vertical_fov: float,
-        center_latitude: float,
-    ) -> torch.Tensor:
-        return build_erp_fourier_features(
-            num_frames=num_frames,
-            height=height,
-            width=width,
-            device=device,
-            dtype=dtype,
-            vertical_fov=vertical_fov,
-            center_latitude=center_latitude,
-            feature_size=self.output_hidden_size,
-        )
-
-    def apply_to_patch_tokens(
-        self,
-        patch_tokens: torch.Tensor,
-        grid_thw: torch.Tensor | None,
-        image_apply_mask: torch.Tensor | None = None,
-        image_erp_geometry: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if not self.enabled or grid_thw is None or grid_thw.numel() == 0:
-            return patch_tokens
-        if grid_thw.ndim != 2 or int(grid_thw.shape[-1]) != 3:
-            raise AssertionError(f"Expected image_grid_thw shape [N, 3], got {tuple(grid_thw.shape)}")
-
-        param = self.gate
-        param_device = param.device
-        param_dtype = self.attn.in_proj_weight.dtype
-        default_center_latitude = 0.0
-
-        num_images = int(grid_thw.shape[0])
-        if image_apply_mask is not None:
-            if image_apply_mask.ndim != 1 or int(image_apply_mask.shape[0]) != num_images:
-                raise AssertionError(
-                    f"Expected image_apply_mask to have shape [{num_images}], got {tuple(image_apply_mask.shape)}"
-                )
-            apply_mask_list = image_apply_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
-        else:
-            apply_mask_list = [True] * num_images
-
-        geometry_list = None
-        if image_erp_geometry is not None:
-            if image_erp_geometry.ndim != 2 or tuple(image_erp_geometry.shape) != (num_images, 2):
-                raise AssertionError(
-                    "Expected image_erp_geometry to have shape "
-                    f"[{num_images}, 2], got {tuple(image_erp_geometry.shape)}"
-                )
-            geometry_list = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32).tolist()
-
-        split_sizes = [
-            int(size)
-            for size in grid_thw.prod(-1).detach().to(device="cpu", dtype=torch.long).tolist()
-        ]
-        if sum(split_sizes) != int(patch_tokens.shape[0]):
-            raise AssertionError(
-                "Patch token count does not match image_grid_thw for ERP SSCA: "
-                f"tokens={int(patch_tokens.shape[0])}, expected={sum(split_sizes)}"
-            )
-
-        token_splits = list(patch_tokens.split(split_sizes, dim=0))
-        for image_index, (tokens, (num_frames, height, width)) in enumerate(zip(token_splits, grid_thw.tolist())):
-            if not apply_mask_list[image_index] or int(height) <= 0 or int(width) <= 0:
-                continue
-
-            if geometry_list is not None:
-                vertical_fov = float(geometry_list[image_index][0])
-                center_latitude = float(geometry_list[image_index][1])
-            else:
-                vertical_fov = infer_erp_vertical_fov_radians(int(height), int(width))
-                center_latitude = default_center_latitude
-
-            query_tokens = tokens.to(device=param_device, dtype=param_dtype)
-            spherical_tokens = self._build_spherical_embeddings(
-                num_frames=int(num_frames),
-                height=int(height),
-                width=int(width),
-                device=param_device,
-                dtype=param_dtype,
-                vertical_fov=vertical_fov,
-                center_latitude=center_latitude,
-            )
-            if int(spherical_tokens.shape[0]) != int(query_tokens.shape[0]):
-                raise AssertionError(
-                    "ERP SSCA spherical token count mismatch: "
-                    f"spherical={int(spherical_tokens.shape[0])}, tokens={int(query_tokens.shape[0])}"
-                )
-            query = self.q_norm(query_tokens).unsqueeze(0)
-            key_value = self.kv_norm(spherical_tokens).unsqueeze(0)
-            delta, _ = self.attn(query, key_value, key_value, need_weights=False)
-            delta = self.output_norm(delta.squeeze(0))
-            delta = delta * self.gate.to(dtype=delta.dtype).tanh()
-            token_splits[image_index] = tokens + delta.to(device=tokens.device, dtype=tokens.dtype)
-
-        return torch.cat(token_splits, dim=0)
-
-
 def ensure_erp_fourier_linear_config(vision_config) -> None:
     defaults = {
         "erp_fourier_linear_enabled": False,
@@ -798,9 +640,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     )
     def __init__(self, config):
         vision_config = getattr(config, "vision_config", None)
-        erp_spatial_enabled = bool(
-            getattr(vision_config, "erp_spatial_enabled", getattr(config, "erp_spatial_enabled", False))
-        )
         erp_fourier_linear_enabled = bool(
             getattr(
                 vision_config,
@@ -809,26 +648,17 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             )
         )
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
-        if erp_spatial_enabled:
-            ensure_erp_spatial_config(config.vision_config)
         if erp_fourier_linear_enabled:
             ensure_erp_fourier_linear_config(config.vision_config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
         super().__init__(config)
 
-        if erp_spatial_enabled:
-            ensure_erp_spatial_config(self.model.visual.config)
         if erp_fourier_linear_enabled:
             ensure_erp_fourier_linear_config(self.model.visual.config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
 
-        self.erp_spatial_adapter = (
-            ERPSphericalCrossAttentionAdapter(self.model.visual.config)
-            if erp_spatial_enabled
-            else None
-        )
         self.erp_fourier_linear_adapter = (
             ERPFourierLinearAdapter(self.model.visual.config)
             if erp_fourier_linear_enabled
@@ -847,9 +677,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._install_pano_patch_embed_hook()
         self._install_image_feature_hook()
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
-
-    def _erp_spatial_enabled(self) -> bool:
-        return self.erp_spatial_adapter is not None and bool(getattr(self.erp_spatial_adapter, "enabled", False))
 
     def _erp_fourier_linear_enabled(self) -> bool:
         return (
@@ -872,10 +699,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         return image_apply_mask
 
     def _install_pano_patch_embed_hook(self) -> None:
-        if (
-            not self._erp_spatial_enabled()
-            and not self._erp_fourier_linear_enabled()
-        ):
+        if not self._erp_fourier_linear_enabled():
             return
         visual = self.model.visual
         if hasattr(visual.patch_embed, "_pano_origin_forward"):
@@ -889,17 +713,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             grid_thw = owner._pano_runtime_grid_thw
             if grid_thw is None or outputs.numel() == 0:
                 return outputs
-
-            if owner._erp_spatial_enabled():
-                image_apply_mask = None
-                if owner.erp_spatial_adapter.apply_to_current_only:
-                    image_apply_mask = owner._current_image_apply_mask(grid_thw)
-                outputs = owner.erp_spatial_adapter.apply_to_patch_tokens(
-                    patch_tokens=outputs,
-                    grid_thw=grid_thw,
-                    image_apply_mask=image_apply_mask,
-                    image_erp_geometry=owner._pano_runtime_image_geometry,
-                )
 
             if owner._erp_fourier_linear_enabled():
                 image_apply_mask = None
@@ -1212,8 +1025,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         **kwargs,
     ):
         if (
-            self._erp_spatial_enabled()
-            or self._erp_fourier_linear_enabled()
+            self._erp_fourier_linear_enabled()
             or self._panovggt_enabled()
         ):
             self._set_runtime_pano_context(
@@ -1246,14 +1058,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         del module
         missing_keys = set(incompatible_keys.missing_keys)
 
-        erp_spatial_module = self.erp_spatial_adapter
-        if (
-            erp_spatial_module is not None
-            and erp_spatial_module.enabled
-            and any(key.startswith("erp_spatial_adapter.") for key in missing_keys)
-        ):
-            erp_spatial_module.reset_parameters()
-
         erp_fourier_linear_module = self.erp_fourier_linear_adapter
         if (
             erp_fourier_linear_module is not None
@@ -1275,10 +1079,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             else:
                 self._mark_panovggt_weights_ready()
 
-    def _reset_erp_spatial_parameters_after_pretrained_load(self) -> None:
-        if self._erp_spatial_enabled() and self.erp_spatial_adapter is not None:
-            self.erp_spatial_adapter.reset_parameters()
-
     def _reset_erp_fourier_linear_parameters_after_pretrained_load(self) -> None:
         if self._erp_fourier_linear_enabled() and self.erp_fourier_linear_adapter is not None:
             self.erp_fourier_linear_adapter.reset_parameters()
@@ -1290,12 +1090,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
         return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.PANOVGGT_STATE_KEYS)
-
-    def _checkpoint_has_erp_spatial_weights(self, pretrained_model_name_or_path) -> bool | None:
-        if self.erp_spatial_adapter is None:
-            return None
-        state_keys = tuple(f"erp_spatial_adapter.{key}" for key in self.erp_spatial_adapter.state_dict().keys())
-        return self._checkpoint_has_any_weights(pretrained_model_name_or_path, state_keys)
 
     def _checkpoint_has_erp_fourier_linear_weights(self, pretrained_model_name_or_path) -> bool | None:
         if self.erp_fourier_linear_adapter is None:
@@ -1353,9 +1147,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        has_erp_spatial_weights = model._checkpoint_has_erp_spatial_weights(pretrained_model_name_or_path)
-        if has_erp_spatial_weights is False:
-            model._reset_erp_spatial_parameters_after_pretrained_load()
         has_erp_fourier_linear_weights = model._checkpoint_has_erp_fourier_linear_weights(
             pretrained_model_name_or_path
         )

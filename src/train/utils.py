@@ -26,7 +26,6 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual": True,
     "visual_merger": True,
     "language_model": True,
-    "erp_spatial_adapter": True,
     "erp_fourier_linear_adapter": True,
     "panovggt_mlp": True,
 }
@@ -74,7 +73,6 @@ def set_model(cfg, model):
             getattr(visual_model, "merger", None)
             if visual_model is not None else None
         ),
-        "erp_spatial_adapter": getattr(model, "erp_spatial_adapter", None),
         "erp_fourier_linear_adapter": getattr(model, "erp_fourier_linear_adapter", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
         "language_model": language_model,
@@ -103,10 +101,6 @@ def _load_model_config(cfg):
     config = Qwen3_5Config.from_pretrained(
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
-    )
-    erp_spatial_fields = (
-        "erp_spatial_enabled",
-        "erp_spatial_alpha_value",
     )
     erp_fourier_linear_fields = (
         "erp_fourier_linear_enabled",
@@ -156,7 +150,6 @@ def _load_model_config(cfg):
             return
         apply_module_fields(enabled, field_names)
 
-    apply_vision_module_fields(bool(cfg.model.erp_spatial_enabled), erp_spatial_fields)
     apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:
         if not hasattr(config, field_name):
