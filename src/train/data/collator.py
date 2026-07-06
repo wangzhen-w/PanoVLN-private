@@ -57,7 +57,14 @@ class MultiModalDataCollator:
             )
 
         for key in STACKABLE_KEYS:
-            if all(key in feature for feature in features):
-                batch[key] = torch.cat([feature[key] for feature in features], dim=0)
+            present_count = sum(key in feature for feature in features)
+            if present_count == 0:
+                continue
+            if present_count != len(features):
+                raise ValueError(
+                    f"Batch has inconsistent multimodal field '{key}': "
+                    f"{present_count}/{len(features)} samples include it"
+                )
+            batch[key] = torch.cat([feature[key] for feature in features], dim=0)
 
         return batch

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import yaml
@@ -28,6 +28,22 @@ class ModelConfig:
 
 
 @dataclass
+class PanoWorldDataConfig:
+    enabled: bool = False
+    jsonl: Optional[str] = None
+    image_root: Optional[str] = None
+    keep_ratio: float = 0.0
+    max_samples: Optional[int] = None
+    system_prompt: Optional[str] = None
+    system_prompt_path: Optional[str] = (
+        "/workspace/code/VLN/src/panoworld/config/system_prompts/erp_multimodal_prompts.txt"
+    )
+    top_crop_degrees: float = 0.0
+    bottom_crop_degrees: float = 0.0
+    auto_insert_media_placeholders: bool = True
+
+
+@dataclass
 class DataConfig:
     train_jsonl: str
     eval_jsonl: Optional[str] = None
@@ -39,7 +55,7 @@ class DataConfig:
     action_vocab: Optional[List[str]] = None
     f1_action_weight: Optional[List[float]] = None
     prompt_format: str = "chat_template"
-    trace_enable: bool = False
+    panoworld: PanoWorldDataConfig = field(default_factory=PanoWorldDataConfig)
 
 
 @dataclass
@@ -120,6 +136,10 @@ def load_config(path: str) -> TrainConfig:
     training = raw.get("training", {})
     run = raw.get("run", {})
     wandb = raw.get("wandb", None)
+    if "panoworld" in data:
+        data = dict(data)
+        panoworld = data.get("panoworld") or {}
+        data["panoworld"] = PanoWorldDataConfig(**panoworld)
 
     return TrainConfig(
         model=ModelConfig(**model),

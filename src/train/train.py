@@ -9,7 +9,8 @@ import yaml
 from config.config import load_config
 from data.collator import MultiModalDataCollator
 from data.data import SupervisedDataset
-from data.sampler import TraceSampler
+from data.mixed import MixedSupervisedDataset
+from data.panoworld import PanoWorldSupervisedDataset
 from utils import (
     build_action_accuracy,
     init_wandb,
@@ -45,8 +46,6 @@ class PanoVLNTrainer(Trainer):
         self,
         *args,
         module_learning_rates=None,
-        trace_enable: bool = False,
-        trace_sampler_shuffle: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -55,60 +54,6 @@ class PanoVLNTrainer(Trainer):
             for name, lr in (module_learning_rates or {}).items()
             if lr is not None
         }
-        self.trace_enable = bool(trace_enable)
-        self.trace_sampler_shuffle = bool(trace_sampler_shuffle)
-
-    def _get_train_sampler(self, train_dataset=None):
-        if not self.trace_enable:
-            return super()._get_train_sampler(train_dataset)
-
-        if train_dataset is None:
-            train_dataset = self.train_dataset
-        if train_dataset is None:
-            return None
-
-        episode_keys = getattr(train_dataset, "episode_keys", None)
-        step_indices = getattr(train_dataset, "step_indices", None)
-        end_step_indices = getattr(train_dataset, "end_step_indices", None)
-        action_sequences = getattr(train_dataset, "action_sequences", None)
-        if (
-            episode_keys is None
-            or step_indices is None
-            or end_step_indices is None
-            or action_sequences is None
-        ):
-            raise ValueError(
-                "trace_enable=true requires train_dataset to be built with "
-                "collect_trace_metadata=true"
-            )
-
-        per_process_batch_size = max(1, int(self._train_batch_size))
-        world_size = max(1, int(self.args.world_size))
-        gradient_accumulation_steps = max(1, int(self.args.gradient_accumulation_steps))
-        window_size = per_process_batch_size * world_size * gradient_accumulation_steps
-
-        sampler = TraceSampler(
-            episode_keys=episode_keys,
-            step_indices=step_indices,
-            end_step_indices=end_step_indices,
-            action_sequences=action_sequences,
-            window_size=window_size,
-            conflict_step_window=4,
-            seed=self.args.seed,
-            shuffle=self.trace_sampler_shuffle,
-        )
-        if RANK == 0:
-            rank0_print(
-                RANK,
-                "TRACE sampler enabled: "
-                f"samples={len(sampler)}, "
-                f"episode_groups={sampler.num_episode_groups}, "
-                f"window_size={window_size}, "
-                f"per_process_batch_size={per_process_batch_size}, "
-                f"world_size={world_size}, "
-                f"gradient_accumulation_steps={gradient_accumulation_steps}",
-            )
-        return sampler
 
     def get_decay_parameter_names(self, model):
         decay_parameter_names = super().get_decay_parameter_names(model)
@@ -207,6 +152,41 @@ def apply_config_overrides(cfg, overrides):
         setattr(target, field_name, yaml.safe_load(raw_value))
 
 
+def load_optional_text(path):
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing text file: {path}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read().strip()
+
+
+def validate_training_config(cfg) -> None:
+    panoworld_cfg = cfg.data.panoworld
+    if not panoworld_cfg.enabled:
+        return
+    if not panoworld_cfg.jsonl:
+        raise ValueError("data.panoworld.jsonl is required when data.panoworld.enabled=true")
+    if not panoworld_cfg.image_root:
+        raise ValueError("data.panoworld.image_root is required when data.panoworld.enabled=true")
+    if cfg.data.train_max_samples is not None:
+        raise ValueError(
+            "data.train_max_samples must be null when data.panoworld.enabled=true "
+            "because mixed training requires full PanoVLN exposure"
+        )
+    if not 0.0 <= float(panoworld_cfg.keep_ratio) <= 1.0:
+        raise ValueError(
+            "data.panoworld.keep_ratio must be in [0, 1], "
+            f"got {panoworld_cfg.keep_ratio}"
+        )
+    for name, path in (
+        ("data.panoworld.jsonl", panoworld_cfg.jsonl),
+        ("data.panoworld.image_root", panoworld_cfg.image_root),
+    ):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing required path for {name}: {path}")
+
+
 def print_training_config(cfg) -> None:
     rank0_print(RANK, "===== Ablation config =====")
     rank0_print(RANK, f"torch_dtype: {_config_value(cfg.model.torch_dtype)}")
@@ -225,7 +205,11 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
     rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
-    rank0_print(RANK, f"trace_enable: {_config_value(cfg.data.trace_enable)}")
+    rank0_print(RANK, f"panoworld_enabled: {_config_value(cfg.data.panoworld.enabled)}")
+    if cfg.data.panoworld.enabled:
+        rank0_print(RANK, f"panoworld_jsonl: {_config_value(cfg.data.panoworld.jsonl)}")
+        rank0_print(RANK, f"panoworld_image_root: {_config_value(cfg.data.panoworld.image_root)}")
+        rank0_print(RANK, f"panoworld_keep_ratio: {_config_value(cfg.data.panoworld.keep_ratio)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -278,6 +262,7 @@ def main():
 
     cfg = load_config(args.config)
     apply_config_overrides(cfg, args.set)
+    validate_training_config(cfg)
     if RANK == 0:
         print_training_config(cfg)
     set_seed(cfg.training.seed)
@@ -321,6 +306,7 @@ def main():
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
     eval_image_root = cfg.data.eval_image_root or train_image_root
+    panoworld_cfg = cfg.data.panoworld
 
     train_dataset = SupervisedDataset(
         jsonl_path=cfg.data.train_jsonl,
@@ -333,10 +319,45 @@ def main():
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
         max_samples=cfg.data.train_max_samples,
-        shuffle=cfg.data.shuffle,
+        shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
         prompt_format=cfg.data.prompt_format,
-        collect_trace_metadata=cfg.data.trace_enable,
     )
+    if panoworld_cfg.enabled:
+        panoworld_dataset = PanoWorldSupervisedDataset(
+            jsonl_path=panoworld_cfg.jsonl,
+            processor=processor,
+            tokenizer=tokenizer,
+            image_root=panoworld_cfg.image_root,
+            image_token=cfg.model.image_token,
+            model_max_length=cfg.model.model_max_length,
+            erp_top_crop_degrees=panoworld_cfg.top_crop_degrees,
+            erp_bottom_crop_degrees=panoworld_cfg.bottom_crop_degrees,
+            panovggt_enabled=effective_panovggt_enabled,
+            max_samples=panoworld_cfg.max_samples,
+            prompt_format=cfg.data.prompt_format,
+            system_prompt=(
+                panoworld_cfg.system_prompt
+                if panoworld_cfg.system_prompt is not None
+                else load_optional_text(panoworld_cfg.system_prompt_path)
+            ),
+            auto_insert_media_placeholders=panoworld_cfg.auto_insert_media_placeholders,
+        )
+        train_dataset = MixedSupervisedDataset(
+            vln_dataset=train_dataset,
+            panoworld_dataset=panoworld_dataset,
+            panoworld_keep_ratio=panoworld_cfg.keep_ratio,
+            seed=cfg.training.seed,
+            shuffle=cfg.data.shuffle,
+        )
+        if RANK == 0:
+            source_counts = getattr(train_dataset, "source_counts", {})
+            rank0_print(
+                RANK,
+                "mixed_train_dataset: "
+                f"total={len(train_dataset)}, "
+                f"vln={source_counts.get('vln', 0)}, "
+                f"panoworld={source_counts.get('panoworld', 0)}",
+            )
 
     eval_dataset = None
     if cfg.data.eval_jsonl and cfg.run.do_eval:
@@ -353,7 +374,7 @@ def main():
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
-        )
+            )
 
     training_args = TrainingArguments(
         output_dir=cfg.training.output_dir,
@@ -407,8 +428,6 @@ def main():
         eval_dataset=eval_dataset,
         data_collator=MultiModalDataCollator(tokenizer),
         processing_class=tokenizer,
-        trace_enable=cfg.data.trace_enable,
-        trace_sampler_shuffle=cfg.data.shuffle,
         module_learning_rates={
             "language_model": cfg.training.language_model_lr,
             "visual": cfg.training.visual_lr,

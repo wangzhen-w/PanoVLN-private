@@ -278,54 +278,6 @@ def _require_non_empty_string(example: Dict[str, Any], field_name: str) -> str:
     raise ValueError(f"VLN example field '{field_name}' must be a non-empty string")
 
 
-def _metadata_value_to_str(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (int, float, bool)):
-        return str(value)
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-def build_episode_key(example: Dict[str, Any]) -> str:
-    episode_id = _metadata_value_to_str(example.get("episode_id"))
-    if episode_id is not None:
-        dataset = _metadata_value_to_str(example.get("dataset")) or "unknown_dataset"
-        return f"dataset={dataset}|episode_id={episode_id}"
-
-    raise ValueError(
-        "TRACE requires each training sample to contain episode_id"
-    )
-
-
-def _metadata_step_index(example: Dict[str, Any], fallback_index: int) -> int:
-    step_index = example.get("step_index")
-    if step_index is None:
-        return int(fallback_index)
-    return int(step_index)
-
-
-def _metadata_action_sequence(example: Dict[str, Any]) -> List[str]:
-    action_sequence = example.get("action_sequence")
-    if not isinstance(action_sequence, list):
-        return []
-    return [str(action) for action in action_sequence]
-
-
-def _metadata_end_step_index(
-    example: Dict[str, Any],
-    step_index: int,
-    action_sequence: List[str],
-) -> int:
-    end_step = example.get("end_step")
-    if end_step is not None:
-        return int(end_step)
-    if action_sequence:
-        return int(step_index) + len(action_sequence) - 1
-    return int(step_index)
-
-
 def _extract_vln_instruction(example: Dict[str, Any]) -> str:
     instruction = _require_non_empty_string(example, "instruction")
     if isinstance(instruction, str) and instruction.strip():
@@ -469,7 +421,6 @@ class SupervisedDataset(Dataset):
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
-        collect_trace_metadata: bool = False,
     ):
         self.jsonl_path = jsonl_path
         self.processor = processor
@@ -486,38 +437,16 @@ class SupervisedDataset(Dataset):
         self.panovggt_enabled = bool(panovggt_enabled)
         self.prompt_format = prompt_format
         self._fp = None
-        self.episode_keys = None
-        self.step_indices = None
-        self.end_step_indices = None
-        self.action_sequences = None
 
         entries = []
         with open(self.jsonl_path, "rb") as handle:
-            line_index = 0
             while True:
                 offset = handle.tell()
                 line = handle.readline()
                 if not line:
                     break
                 if line.strip():
-                    entry = {"offset": offset}
-                    if collect_trace_metadata:
-                        example = json.loads(line)
-                        action_sequence = _metadata_action_sequence(example)
-                        step_index = _metadata_step_index(
-                            example,
-                            fallback_index=line_index,
-                        )
-                        entry["episode_key"] = build_episode_key(example)
-                        entry["step_index"] = step_index
-                        entry["end_step_index"] = _metadata_end_step_index(
-                            example,
-                            step_index=step_index,
-                            action_sequence=action_sequence,
-                        )
-                        entry["action_sequence"] = action_sequence
-                    entries.append(entry)
-                    line_index += 1
+                    entries.append(offset)
 
         if shuffle:
             random.shuffle(entries)
@@ -525,12 +454,7 @@ class SupervisedDataset(Dataset):
         if max_samples is not None:
             entries = entries[:max_samples]
 
-        self.offsets = [entry["offset"] for entry in entries]
-        if collect_trace_metadata:
-            self.episode_keys = [entry["episode_key"] for entry in entries]
-            self.step_indices = [entry["step_index"] for entry in entries]
-            self.end_step_indices = [entry["end_step_index"] for entry in entries]
-            self.action_sequences = [entry["action_sequence"] for entry in entries]
+        self.offsets = entries
 
     def __len__(self):
         return len(self.offsets)

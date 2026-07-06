@@ -1,5 +1,5 @@
 model:
-  name_or_path: "/workspace/code/a_property/model/Qwen3.5-4B"
+  name_or_path: "/workspace/data1/model/panoworld/panovln_panovggt_1e-6"
   trust_remote_code: false
   torch_dtype: "bfloat16"
   attn_implementation: "flash_attention_2"
@@ -36,10 +36,14 @@ data:
   action_vocab: ["stop", "forward", "left", "right"]
   f1_action_weight: [1.0, 1.0, 1.0, 1.0]
   prompt_format: "chat_template"
-  trace_enable: false
+  panoworld:
+    enabled: true
+    jsonl: "/workspace/data1/dataset/Panoworld/train_outdoor.jsonl"
+    image_root: "/workspace/data1/dataset/Panoworld"
+    keep_ratio: 1.0  #panoworld自己数据集的比例，全量panoworld有361k数据
 
 training:
-  output_dir: "/workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_grouping_lr1e-5_8card"
+  output_dir: "/workspace/data1/model/ablation_new/panovggt_new/panovggt_0.05_panoworld_8card"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -63,7 +67,7 @@ training:
   metric_for_best_model: "eval_weighted_action_f1"
   greater_is_better: true
   save_total_limit: 2
-  warmup_steps: 0.03
+  warmup_steps: 0.03  #new huggingface version
   lr_scheduler_type: "cosine"
   fp16: false
   bf16: true
