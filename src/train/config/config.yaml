@@ -57,12 +57,13 @@ training:
   save_steps: 200
   eval_steps: 200
   max_steps: -1
-  eval_strategy: "steps"
+  eval_strategy: "no"
   save_strategy: "steps"
+  save_model_at_end: true
   max_shard_size: "50GB"
-  load_best_model_at_end: true
-  metric_for_best_model: "eval_weighted_action_f1"
-  greater_is_better: true
+  load_best_model_at_end: false
+  metric_for_best_model: null
+  greater_is_better: null
   save_total_limit: 2
   warmup_steps: 0.03  #new huggingface version
   lr_scheduler_type: "cosine"
@@ -74,11 +75,11 @@ training:
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
-  max_grad_norm: 0.5
+  max_grad_norm: 1.0
   deepspeed: "/workspace/code/VLN/scripts/zero2.json"
 
 run:
-  do_eval: true
+  do_eval: false
   resume_from_checkpoint: false
 
 wandb:
