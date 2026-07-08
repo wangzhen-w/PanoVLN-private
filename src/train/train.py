@@ -9,7 +9,7 @@ import yaml
 from config.config import load_config
 from data.collator import MultiModalDataCollator
 from data.data import SupervisedDataset
-from data.mixed import MixedSupervisedDataset
+from data.mixed import MixedSupervisedDataset, SourceGroupedSampler
 from data.panoworld import PanoWorldSupervisedDataset
 from utils import (
     build_action_accuracy,
@@ -113,6 +113,21 @@ class PanoVLNTrainer(Trainer):
 
         return self.optimizer
 
+    def _get_train_sampler(self, train_dataset=None):
+        if train_dataset is None:
+            train_dataset = self.train_dataset
+        if getattr(train_dataset, "mixing_strategy", None) == "task":
+            return SourceGroupedSampler(
+                train_dataset,
+                batch_size=self._train_batch_size,
+                seed=self.args.seed,
+                shuffle=getattr(train_dataset, "shuffle", True),
+                world_size=self.args.world_size,
+                gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+                drop_last=self.args.dataloader_drop_last,
+            )
+        return super()._get_train_sampler(train_dataset)
+
 
 def copy_chat_template_files(source_dir: str, output_dir: str):
     for template_name in ("chat_template.json", "chat_template.jinja"):
@@ -175,6 +190,11 @@ def validate_training_config(cfg) -> None:
             "data.panoworld.keep_ratio must be in [0, 1], "
             f"got {panoworld_cfg.keep_ratio}"
         )
+    if panoworld_cfg.mixing_strategy not in {"sample", "task"}:
+        raise ValueError(
+            "data.panoworld.mixing_strategy must be 'sample' or 'task', "
+            f"got {panoworld_cfg.mixing_strategy}"
+        )
     for name, path in (
         ("data.panoworld.jsonl", panoworld_cfg.jsonl),
         ("data.panoworld.image_root", panoworld_cfg.image_root),
@@ -204,6 +224,7 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"panoworld_jsonl: {_config_value(cfg.data.panoworld.jsonl)}")
         rank0_print(RANK, f"panoworld_image_root: {_config_value(cfg.data.panoworld.image_root)}")
         rank0_print(RANK, f"panoworld_keep_ratio: {_config_value(cfg.data.panoworld.keep_ratio)}")
+        rank0_print(RANK, f"panoworld_mixing_strategy: {_config_value(cfg.data.panoworld.mixing_strategy)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -334,6 +355,7 @@ def main():
             panoworld_keep_ratio=panoworld_cfg.keep_ratio,
             seed=cfg.training.seed,
             shuffle=cfg.data.shuffle,
+            mixing_strategy=panoworld_cfg.mixing_strategy,
         )
         if RANK == 0:
             source_counts = getattr(train_dataset, "source_counts", {})
@@ -342,7 +364,8 @@ def main():
                 "mixed_train_dataset: "
                 f"total={len(train_dataset)}, "
                 f"vln={source_counts.get('vln', 0)}, "
-                f"panoworld={source_counts.get('panoworld', 0)}",
+                f"panoworld={source_counts.get('panoworld', 0)}, "
+                f"mixing_strategy={panoworld_cfg.mixing_strategy}",
             )
 
     eval_dataset = None

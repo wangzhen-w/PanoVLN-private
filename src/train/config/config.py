@@ -31,6 +31,7 @@ class PanoWorldDataConfig:
     jsonl: Optional[str] = None
     image_root: Optional[str] = None
     keep_ratio: float = 0.0
+    mixing_strategy: str = "sample"
     max_samples: Optional[int] = None
     system_prompt: Optional[str] = None
     system_prompt_path: Optional[str] = (
