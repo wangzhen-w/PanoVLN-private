@@ -202,6 +202,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"erp_fourier_linear_alpha_value: {_config_value(cfg.model.erp_fourier_linear_alpha_value)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
+    rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
@@ -384,6 +385,7 @@ def main() -> None:
         rank0_print(RANK, "===== Effective model config =====")
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
+        rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         vision_config = getattr(model_config, "vision_config", None)
         rank0_print(

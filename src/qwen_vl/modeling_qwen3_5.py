@@ -11,7 +11,10 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGe
 
 
 PANOVGGT_AGGREGATOR_LAYER = -1
-PANOVGGT_CONTEXT_DIM = 2048
+PANOVGGT_AGGREGATOR_CONTEXT_DIM = 2048
+PANOVGGT_POINT_HIDDEN_DIM = 1024
+PANOVGGT_FEATURE_SOURCES = {"aggregator", "point_hidden"}
+PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -226,6 +229,8 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_enabled": False,
         "panovggt_checkpoint_path": "/workspace/code/a_property/model/PanoVGGT/model.pt",
         "panovggt_alpha_value": 0.1,
+        "panovggt_feature_source": "aggregator",
+        "panovggt_injection_stage": "post_merger",
         "panovggt_sampling_mode": "grouping",
         "panovggt_force_fp32": False,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
@@ -252,8 +257,30 @@ def _ensure_vendored_panovggt_available() -> None:
         sys.path.insert(0, src_root)
 
 
-def build_panovggt_model_from_vendored_config():
+def normalize_panovggt_feature_source(feature_source: str) -> str:
+    feature_source = str(feature_source).lower()
+    if feature_source not in PANOVGGT_FEATURE_SOURCES:
+        raise ValueError(
+            "panovggt_feature_source must be 'aggregator' or 'point_hidden', "
+            f"got {feature_source!r}"
+        )
+    return feature_source
+
+
+def normalize_panovggt_injection_stage(injection_stage: str) -> str:
+    injection_stage = str(injection_stage).lower()
+    if injection_stage not in PANOVGGT_INJECTION_STAGES:
+        raise ValueError(
+            "panovggt_injection_stage must be 'post_merger' or 'pre_merger', "
+            f"got {injection_stage!r}"
+        )
+    return injection_stage
+
+
+def build_panovggt_model_from_vendored_config(feature_source: str = "aggregator"):
     _ensure_vendored_panovggt_available()
+    feature_source = normalize_panovggt_feature_source(feature_source)
+    enable_point = feature_source == "point_hidden"
 
     try:
         from omegaconf import OmegaConf
@@ -278,7 +305,7 @@ def build_panovggt_model_from_vendored_config():
             embed_dim=cfg.embed_dim,
             enable_camera=False,
             enable_depth=False,
-            enable_point=False,
+            enable_point=enable_point,
             enable_global_points=False,
             aggregator=OmegaConf.to_container(mc.aggregator, resolve=True),
         )
@@ -310,13 +337,18 @@ def load_panovggt_checkpoint(model: nn.Module, checkpoint_path: str) -> None:
         for key, value in ckpt.items()
     }
     load_result = model.load_state_dict(state_dict, strict=False)
-    missing_aggregator_keys = [
-        key for key in getattr(load_result, "missing_keys", []) if key.startswith("aggregator.")
+    required_prefixes = ["aggregator."]
+    if bool(getattr(model, "enable_point", False)):
+        required_prefixes.extend(("point_decoder.", "pos_adapters.point."))
+    missing_required_keys = [
+        key
+        for key in getattr(load_result, "missing_keys", [])
+        if any(key.startswith(prefix) for prefix in required_prefixes)
     ]
-    if missing_aggregator_keys:
+    if missing_required_keys:
         raise RuntimeError(
-            "PanoVGGT checkpoint is missing aggregator weights, "
-            f"first missing key: {missing_aggregator_keys[0]}"
+            "PanoVGGT checkpoint is missing required weights, "
+            f"first missing key: {missing_required_keys[0]}"
         )
     freeze_panovggt_model(model)
 
@@ -327,8 +359,21 @@ class PanoVGGTGeometryMLP(nn.Module):
 
         self.enabled = bool(getattr(config, "panovggt_enabled", False))
         self.layer = PANOVGGT_AGGREGATOR_LAYER
-        self.context_dim = PANOVGGT_CONTEXT_DIM
-        self.output_dim = int(getattr(config, "panovggt_output_dim", config.text_config.hidden_size))
+        self.feature_source = normalize_panovggt_feature_source(
+            getattr(config, "panovggt_feature_source", "aggregator")
+        )
+        self.injection_stage = normalize_panovggt_injection_stage(
+            getattr(config, "panovggt_injection_stage", "post_merger")
+        )
+        self.context_dim = (
+            PANOVGGT_POINT_HIDDEN_DIM
+            if self.feature_source == "point_hidden"
+            else PANOVGGT_AGGREGATOR_CONTEXT_DIM
+        )
+        if self.injection_stage == "pre_merger":
+            self.output_dim = int(getattr(config.vision_config, "hidden_size"))
+        else:
+            self.output_dim = int(getattr(config, "panovggt_output_dim", config.text_config.hidden_size))
         self.hidden_dim = PANOVGGT_MLP_HIDDEN_SIZE
         self.sampling_mode = str(getattr(config, "panovggt_sampling_mode", "grouping")).lower()
         if self.sampling_mode not in {"singlepoint", "grouping"}:
@@ -508,6 +553,127 @@ class PanoVGGTGeometryMLP(nn.Module):
             dtype=dtype,
         )
 
+    def _to_qwen_pre_merger_order(
+        self,
+        tokens: torch.Tensor,
+        grid_h: int,
+        grid_w: int,
+    ) -> torch.Tensor:
+        if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
+            raise AssertionError(
+                "PanoVGGT pre-merger target grid is not divisible by Qwen spatial_merge_size: "
+                f"grid=({grid_h}, {grid_w}), spatial_merge_size={self.spatial_merge_size}"
+            )
+        if int(tokens.shape[0]) != int(grid_h * grid_w):
+            raise AssertionError(
+                "PanoVGGT pre-merger token length mismatch before Qwen order conversion: "
+                f"tokens={int(tokens.shape[0])}, grid=({grid_h}, {grid_w})"
+            )
+        tokens = tokens.reshape(
+            grid_h // self.spatial_merge_size,
+            self.spatial_merge_size,
+            grid_w // self.spatial_merge_size,
+            self.spatial_merge_size,
+            tokens.shape[-1],
+        )
+        tokens = tokens.permute(0, 2, 1, 3, 4).contiguous()
+        return tokens.reshape(grid_h * grid_w, -1)
+
+    def _point_decoder_xpos(
+        self,
+        *,
+        encoder: nn.Module,
+        pos_2d: torch.Tensor | None,
+        batch_frames: int,
+        token_count: int,
+        patch_start_idx: int,
+        patch_h: int,
+        patch_w: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if getattr(encoder.aggregator, "rope", None) is None:
+            return None
+        if pos_2d is not None:
+            if int(pos_2d.shape[0]) != batch_frames or int(pos_2d.shape[1]) != token_count:
+                raise AssertionError(
+                    "PanoVGGT point decoder xpos shape mismatch: "
+                    f"xpos={tuple(pos_2d.shape)}, expected=({batch_frames}, {token_count}, 2)"
+                )
+            return pos_2d
+        if not hasattr(encoder.aggregator, "position_getter"):
+            raise AssertionError("PanoVGGT point decoder requires aggregator.position_getter for RoPE xpos")
+        pos_2d = encoder.aggregator.position_getter(batch_frames, patch_h, patch_w, device)
+        pos_2d = pos_2d + 1
+        pos_special = torch.zeros(
+            batch_frames,
+            patch_start_idx,
+            2,
+            device=device,
+            dtype=pos_2d.dtype,
+        )
+        return torch.cat([pos_special, pos_2d], dim=1)
+
+    def _decode_point_hidden_tokens(
+        self,
+        *,
+        encoder: nn.Module,
+        tokens: torch.Tensor,
+        patch_start_idx: int,
+        image_h: int,
+        image_w: int,
+        pos_2d: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not hasattr(encoder, "point_decoder") or not hasattr(encoder, "_get_branch_pos_embed"):
+            raise AssertionError(
+                "panovggt_feature_source='point_hidden' requires PanoVGGT to be built with enable_point=True"
+            )
+        batch_size, num_frames, token_count, token_dim = [int(value) for value in tokens.shape]
+        if token_dim != PANOVGGT_AGGREGATOR_CONTEXT_DIM:
+            raise AssertionError(
+                "PanoVGGT point decoder expects aggregator tokens with "
+                f"{PANOVGGT_AGGREGATOR_CONTEXT_DIM} channels, got {token_dim}"
+            )
+        patch_size = int(getattr(encoder, "patch_size", 0))
+        patch_count = token_count - int(patch_start_idx)
+        patch_h, patch_w = self._infer_patch_grid(
+            patch_count=patch_count,
+            image_height=int(image_h),
+            image_width=int(image_w),
+            patch_size=patch_size,
+        )
+        batch_frames = batch_size * num_frames
+        decoder_tokens = tokens.reshape(batch_frames, token_count, token_dim)
+        decoder_xpos = self._point_decoder_xpos(
+            encoder=encoder,
+            pos_2d=pos_2d,
+            batch_frames=batch_frames,
+            token_count=token_count,
+            patch_start_idx=patch_start_idx,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            device=decoder_tokens.device,
+        )
+        pos_embed = encoder._get_branch_pos_embed(
+            patch_h,
+            patch_w,
+            patch_start_idx,
+            decoder_tokens.device,
+            decoder_tokens.dtype,
+            "point",
+            batch_frames,
+        )
+        point_hidden = encoder.point_decoder(decoder_tokens, pos_embed=pos_embed, xpos=decoder_xpos)
+        if point_hidden.ndim != 3:
+            raise AssertionError(
+                f"Expected PanoVGGT point hidden [B*S, P, C], got {tuple(point_hidden.shape)}"
+            )
+        if int(point_hidden.shape[0]) != batch_frames or int(point_hidden.shape[1]) != token_count:
+            raise AssertionError(
+                "PanoVGGT point hidden shape mismatch: "
+                f"point_hidden={tuple(point_hidden.shape)}, expected=({batch_frames}, {token_count}, C)"
+            )
+        return point_hidden.reshape(batch_size, num_frames, token_count, int(point_hidden.shape[-1]))
+
     def forward(
         self,
         panovggt_pixel_values: torch.Tensor,
@@ -541,16 +707,28 @@ class PanoVGGTGeometryMLP(nn.Module):
 
         with torch.no_grad():
             aggregated = encoder.aggregator(images)
-        if isinstance(aggregated, (list, tuple)):
-            token_list = aggregated[0]
-            patch_start_idx = int(aggregated[1])
-            tokens = token_list[self.layer] if isinstance(token_list, list) else token_list
-        else:
-            tokens = aggregated
-            patch_start_idx = 0
+            pos_2d = None
+            if isinstance(aggregated, (list, tuple)):
+                token_list = aggregated[0]
+                patch_start_idx = int(aggregated[1])
+                pos_2d = aggregated[2] if len(aggregated) > 2 else None
+                tokens = token_list[self.layer] if isinstance(token_list, list) else token_list
+            else:
+                tokens = aggregated
+                patch_start_idx = 0
 
-        if tokens.ndim != 4:
-            raise AssertionError(f"Expected PanoVGGT tokens [B, S, P, C], got {tuple(tokens.shape)}")
+            if tokens.ndim != 4:
+                raise AssertionError(f"Expected PanoVGGT tokens [B, S, P, C], got {tuple(tokens.shape)}")
+            _, _, _, image_h, image_w = images.shape
+            if self.feature_source == "point_hidden":
+                tokens = self._decode_point_hidden_tokens(
+                    encoder=encoder,
+                    tokens=tokens,
+                    patch_start_idx=patch_start_idx,
+                    image_h=int(image_h),
+                    image_w=int(image_w),
+                    pos_2d=pos_2d,
+                )
         tokens = tokens[:, -1, patch_start_idx:, :]
         if tokens.shape[-1] != self.context_dim:
             raise AssertionError(
@@ -594,8 +772,12 @@ class PanoVGGTGeometryMLP(nn.Module):
                     "PanoVGGT target grid is not divisible by Qwen spatial_merge_size: "
                     f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}"
                 )
-            target_h = max(1, grid_h // self.spatial_merge_size)
-            target_w = max(1, grid_w // self.spatial_merge_size)
+            if self.injection_stage == "pre_merger":
+                target_h = grid_h
+                target_w = grid_w
+            else:
+                target_h = max(1, grid_h // self.spatial_merge_size)
+                target_w = max(1, grid_w // self.spatial_merge_size)
             expected_len = target_h * target_w
             if expected_len != int(target_len):
                 raise AssertionError(
@@ -619,6 +801,8 @@ class PanoVGGTGeometryMLP(nn.Module):
                 )
             projected = self.output_norm(self.mlp(geo))
             projected = self.alpha.to(dtype=projected.dtype) * projected
+            if self.injection_stage == "pre_merger":
+                projected = self._to_qwen_pre_merger_order(projected, grid_h=grid_h, grid_w=grid_w)
             deltas.append(projected.to(device=output_device, dtype=output_dtype))
 
         return deltas
@@ -669,13 +853,18 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
         self._panovggt_device = None
+        self._panovggt_mlp_load_was_incompatible = False
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
+        self._pano_runtime_in_image_features = False
+        self._pano_runtime_visual_grid_thw = None
         self._install_pano_patch_embed_hook()
+        self._install_pano_merger_hook()
         self._install_image_feature_hook()
+        self.register_load_state_dict_pre_hook(self._drop_incompatible_panovggt_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
     def _erp_fourier_linear_enabled(self) -> bool:
@@ -686,6 +875,26 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
+
+    def _panovggt_feature_source(self) -> str:
+        if self.panovggt_mlp is not None:
+            return self.panovggt_mlp.feature_source
+        return normalize_panovggt_feature_source(getattr(self.config, "panovggt_feature_source", "aggregator"))
+
+    def _panovggt_injection_stage(self) -> str:
+        if self.panovggt_mlp is not None:
+            return self.panovggt_mlp.injection_stage
+        return normalize_panovggt_injection_stage(getattr(self.config, "panovggt_injection_stage", "post_merger"))
+
+    def _runtime_grid_matches_image_grid(self, grid_thw: torch.Tensor | None) -> bool:
+        runtime_grid = self._pano_runtime_grid_thw
+        if grid_thw is None or runtime_grid is None:
+            return False
+        if grid_thw is runtime_grid:
+            return True
+        if grid_thw.device == runtime_grid.device and tuple(grid_thw.shape) == tuple(runtime_grid.shape):
+            return grid_thw.data_ptr() == runtime_grid.data_ptr()
+        return False
 
     def _current_image_apply_mask(self, grid_thw: torch.Tensor) -> torch.Tensor:
         image_apply_mask = torch.zeros(
@@ -729,6 +938,188 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         visual.patch_embed.forward = MethodType(patch_embed_with_pano_adapters, visual.patch_embed)
 
+    def _select_panovggt_current_items(
+        self,
+        image_grid_thw: torch.Tensor,
+        num_image_outputs: int | None = None,
+    ) -> list[tuple[int, int]]:
+        current_indices = self._current_image_flat_indices(image_grid_thw)
+        if not current_indices:
+            return []
+        return [
+            (batch_index, image_index)
+            for batch_index, image_index in current_indices
+            if 0 <= image_index < int(image_grid_thw.shape[0])
+            and (num_image_outputs is None or image_index < num_image_outputs)
+        ]
+
+    def _panovggt_current_batch_inputs(
+        self,
+        *,
+        panovggt_pixel_values: torch.Tensor,
+        current_items: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        if panovggt_pixel_values is None or panovggt_pixel_values.numel() == 0:
+            raise AssertionError("PanoVGGT is enabled but panovggt_pixel_values is missing")
+        if int(panovggt_pixel_values.shape[0]) != len(current_items):
+            raise AssertionError(
+                "PanoVGGT current-image batch size mismatch: "
+                f"panovggt_batch={int(panovggt_pixel_values.shape[0])}, "
+                f"current_items={len(current_items)}"
+            )
+        batch_indices = torch.tensor(
+            [item[0] for item in current_items],
+            device=panovggt_pixel_values.device,
+            dtype=torch.long,
+        )
+        return panovggt_pixel_values.index_select(0, batch_indices)
+
+    def _target_geometry_for_indices(
+        self,
+        target_indices: list[int],
+    ) -> torch.Tensor | None:
+        geometry = self._pano_runtime_image_geometry
+        if geometry is None:
+            return None
+        return geometry[target_indices].detach().to(device="cpu", dtype=torch.float32)
+
+    def _apply_post_merger_panovggt_residual(self, vision_output, image_grid_thw: torch.Tensor):
+        if image_grid_thw is None or vision_output.pooler_output is None:
+            return vision_output
+
+        image_embeds = list(vision_output.pooler_output)
+        current_items = self._select_panovggt_current_items(image_grid_thw, num_image_outputs=len(image_embeds))
+        if not current_items:
+            return vision_output
+
+        panovggt_pixel_values = self._pano_runtime_panovggt_pixel_values
+        panovggt_inputs = self._panovggt_current_batch_inputs(
+            panovggt_pixel_values=panovggt_pixel_values,
+            current_items=current_items,
+        )
+        target_indices = [item[1] for item in current_items]
+        target_grid_thw = image_grid_thw[target_indices].detach().to(device="cpu", dtype=torch.long)
+        target_lengths = [int(image_embeds[index].shape[0]) for index in target_indices]
+        geometry = self._target_geometry_for_indices(target_indices)
+
+        panovggt_model = self._ensure_panovggt_model(
+            device=image_embeds[target_indices[0]].device,
+            dtype=image_embeds[target_indices[0]].dtype,
+        )
+        if panovggt_model is None or self.panovggt_mlp is None:
+            return vision_output
+        deltas = self.panovggt_mlp(
+            panovggt_inputs,
+            panovggt_model=panovggt_model,
+            target_grid_thw=target_grid_thw,
+            target_lengths=target_lengths,
+            image_erp_geometry=geometry,
+            output_device=image_embeds[target_indices[0]].device,
+            output_dtype=image_embeds[target_indices[0]].dtype,
+        )
+        for image_index, delta in zip(target_indices, deltas):
+            if delta.shape != image_embeds[image_index].shape:
+                raise AssertionError(
+                    "PanoVGGT delta shape mismatch: "
+                    f"delta={tuple(delta.shape)}, qwen={tuple(image_embeds[image_index].shape)}"
+                )
+            image_embeds[image_index] = image_embeds[image_index] + delta
+
+        vision_output.pooler_output = tuple(image_embeds)
+        return vision_output
+
+    def _apply_pre_merger_panovggt_residual(
+        self,
+        hidden_states: torch.Tensor,
+        image_grid_thw: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if image_grid_thw is None or hidden_states.numel() == 0:
+            return hidden_states
+
+        current_items = self._select_panovggt_current_items(image_grid_thw)
+        if not current_items:
+            return hidden_states
+
+        panovggt_pixel_values = self._pano_runtime_panovggt_pixel_values
+        panovggt_inputs = self._panovggt_current_batch_inputs(
+            panovggt_pixel_values=panovggt_pixel_values,
+            current_items=current_items,
+        )
+        target_indices = [item[1] for item in current_items]
+        target_grid_thw = image_grid_thw[target_indices].detach().to(device="cpu", dtype=torch.long)
+        target_lengths = [
+            int(num_frames * grid_h * grid_w)
+            for num_frames, grid_h, grid_w in target_grid_thw.tolist()
+        ]
+        geometry = self._target_geometry_for_indices(target_indices)
+
+        panovggt_model = self._ensure_panovggt_model(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        if panovggt_model is None or self.panovggt_mlp is None:
+            return hidden_states
+        deltas = self.panovggt_mlp(
+            panovggt_inputs,
+            panovggt_model=panovggt_model,
+            target_grid_thw=target_grid_thw,
+            target_lengths=target_lengths,
+            image_erp_geometry=geometry,
+            output_device=hidden_states.device,
+            output_dtype=hidden_states.dtype,
+        )
+
+        split_lengths = [
+            int(num_frames * grid_h * grid_w)
+            for num_frames, grid_h, grid_w in image_grid_thw.detach().to(device="cpu", dtype=torch.long).tolist()
+        ]
+        offsets = []
+        offset = 0
+        for length in split_lengths:
+            offsets.append(offset)
+            offset += length
+        if offset != int(hidden_states.shape[0]):
+            raise AssertionError(
+                "Qwen pre-merger hidden length does not match image_grid_thw: "
+                f"hidden={int(hidden_states.shape[0])}, grid_total={offset}"
+            )
+
+        hidden_states = hidden_states.clone()
+        for image_index, delta in zip(target_indices, deltas):
+            start = offsets[image_index]
+            length = split_lengths[image_index]
+            if tuple(delta.shape) != (length, int(hidden_states.shape[-1])):
+                raise AssertionError(
+                    "PanoVGGT pre-merger delta shape mismatch: "
+                    f"delta={tuple(delta.shape)}, qwen=({length}, {int(hidden_states.shape[-1])})"
+                )
+            hidden_states[start:start + length] = hidden_states[start:start + length] + delta
+        return hidden_states
+
+    def _install_pano_merger_hook(self) -> None:
+        if not self._panovggt_enabled() or self._panovggt_injection_stage() != "pre_merger":
+            return
+        visual = self.model.visual
+        if hasattr(visual.merger, "_pano_origin_forward"):
+            return
+
+        visual.merger._pano_origin_forward = visual.merger.forward
+        owner = self
+
+        def merger_with_pano_pre_merger_residual(this, hidden_states):
+            if (
+                owner._panovggt_enabled()
+                and owner._panovggt_injection_stage() == "pre_merger"
+                and owner._pano_runtime_in_image_features
+            ):
+                hidden_states = owner._apply_pre_merger_panovggt_residual(
+                    hidden_states=hidden_states,
+                    image_grid_thw=owner._pano_runtime_visual_grid_thw,
+                )
+            return this._pano_origin_forward(hidden_states)
+
+        visual.merger.forward = MethodType(merger_with_pano_pre_merger_residual, visual.merger)
+
     def _install_image_feature_hook(self) -> None:
         if not self._panovggt_enabled():
             return
@@ -739,75 +1130,25 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         owner = self
 
         def get_image_features_with_pano_residuals(this, pixel_values, image_grid_thw=None, **kwargs):
-            vision_output = this._pano_origin_get_image_features(
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                **kwargs,
-            )
-            if image_grid_thw is None or vision_output.pooler_output is None:
+            is_image_visual_call = owner._runtime_grid_matches_image_grid(image_grid_thw)
+            previous_in_image_features = owner._pano_runtime_in_image_features
+            previous_visual_grid = owner._pano_runtime_visual_grid_thw
+            owner._pano_runtime_in_image_features = is_image_visual_call
+            owner._pano_runtime_visual_grid_thw = image_grid_thw if is_image_visual_call else None
+            try:
+                vision_output = this._pano_origin_get_image_features(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    **kwargs,
+                )
+            finally:
+                owner._pano_runtime_in_image_features = previous_in_image_features
+                owner._pano_runtime_visual_grid_thw = previous_visual_grid
+            if not is_image_visual_call:
                 return vision_output
-
-            current_indices = owner._current_image_flat_indices(image_grid_thw)
-            if not current_indices:
+            if owner._panovggt_injection_stage() == "pre_merger":
                 return vision_output
-
-            image_embeds = list(vision_output.pooler_output)
-            current_items = [
-                (batch_index, image_index)
-                for batch_index, image_index in current_indices
-                if 0 <= image_index < len(image_embeds)
-            ]
-            if not current_items:
-                return vision_output
-
-            panovggt_pixel_values = owner._pano_runtime_panovggt_pixel_values
-            if owner._panovggt_enabled():
-                if panovggt_pixel_values is None or panovggt_pixel_values.numel() == 0:
-                    raise AssertionError("PanoVGGT is enabled but panovggt_pixel_values is missing")
-                if int(panovggt_pixel_values.shape[0]) != len(current_items):
-                    raise AssertionError(
-                        "PanoVGGT current-image batch size mismatch: "
-                        f"panovggt_batch={int(panovggt_pixel_values.shape[0])}, "
-                        f"current_items={len(current_items)}"
-                    )
-                panovggt_items = list(current_items)
-                if panovggt_items:
-                    batch_indices = torch.tensor(
-                        [item[0] for item in panovggt_items],
-                        device=panovggt_pixel_values.device,
-                        dtype=torch.long,
-                    )
-                    target_indices = [item[1] for item in panovggt_items]
-                    target_grid_thw = image_grid_thw[target_indices].detach().to(device="cpu", dtype=torch.long)
-                    target_lengths = [int(image_embeds[index].shape[0]) for index in target_indices]
-                    geometry = owner._pano_runtime_image_geometry
-                    if geometry is not None:
-                        geometry = geometry[target_indices].detach().to(device="cpu", dtype=torch.float32)
-
-                    panovggt_model = owner._ensure_panovggt_model(
-                        device=image_embeds[target_indices[0]].device,
-                        dtype=image_embeds[target_indices[0]].dtype,
-                    )
-                    if panovggt_model is None or owner.panovggt_mlp is None:
-                        return vision_output
-                    deltas = owner.panovggt_mlp(
-                        panovggt_pixel_values.index_select(0, batch_indices),
-                        panovggt_model=panovggt_model,
-                        target_grid_thw=target_grid_thw,
-                        target_lengths=target_lengths,
-                        image_erp_geometry=geometry,
-                        output_device=image_embeds[target_indices[0]].device,
-                        output_dtype=image_embeds[target_indices[0]].dtype,
-                    )
-                    for image_index, delta in zip(target_indices, deltas):
-                        if delta.shape != image_embeds[image_index].shape:
-                            raise AssertionError(
-                                "PanoVGGT delta shape mismatch: "
-                                f"delta={tuple(delta.shape)}, qwen={tuple(image_embeds[image_index].shape)}"
-                            )
-                        image_embeds[image_index] = image_embeds[image_index] + delta
-
-            vision_output.pooler_output = tuple(image_embeds)
+            vision_output = owner._apply_post_merger_panovggt_residual(vision_output, image_grid_thw)
             return vision_output
 
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
@@ -833,12 +1174,53 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
         self._pano_runtime_panovggt_pixel_values = None
+        self._pano_runtime_in_image_features = False
+        self._pano_runtime_visual_grid_thw = None
+
+    def _drop_incompatible_panovggt_mlp_pre_hook(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        if self.panovggt_mlp is None:
+            return
+        key_prefix = f"{prefix}panovggt_mlp."
+        checkpoint_keys = [key for key in state_dict.keys() if key.startswith(key_prefix)]
+        if not checkpoint_keys:
+            return
+        target_state = self.panovggt_mlp.state_dict()
+        incompatible = False
+        unknown_keys = []
+        for key in checkpoint_keys:
+            local_key = key[len(key_prefix) :]
+            target_tensor = target_state.get(local_key)
+            source_tensor = state_dict[key]
+            if target_tensor is None:
+                unknown_keys.append(key)
+                continue
+            if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+                incompatible = True
+                break
+        if not incompatible:
+            for key in unknown_keys:
+                del state_dict[key]
+            return
+        for key in checkpoint_keys:
+            del state_dict[key]
+        self._panovggt_mlp_load_was_incompatible = True
 
     def _load_external_panovggt_weights(self) -> None:
         if not self._panovggt_enabled():
             return
         if self.panovggt is None:
-            self.panovggt = build_panovggt_model_from_vendored_config()
+            self.panovggt = build_panovggt_model_from_vendored_config(self._panovggt_feature_source())
         load_panovggt_checkpoint(
             self.panovggt,
             str(getattr(self.config, "panovggt_checkpoint_path")),
@@ -920,14 +1302,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return False
 
         if self.panovggt is None:
-            self.panovggt = build_panovggt_model_from_vendored_config()
+            self.panovggt = build_panovggt_model_from_vendored_config(self._panovggt_feature_source())
 
         incompatible = self.panovggt.load_state_dict(state_dict, strict=False)
         if incompatible.missing_keys or incompatible.unexpected_keys:
-            raise RuntimeError(
-                "Saved PanoVGGT checkpoint keys do not match the vendored PanoVGGT model: "
-                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
-            )
+            self.panovggt = None
+            self._panovggt_weights_ready = False
+            return False
         freeze_panovggt_model(self.panovggt)
         self._panovggt_weights_ready = True
         self._panovggt_device = None
@@ -946,7 +1327,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if not self._panovggt_enabled():
             return None
         if self.panovggt is None:
-            self.panovggt = build_panovggt_model_from_vendored_config()
+            self.panovggt = build_panovggt_model_from_vendored_config(self._panovggt_feature_source())
         if not self._panovggt_weights_ready:
             self._load_external_panovggt_weights()
         if bool(getattr(self.config, "panovggt_force_fp32", False)):
@@ -1070,9 +1451,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if (
             panovggt_module is not None
             and panovggt_module.enabled
-            and any(key.startswith("panovggt_mlp.") for key in missing_keys)
+            and (
+                self._panovggt_mlp_load_was_incompatible
+                or any(key.startswith("panovggt_mlp.") for key in missing_keys)
+            )
         ):
             panovggt_module.reset_parameters()
+            self._panovggt_mlp_load_was_incompatible = False
         if panovggt_module is not None and panovggt_module.enabled:
             if any(key.startswith("panovggt.") for key in missing_keys):
                 self._load_external_panovggt_weights()

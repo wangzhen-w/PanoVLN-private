@@ -114,6 +114,8 @@ def _load_model_config(cfg):
         "panovggt_enabled",
         "panovggt_checkpoint_path",
         "panovggt_alpha_value",
+        "panovggt_feature_source",
+        "panovggt_injection_stage",
         "panovggt_sampling_mode",
         "panovggt_force_fp32",
     )
@@ -143,12 +145,15 @@ def _load_model_config(cfg):
 
     def apply_module_fields_preserve_checkpoint(enabled: bool, field_names: tuple[str, ...]) -> None:
         checkpoint_enabled = bool(getattr(config, field_names[0], False))
+        if enabled:
+            apply_module_fields(True, field_names)
+            return
         if checkpoint_enabled:
             for field_name in field_names:
                 if not hasattr(config, field_name):
                     setattr(config, field_name, getattr(cfg.model, field_name))
             return
-        apply_module_fields(enabled, field_names)
+        apply_module_fields(False, field_names)
 
     apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:

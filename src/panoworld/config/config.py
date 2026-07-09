@@ -22,6 +22,7 @@ class ModelConfig:
     panovggt_enabled: bool = True
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.05
+    panovggt_feature_source: str = "aggregator"
     panovggt_sampling_mode: str = "grouping"
     panovggt_force_fp32: bool = False
 

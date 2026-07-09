@@ -19,6 +19,7 @@ model:
   panovggt_enabled: false
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.05
+  panovggt_feature_source: "aggregator"
   panovggt_sampling_mode: "grouping"
   panovggt_force_fp32: false
 
