@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -14,23 +14,32 @@ class ModelConfig:
     image_token: str = "<image>"
     model_max_length: Optional[int] = None
     trainable_modules: Optional[Dict[str, bool]] = None
-    erp_pos_enabled: bool = False
-    erp_pos_hidden_size: Optional[int] = None
-    erp_pos_alpha_value: float = 0.02
-    erp_assume_centered: bool = True
-    erp_center_latitude_deg: float = 0.0
-    erp_apply_to_current_only: bool = True
     erp_top_crop_degrees: float = 20.0
     erp_bottom_crop_degrees: float = 20.0
+    erp_fourier_linear_enabled: bool = False
+    erp_fourier_linear_alpha_value: float = 0.005
     panovggt_enabled: bool = False
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.1
     panovggt_sampling_mode: str = "grouping"
     panovggt_force_fp32: bool = False
-    action_bearing_enabled: bool = False
-    action_bearing_key_alpha_value: float = 0.02
-    action_bearing_value_alpha_value: float = 0.05
-    action_bearing_inject_layers: Optional[Union[int, List[int]]] = None
+
+
+@dataclass
+class PanoWorldDataConfig:
+    enabled: bool = False
+    jsonl: Optional[str] = None
+    image_root: Optional[str] = None
+    keep_ratio: float = 0.0
+    mixing_strategy: str = "sample"
+    max_samples: Optional[int] = None
+    system_prompt: Optional[str] = None
+    system_prompt_path: Optional[str] = (
+        "/workspace/code/VLN/src/panoworld/config/system_prompts/erp_multimodal_prompts.txt"
+    )
+    top_crop_degrees: float = 0.0
+    bottom_crop_degrees: float = 0.0
+    auto_insert_media_placeholders: bool = True
 
 
 @dataclass
@@ -45,7 +54,7 @@ class DataConfig:
     action_vocab: Optional[List[str]] = None
     f1_action_weight: Optional[List[float]] = None
     prompt_format: str = "chat_template"
-    trace_enable: bool = False
+    panoworld: PanoWorldDataConfig = field(default_factory=PanoWorldDataConfig)
 
 
 @dataclass
@@ -58,9 +67,8 @@ class TrainingConfig:
     language_model_lr: Optional[float] = None
     visual_lr: Optional[float] = None
     visual_merger_lr: Optional[float] = None
-    erp_position_mlp_lr: Optional[float] = None
+    erp_fourier_linear_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
-    action_bearing_kv_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10
@@ -127,6 +135,10 @@ def load_config(path: str) -> TrainConfig:
     training = raw.get("training", {})
     run = raw.get("run", {})
     wandb = raw.get("wandb", None)
+    if "panoworld" in data:
+        data = dict(data)
+        panoworld = data.get("panoworld") or {}
+        data["panoworld"] = PanoWorldDataConfig(**panoworld)
 
     return TrainConfig(
         model=ModelConfig(**model),

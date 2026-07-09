@@ -1,0 +1,98 @@
+model:
+  name_or_path: "/workspace/code/a_property/model/Qwen3.5-4B"
+  trust_remote_code: false
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  cache_dir: null
+  image_token: "<|image_pad|>"
+  model_max_length: 163840
+  trainable_modules:
+    visual: true
+    visual_merger: true
+    language_model: true
+    erp_fourier_linear_adapter: true
+    panovggt_mlp: false
+  erp_top_crop_degrees: 0.0
+  erp_bottom_crop_degrees: 0.0
+  erp_fourier_linear_enabled: true
+  erp_fourier_linear_alpha_value: 0.01
+  panovggt_enabled: false
+  panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
+  panovggt_alpha_value: 0.05
+  panovggt_sampling_mode: "grouping"
+  panovggt_force_fp32: false
+
+data:
+  train_jsonl: "/workspace/data1/dataset/Panoworld/train_outdoor.jsonl"
+  eval_jsonl: null
+  train_image_root: "/workspace/data1/dataset/Panoworld"
+  eval_image_root: null
+  train_max_samples: null
+  eval_max_samples: null
+  shuffle: true
+  eval_shuffle: false
+  prompt_format: "chat_template"
+  system_prompt: null
+  system_prompt_path: "/workspace/code/VLN/src/panoworld/config/system_prompts/erp_multimodal_prompts.txt"
+  auto_insert_media_placeholders: true
+  image_processor:
+    min_pixels: 16384
+    max_pixels: 460800
+    size:
+      shortest_edge: 16384
+      longest_edge: 460800
+
+training:
+  output_dir: "/workspace/data1/model/panoworld/panovln_fourier001"
+  seed: 42
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-6
+  language_model_lr: 1.0e-6
+  visual_lr: 1.0e-6
+  visual_merger_lr: 1.0e-6
+  erp_fourier_linear_lr: 1.0e-6
+  panovggt_mlp_lr: 1.0e-6
+  weight_decay: 0.01
+  num_train_epochs: 1
+  logging_steps: 5
+  save_steps: 300
+  eval_steps: 300
+  max_steps: -1
+  eval_strategy: "no"
+  save_strategy: "steps"
+  save_model_at_end: true
+  max_shard_size: "5GB"
+  load_best_model_at_end: false
+  metric_for_best_model: null
+  greater_is_better: null
+  save_total_limit: 2
+  warmup_steps: 0.03
+  lr_scheduler_type: "cosine"
+  fp16: false
+  bf16: true
+  optim: "adamw_torch"
+  report_to: ["wandb"]
+  run_name: null
+  remove_unused_columns: false
+  dataloader_num_workers: 6
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  deepspeed: "/workspace/code/VLN/scripts/zero2.json"
+
+run:
+  do_train: true
+  do_eval: false
+  resume_from_checkpoint: false
+
+wandb:
+  project: "PanoWorld-PanoVLN"
+  entity: null
+  name: null
+  tags: null
+  mode: "offline"
+  group: null
+  notes: null
+  id: null
+  resume: "never"

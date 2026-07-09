@@ -422,12 +422,6 @@ class PanoVLN_Agent(Agent):
             model_path,
             **model_init_kwargs,
         )
-        action_attention_layers = getattr(self.model, "_pano_action_bearing_attention_layers", None)
-        action_inject_layers = getattr(self.model, "_pano_action_bearing_inject_layers", None)
-        if action_attention_layers is not None:
-            print(f"action_bearing_full_attention_layers: {list(action_attention_layers)}", flush=True)
-        if action_inject_layers is not None:
-            print(f"action_bearing_actual_inject_layers: {list(action_inject_layers)}", flush=True)
 
         if lora_path is not None and lora_path!= '':
             print('Loading LoRA weights...')

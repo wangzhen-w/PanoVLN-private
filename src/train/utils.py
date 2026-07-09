@@ -26,9 +26,8 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual": True,
     "visual_merger": True,
     "language_model": True,
-    "erp_position_mlp": True,
+    "erp_fourier_linear_adapter": True,
     "panovggt_mlp": True,
-    "action_bearing_kv": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,9 +73,8 @@ def set_model(cfg, model):
             getattr(visual_model, "merger", None)
             if visual_model is not None else None
         ),
-        "erp_position_mlp": getattr(model, "erp_position_mlp", None),
+        "erp_fourier_linear_adapter": getattr(model, "erp_fourier_linear_adapter", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
-        "action_bearing_kv": getattr(model, "action_bearing_kv", None),
         "language_model": language_model,
     }
 
@@ -104,13 +102,9 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
-    erp_fields = (
-        "erp_pos_enabled",
-        "erp_pos_hidden_size",
-        "erp_pos_alpha_value",
-        "erp_assume_centered",
-        "erp_center_latitude_deg",
-        "erp_apply_to_current_only",
+    erp_fourier_linear_fields = (
+        "erp_fourier_linear_enabled",
+        "erp_fourier_linear_alpha_value",
     )
     erp_crop_fields = (
         "erp_top_crop_degrees",
@@ -122,12 +116,6 @@ def _load_model_config(cfg):
         "panovggt_alpha_value",
         "panovggt_sampling_mode",
         "panovggt_force_fp32",
-    )
-    action_bearing_fields = (
-        "action_bearing_enabled",
-        "action_bearing_key_alpha_value",
-        "action_bearing_value_alpha_value",
-        "action_bearing_inject_layers",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -153,20 +141,6 @@ def _load_model_config(cfg):
             if hasattr(vision_config, field_name):
                 delattr(vision_config, field_name)
 
-    def apply_vision_module_fields_preserve_checkpoint(enabled: bool, field_names: tuple[str, ...]) -> None:
-        vision_config = getattr(config, "vision_config", None)
-        if vision_config is None:
-            return
-        checkpoint_enabled = bool(getattr(vision_config, field_names[0], False))
-        if checkpoint_enabled:
-            for field_name in field_names:
-                if not hasattr(vision_config, field_name):
-                    value = getattr(cfg.model, field_name)
-                    if value is not None:
-                        setattr(vision_config, field_name, value)
-            return
-        apply_vision_module_fields(enabled, field_names)
-
     def apply_module_fields_preserve_checkpoint(enabled: bool, field_names: tuple[str, ...]) -> None:
         checkpoint_enabled = bool(getattr(config, field_names[0], False))
         if checkpoint_enabled:
@@ -176,12 +150,10 @@ def _load_model_config(cfg):
             return
         apply_module_fields(enabled, field_names)
 
-    apply_vision_module_fields_preserve_checkpoint(bool(cfg.model.erp_pos_enabled), erp_fields)
+    apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:
-        if not hasattr(config, field_name):
-            setattr(config, field_name, getattr(cfg.model, field_name))
+        setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
-    apply_module_fields_preserve_checkpoint(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     return config
 
 
