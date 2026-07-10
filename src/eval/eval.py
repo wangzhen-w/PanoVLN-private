@@ -58,7 +58,6 @@ ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
 STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
 ACTION_SEQUENCE_LENGTH = 4
-REPLAN_ACTION_COUNT_WITHOUT_STOP = 4
 ATOMIC_ACTION_VARIANTS = {
     "stop": ("stop",),
     "forward": ("forward", "move_forward", "move forward", "move-forward"),
@@ -577,7 +576,7 @@ class PanoVLN_Agent(Agent):
             return [STOP_ACTION_ID]
         if STOP_ACTION_ID in action_ids:
             return action_ids[:action_ids.index(STOP_ACTION_ID) + 1]
-        return action_ids[:REPLAN_ACTION_COUNT_WITHOUT_STOP]
+        return action_ids
 
     def finalize_episode(self):
         self._record_previous_action()

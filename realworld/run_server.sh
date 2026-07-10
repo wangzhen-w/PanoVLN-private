@@ -8,7 +8,7 @@ echo "Switched to directory: $PROJECT_ROOT"
 
 HOST="0.0.0.0"
 PORT="8000"
-MODEL_PATH="/workspace/data1/model/ablation_new/action_new/FourierLinear_0.005"
+MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
 GPU_IDS="4"
 PANOVGGT_CHECKPOINT=""
 ATTN_IMPLEMENTATION="flash_attention_2"

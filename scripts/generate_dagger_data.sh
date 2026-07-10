@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data1/model/ablation_new/action_new/FourierLinear_0.005"
+MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
 OUTPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 REFERENCE_INPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 DAGGER_DATASET_NAME="dagger"

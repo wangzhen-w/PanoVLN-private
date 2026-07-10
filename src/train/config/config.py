@@ -17,7 +17,8 @@ class ModelConfig:
     erp_top_crop_degrees: float = 20.0
     erp_bottom_crop_degrees: float = 20.0
     erp_fourier_linear_enabled: bool = False
-    erp_fourier_linear_alpha_value: float = 0.005
+    erp_fourier_linear_alpha_value: float = 0.01
+    erp_fourier_linear_apply_to_current_only: bool = True
     panovggt_enabled: bool = False
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.1

@@ -40,10 +40,9 @@ from src.train.data.data import (
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
 
-DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/action_new/FourierLinear_0.005"
+DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
 ACTION_WORDS = ("stop", "forward", "left", "right")
 ACTION_SEQUENCE_LENGTH = 4
-REPLAN_ACTION_COUNT_WITHOUT_STOP = 4
 DEFAULT_REALWORLD_GENERATION_KWARGS = {
     "max_new_tokens": 24,
     "temperature": 0,
@@ -159,7 +158,7 @@ def build_executable_action_queue(actions: Iterable[str]) -> list[str]:
         return ["stop"]
     if "stop" in action_list:
         return action_list[: action_list.index("stop") + 1]
-    return action_list[:REPLAN_ACTION_COUNT_WITHOUT_STOP]
+    return action_list
 
 
 class PanoVLNPredictor:

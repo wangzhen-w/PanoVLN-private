@@ -29,9 +29,6 @@ RANK = int(os.environ.get("RANK", "0"))
 
 
 class PanoVLNTrainer(Trainer):
-    RAW_ALPHA_NO_DECAY_SUFFIXES = (
-        "erp_fourier_linear_adapter.gate",
-    )
     MODULE_LR_KEYS = (
         "language_model",
         "visual",
@@ -52,14 +49,6 @@ class PanoVLNTrainer(Trainer):
             for name, lr in (module_learning_rates or {}).items()
             if lr is not None
         }
-
-    def get_decay_parameter_names(self, model):
-        decay_parameter_names = super().get_decay_parameter_names(model)
-        return [
-            name
-            for name in decay_parameter_names
-            if not name.endswith(self.RAW_ALPHA_NO_DECAY_SUFFIXES)
-        ]
 
     @staticmethod
     def _name_has_module(name: str, module_name: str) -> bool:
@@ -214,6 +203,11 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
     rank0_print(RANK, f"erp_fourier_linear_enabled: {_config_value(cfg.model.erp_fourier_linear_enabled)}")
     rank0_print(RANK, f"erp_fourier_linear_alpha_value: {_config_value(cfg.model.erp_fourier_linear_alpha_value)}")
+    rank0_print(
+        RANK,
+        "erp_fourier_linear_apply_to_current_only: "
+        f"{_config_value(cfg.model.erp_fourier_linear_apply_to_current_only)}",
+    )
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
@@ -313,6 +307,11 @@ def main():
             RANK,
             "erp_fourier_linear_alpha_value: "
             f"{_config_value(getattr(vision_config, 'erp_fourier_linear_alpha_value', None))}",
+        )
+        rank0_print(
+            RANK,
+            "erp_fourier_linear_apply_to_current_only: "
+            f"{_config_value(getattr(vision_config, 'erp_fourier_linear_apply_to_current_only', None))}",
         )
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root

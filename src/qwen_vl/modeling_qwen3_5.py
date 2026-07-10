@@ -21,6 +21,8 @@ SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
 VENDORED_PANOVGGT_CONFIG_PATH = VENDORED_PANOVGGT_DIR / "training" / "config" / "default.yaml"
 ERP_ANGLE_EPS = 1e-6
+ERP_FOURIER_NUM_HARMONICS = 16
+ERP_FOURIER_ENCODING_DIM = ERP_FOURIER_NUM_HARMONICS * 4
 
 
 def validate_erp_angles(vertical_fov: float, center_latitude: float) -> tuple[float, float]:
@@ -32,20 +34,46 @@ def validate_erp_angles(vertical_fov: float, center_latitude: float) -> tuple[fl
     return min(vertical_fov, math.pi), max(-half_pi, min(half_pi, center_latitude))
 
 
-def build_erp_base_angles(
+def reorder_erp_features_to_qwen_patch_order(
+    features: torch.Tensor,
     *,
+    num_frames: int,
     height: int,
     width: int,
-    device: torch.device,
-    vertical_fov: float,
-    center_latitude: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
-    ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
-    xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
-    pitch = (ys[:, None] / float(height) - 0.5) * vertical_fov + center_latitude
-    yaw = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
-    return pitch.expand(height, width), yaw.expand(height, width)
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    num_frames = int(num_frames)
+    height = int(height)
+    width = int(width)
+    spatial_merge_size = int(spatial_merge_size)
+    if num_frames <= 0:
+        raise AssertionError(f"ERP Fourier num_frames must be positive, got {num_frames}")
+    if spatial_merge_size <= 0:
+        raise AssertionError(
+            f"ERP Fourier spatial_merge_size must be positive, got {spatial_merge_size}"
+        )
+    if height % spatial_merge_size != 0 or width % spatial_merge_size != 0:
+        raise AssertionError(
+            "ERP Fourier grid is not divisible by Qwen spatial_merge_size: "
+            f"grid=({height}, {width}), spatial_merge_size={spatial_merge_size}"
+        )
+    if features.ndim != 2 or int(features.shape[0]) != height * width:
+        raise AssertionError(
+            "ERP Fourier row-major feature shape mismatch before Qwen order conversion: "
+            f"features={tuple(features.shape)}, grid=({height}, {width})"
+        )
+
+    ordered = features.reshape(
+        height // spatial_merge_size,
+        spatial_merge_size,
+        width // spatial_merge_size,
+        spatial_merge_size,
+        features.shape[-1],
+    )
+    ordered = ordered.permute(0, 2, 1, 3, 4).contiguous().reshape(height * width, -1)
+    if num_frames > 1:
+        ordered = ordered.repeat(num_frames, 1)
+    return ordered
 
 
 def build_erp_fourier_features(
@@ -53,49 +81,42 @@ def build_erp_fourier_features(
     num_frames: int,
     height: int,
     width: int,
+    spatial_merge_size: int,
     device: torch.device,
     dtype: torch.dtype,
     vertical_fov: float,
     center_latitude: float,
-    feature_size: int,
 ) -> torch.Tensor:
-    pitch, yaw = build_erp_base_angles(
-        height=height,
-        width=width,
-        device=device,
-        vertical_fov=vertical_fov,
-        center_latitude=center_latitude,
-    )
-    features_per_band = 4
-    num_bands = max(1, math.ceil(int(feature_size) / features_per_band))
-    max_freq = max(float(max(height, width)), 1.0)
-    # Yaw is a periodic longitude angle: only integer harmonics keep the
-    # ERP left/right boundary continuous under yaw +/- 2pi.
-    yaw_scales = torch.linspace(
-        1.0,
-        max_freq,
-        steps=num_bands,
-        device=device,
-        dtype=torch.float32,
-    ).round().clamp_min_(1.0)
-    pitch_scales = 2.0 ** torch.linspace(
-        0.0,
-        math.log2(max_freq),
-        steps=num_bands,
+    vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
+    ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
+    xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
+
+    # image_erp_geometry stores its vertical center in image-row coordinates
+    # (positive down). Convert it here to the physical positive-up pitch used
+    # by the ERP prompt without changing PanoVGGT's validated sampling path.
+    pitch = (0.5 - ys[:, None] / float(height)) * vertical_fov - center_latitude
+    yaw = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
+    pitch = pitch.expand(height, width)
+    yaw = yaw.expand(height, width)
+
+    scales = torch.arange(
+        1,
+        ERP_FOURIER_NUM_HARMONICS + 1,
         device=device,
         dtype=torch.float32,
     )
-    yaw_phase = yaw.reshape(height * width, 1) * yaw_scales
-    pitch_phase = pitch.reshape(height * width, 1) * pitch_scales
+    yaw_phase = yaw.reshape(height * width, 1) * scales
+    pitch_phase = pitch.reshape(height * width, 1) * scales
     yaw_features = torch.stack([yaw_phase.sin(), yaw_phase.cos()], dim=-1).reshape(height * width, -1)
     pitch_features = torch.stack([pitch_phase.sin(), pitch_phase.cos()], dim=-1).reshape(height * width, -1)
     embeddings = torch.cat([yaw_features, pitch_features], dim=-1)
-    if embeddings.shape[-1] > int(feature_size):
-        embeddings = embeddings[:, : int(feature_size)]
-    elif embeddings.shape[-1] < int(feature_size):
-        embeddings = F.pad(embeddings, (0, int(feature_size) - embeddings.shape[-1]))
-    if num_frames > 1:
-        embeddings = embeddings.repeat(num_frames, 1)
+    embeddings = reorder_erp_features_to_qwen_patch_order(
+        embeddings,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        spatial_merge_size=spatial_merge_size,
+    )
     return embeddings.to(dtype=dtype)
 
 
@@ -108,7 +129,8 @@ def infer_erp_vertical_fov_radians(height: int, width: int) -> float:
 def ensure_erp_fourier_linear_config(vision_config) -> None:
     defaults = {
         "erp_fourier_linear_enabled": False,
-        "erp_fourier_linear_alpha_value": 0.005,
+        "erp_fourier_linear_alpha_value": 0.01,
+        "erp_fourier_linear_apply_to_current_only": True,
     }
     for field_name, default_value in defaults.items():
         if not hasattr(vision_config, field_name):
@@ -122,24 +144,23 @@ class ERPFourierLinearAdapter(nn.Module):
 
         self.enabled = bool(getattr(config, "erp_fourier_linear_enabled", False))
         self.output_hidden_size = int(config.hidden_size)
-        self.fourier_feature_size = min(256, self.output_hidden_size)
-        self.alpha_init = float(getattr(config, "erp_fourier_linear_alpha_value", 0.005))
-        self.apply_to_current_only = True
+        self.alpha_init = float(getattr(config, "erp_fourier_linear_alpha_value", 0.01))
+        self.apply_to_current_only = bool(
+            getattr(config, "erp_fourier_linear_apply_to_current_only", True)
+        )
+        self.spatial_merge_size = int(getattr(config, "spatial_merge_size", 2))
         if self.enabled and self.alpha_init <= 0.0:
             raise ValueError(
                 "erp_fourier_linear_alpha_value must be positive when ERP Fourier linear is enabled; "
                 "use erp_fourier_linear_enabled=false to disable the adapter."
             )
 
-        self.input_norm = nn.LayerNorm(self.fourier_feature_size)
-        self.proj = nn.Linear(self.fourier_feature_size, self.output_hidden_size, bias=False)
-        self.gate = nn.Parameter(torch.tensor(self.alpha_init, dtype=torch.float32))
+        self.proj = nn.Linear(ERP_FOURIER_ENCODING_DIM, self.output_hidden_size, bias=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        self.input_norm.reset_parameters()
-        nn.init.zeros_(self.proj.weight)
-        self.gate.data.fill_(self.alpha_init)
+        init_std = self.alpha_init * math.sqrt(2.0 / float(ERP_FOURIER_ENCODING_DIM))
+        nn.init.normal_(self.proj.weight, mean=0.0, std=init_std)
 
     def apply_to_patch_tokens(
         self,
@@ -203,19 +224,18 @@ class ERPFourierLinearAdapter(nn.Module):
                 num_frames=int(num_frames),
                 height=int(height),
                 width=int(width),
+                spatial_merge_size=self.spatial_merge_size,
                 device=param_device,
                 dtype=param_dtype,
                 vertical_fov=vertical_fov,
                 center_latitude=center_latitude,
-                feature_size=self.fourier_feature_size,
             )
             if int(fourier_features.shape[0]) != int(tokens.shape[0]):
                 raise AssertionError(
                     "ERP Fourier linear feature count mismatch: "
                     f"features={int(fourier_features.shape[0])}, tokens={int(tokens.shape[0])}"
                 )
-            delta = self.proj(self.input_norm(fourier_features))
-            delta = delta * self.gate.to(dtype=delta.dtype).tanh()
+            delta = self.proj(fourier_features)
             token_splits[image_index] = tokens + delta.to(device=tokens.device, dtype=tokens.dtype)
 
         return torch.cat(token_splits, dim=0)

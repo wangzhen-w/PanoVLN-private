@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="/workspace/code/VLN/src/panoworld/config/config.yaml"
-OUTPUT_DIR="/workspace/data1/model/panoworld/panovln_fourier001"
+OUTPUT_DIR="/workspace/data1/model/panoworld/panovln_fourier_alpha001_fixed"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"

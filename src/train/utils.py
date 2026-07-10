@@ -105,6 +105,7 @@ def _load_model_config(cfg):
     erp_fourier_linear_fields = (
         "erp_fourier_linear_enabled",
         "erp_fourier_linear_alpha_value",
+        "erp_fourier_linear_apply_to_current_only",
     )
     erp_crop_fields = (
         "erp_top_crop_degrees",
