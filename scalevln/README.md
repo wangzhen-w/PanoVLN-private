@@ -1,0 +1,149 @@
+# ScaleVLN 转换与 instruction rewrite 消融
+
+`scalevln/` 只负责两件事：
+
+1. 将原始离散 ScaleVLN path 转为 VLN-CE episode；
+2. 使用共享的 `data_create.instruction.pipeline` 重写 ScaleVLN instruction，
+   与原 instruction 做严格同轨迹消融。
+
+HM3D 自采数据不放在这里，见 `../data_create/README.md`。
+
+## 目录
+
+```text
+scalevln/
+├── README.md
+├── generate_scalevln_ce.py       # ScaleVLN -> VLN-CE
+├── run_scalevln_ce.sh             # 转换脚本；可选生成制作期 GT
+├── run_rewrite.sh                 # instruction rewrite
+└── audit_instruction_quality.py   # 可选文本/action 质量审计
+```
+
+运行产物、审计结果和图片不写入代码目录。
+
+## 1. 转换为 VLN-CE
+
+转换器使用 `ijson` 流式读取约 290 万条的原始 annotation，首次使用前安装：
+
+```bash
+pip install ijson
+```
+
+所有路径和开关都在 [run_scalevln_ce.sh](run_scalevln_ce.sh) 顶部直接赋值。
+修改：
+
+```bash
+MODE="build"  # 正式数据默认只 build；gt / full 仅用于制作期回放
+RAW_ANNOTATIONS="/path/to/ScaleVLN_total/annotations/R2R_scalevln_ft_aug_enc.json"
+EXISTING_SUBSET="/path/to/ScaleVLN_150k/scalevln_subset_150k.json.gz"
+CONNECTIVITY_DIR="/path/to/ScaleVLN_total/connectivity"
+CONNECTIVITY_MP3D_DIR="/path/to/ScaleVLN_total/connectivity_mp3d"
+SCENES_DIR="/path/to/scene_datasets"
+CONFIG_PATH="${REPO_ROOT}/config/vln_scalevln.yaml"
+OUTPUT_ROOT="/workspace/data1/dataset/general_VLN_data/ScaleVLN_CE"
+NUM_SUBSETS=10
+SUBSET_SIZE=150000
+```
+
+然后运行：
+
+```bash
+cd /workspace/code/VLN
+bash scalevln/run_scalevln_ce.sh
+```
+
+- `build`：生成正式 VLN-CE subset，这是默认模式和需要保留的数据；
+- `gt`：按 scene 生成制作期 ShortestPathFollower actions/locations，供立即采图或核验；
+- `full`：依次执行 build、gt，只用于上述制作流程。
+
+类似 R2R 的 `train_gt.json.gz` 不属于本项目的数据集发布契约。ScaleVLN 正式产物
+只需要 `scalevln_subset_150k.json.gz`；需要 action sequence 时，再根据 episode 的
+reference path 和统一的 `GOAL_RADIUS=0.3` 调用 Habitat 生成即可。
+旧脚本曾写出的 `manifest.json` 和可选 gt/full 模式生成的 GT sidecar 都不是正式
+训练输入；默认 build 不再生成 manifest，并会清理 OUTPUT_ROOT 下已有 subset 中
+的这些非 dataset 文件。若主动选择 gt/full，制作期 GT 会保留供后续阶段使用；完成
+后切回 build 运行一次即可恢复每个 subset 只含 dataset 的发布目录。
+
+## 2. Rewrite instruction
+
+[run_rewrite.sh](run_rewrite.sh) 顶部只需要配置三个数据路径：
+
+```bash
+SOURCE_JSONL="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl"
+IMAGE_ROOT="/workspace/data1/dataset/PanoVLN/images/scalevln"
+REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl"
+```
+
+然后运行：
+
+```bash
+cd /workspace/code/VLN
+bash scalevln/run_rewrite.sh
+```
+
+这里明确使用 `--mode generate`。`SOURCE_JSONL` 文件物理上仍保留原 instruction，
+但 pipeline 逻辑上只把 episode ID 和 actions 传入生成流：在任何 agent 运行前
+强制清空原 ScaleVLN instruction，writer、
+reviewer 和 blind auditor 都看不到原文。因此它与 `data_create` 自采数据使用的是
+同一套无源文本 instruction 系统。
+
+ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.glb`
+或 `mp3d/...` scene ID；`PanoVLN-HM3D` 新数据则使用
+`hm3d/train/<scene_dir>/<scene_name>.basis.glb`。前者由统一 `SCENES_DIR` 解析，
+后者在制作阶段由 HM3D 专用 `SCENE_ROOT` 解析，两个根目录不要混用。
+
+注意：仓库外当前同名的 104,141 条 rewrite 文件是历史生成结果经过 158 条对齐
+过滤后的数据；修改脚本本身不会追溯性地改变它。只有重新完整运行
+`run_rewrite.sh` 后，才能把该路径上的结果当作新的 source-text-blind ablation。
+小样本验证中 `mode=generate`、所有 `candidate.old_instruction` 均为空，说明信息隔离
+实际生效，而不只是 prompt 里要求模型忽略原文。
+
+处理顺序：
+
+```text
+ScaleVLN trajectory/actions + panoramas
+  -> shared source-text-blind multi-agent generation
+  -> 要求全部 episode 通过质量门
+  -> 原子发布 REWRITE_OUTPUT
+```
+
+`REWRITE_OUTPUT` 是唯一正式 rewrite，不生成 candidate、original-baseline 副本或
+pair manifest。脚本使用 `--drop-failed false --allow-incomplete false`：只要还有一条
+失败，就保留 progress 供恢复并拒绝发布不完整 rewrite。
+
+共享 agent 还包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：planner 的
+passed/near/avoid landmark 关系会先做确定性消歧；一次 critical blind-grounding
+失败不能被下一次随机 bare pass 擦除，修复后必须连续两次通过；仅有 actions 时会
+dead-reckon 非局部复访，复访同时伴随多个大转向的路线不得被压缩成直线描述。
+这些门不会利用原 instruction。
+
+## 158 条失败样本
+
+158 条历史 rewrite 失败样本已经同时从 source 和 rewrite 实验输入中原子删除：
+
+```text
+scalevln.jsonl:                         104,141
+scalevln_qwen35_27b_r2rstyle.jsonl:     104,141
+ID/order/action mismatch:                     0
+```
+
+因此 `scalevln.jsonl` 本身就是 original-instruction baseline，不再需要额外 aligned
+文件。两份 JSONL 的 episode ID、顺序和 actions 完全一致，只差 instruction。
+
+最终训练前，需要分别从这两份 annotation、使用相同 seed 和相同
+`prepare_training_data.py` 配置重新生成训练 JSONL。不要复用包含全部
+104,299 episode 的旧派生训练文件，否则两组样本不一致。
+
+## 可选审计
+
+```bash
+python scalevln/audit_instruction_quality.py \
+  --candidate /workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl \
+  --source /workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl
+```
+
+审计结果默认写入：
+
+```text
+/workspace/data1/dataset/PanoVLN/audits/<candidate_name>/
+```

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import random
+import tempfile
 from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -10,13 +11,38 @@ from tqdm import tqdm
 
 DEFAULT_ACTION_HORIZON = 4
 DEFAULT_SEED = 42
+DEFAULT_SUBSET_SEED = 42
 EBS_SAMPLER = "ebs"
-DEFAULT_EVENT_KEEP_PROB = 0.50
-DEFAULT_BACKGROUND_KEEP_PROB = 0.05
-DEFAULT_TAIL_DENSE_KEEP_PROB = 1.00
+DEFAULT_EVENT_KEEP_PROB = 0.60
+DEFAULT_BACKGROUND_KEEP_PROB = 0.11
+DEFAULT_TAIL_DENSE_KEEP_PROB = 0.50
 DEFAULT_BODY_KEEP_ADVANCE = DEFAULT_ACTION_HORIZON
 STOP_ACTION_ID = 0
 EVENT_ACTION_IDS = {2, 3}
+
+DATASET_SPECS = {
+    "r2r": {"image_dir": "r2r", "annotation_name": "r2r.jsonl"},
+    "rxr": {"image_dir": "rxr", "annotation_name": "rxr.jsonl"},
+    "envdrop": {"image_dir": "envdrop", "annotation_name": "envdrop.jsonl"},
+    "scalevln": {
+        "image_dir": "scalevln",
+        "annotation_name": "scalevln.jsonl",
+        "dataset_label": "scalevln",
+    },
+    # Instruction-only ablation: reuse the exact ScaleVLN trajectories/images.
+    "PanoVLN": {
+        "image_dir": "scalevln",
+        "annotation_name": "PanoVLN.jsonl",
+        "dataset_label": "scalevln",
+    },
+    "scalevln_150k": {
+        "image_dir": "scalevln_150k",
+        "annotation_name": "scalevln_150k.jsonl",
+    },
+    "dagger": {"image_dir": "dagger", "annotation_name": "dagger.jsonl"},
+}
+
+INSTRUCTION_ABLATION_VARIANTS = frozenset({"scalevln", "PanoVLN"})
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -36,6 +62,17 @@ def frame_index_from_filename(filename: str) -> str:
     return filename.split("_")[1].split(".")[0]
 
 
+def annotation_image_id(episode_item: Dict[str, Any]) -> str:
+    """Resolve shared trajectory images while preserving old episode-keyed data."""
+
+    image_id = episode_item.get("trajectory_id")
+    if image_id is None:
+        image_id = episode_item.get("episode_id", episode_item.get("video_id"))
+    if image_id is None or isinstance(image_id, bool) or not str(image_id).strip():
+        raise ValueError("Annotation has no usable trajectory_id/episode_id/video_id")
+    return str(image_id)
+
+
 def to_relative_path(path: str, root: str) -> str:
     return os.path.relpath(path, root).replace(os.sep, "/")
 
@@ -45,19 +82,44 @@ def write_jsonl_item(handle, item: Dict) -> None:
 
 
 def build_dataset_config(input_root: str) -> Dict[str, Dict[str, str]]:
-    dataset_names = ["r2r", "rxr", "envdrop", "scalevln", "scalevln_150k", "dagger"]
     return {
         dataset_name: {
-            "image_path": os.path.join(input_root, "images", dataset_name),
+            "image_path": os.path.join(input_root, "images", spec["image_dir"]),
             "annotation_path": os.path.join(
                 input_root,
                 "sub_dataset",
-                f"{dataset_name}.jsonl",
+                spec["annotation_name"],
             ),
+            "dataset_label": spec.get("dataset_label", dataset_name),
             "frame_index_fn": frame_index_from_filename,
         }
-        for dataset_name in dataset_names
+        for dataset_name, spec in DATASET_SPECS.items()
     }
+
+
+def validate_selected_subsets(
+    selected_subset_list: List[str],
+    dataset_config: Dict[str, Dict[str, str]],
+) -> None:
+    if not selected_subset_list:
+        raise ValueError("At least one dataset name is required")
+    duplicates = sorted(
+        name for name, count in Counter(selected_subset_list).items() if count > 1
+    )
+    if duplicates:
+        raise ValueError(f"Duplicate dataset names are not allowed: {duplicates}")
+    unsupported = sorted(set(selected_subset_list) - set(dataset_config))
+    if unsupported:
+        raise ValueError(
+            f"Unsupported dataset names: {unsupported}; "
+            f"supported={sorted(dataset_config)}"
+        )
+    if INSTRUCTION_ABLATION_VARIANTS.issubset(selected_subset_list):
+        raise ValueError(
+            "scalevln and PanoVLN are paired instruction variants over the same "
+            "trajectories. Generate them in separate runs with the same seed and "
+            "sampling parameters; do not mix both into one training JSONL."
+        )
 
 
 def load_episode_images(
@@ -105,6 +167,7 @@ def load_subset_annotations(
     selected_subset_list: List[str],
     dataset_config: Dict[str, Dict[str, str]],
     max_episodes_per_subset: int = None,
+    subset_seed: int = DEFAULT_SUBSET_SEED,
 ) -> Dict[str, List[Dict[str, Any]]]:
     annotations_by_subset = {}
     for subset in selected_subset_list:
@@ -114,7 +177,22 @@ def load_subset_annotations(
             for line in handle:
                 annotation.append(json.loads(line))
         if max_episodes_per_subset is not None:
+            if max_episodes_per_subset <= 0:
+                raise ValueError(
+                    "max_episodes_per_subset must be positive, got "
+                    f"{max_episodes_per_subset}"
+                )
+            if max_episodes_per_subset > len(annotation):
+                raise ValueError(
+                    f"Requested {max_episodes_per_subset} episodes from {subset}, "
+                    f"but only {len(annotation)} are available"
+                )
+            random.Random(subset_seed).shuffle(annotation)
             annotation = annotation[:max_episodes_per_subset]
+            print(
+                f"[{subset}] selected {len(annotation)} random episodes "
+                f"with subset_seed={subset_seed}"
+            )
         annotations_by_subset[subset] = annotation
     return annotations_by_subset
 
@@ -308,6 +386,7 @@ def process_dataset(
     for subset in selected_subset_list:
         subset_config = dataset_config[subset]
         image_path = subset_config["image_path"]
+        dataset_label = subset_config["dataset_label"]
         frame_index_fn = subset_config["frame_index_fn"]
         annotation = annotations_by_subset[subset]
 
@@ -320,7 +399,7 @@ def process_dataset(
             actions = episode_item["actions"]
             assert actions[-1] == 0
 
-            episode_image_dir = str(episode_item.get("episode_id", episode_item.get("video_id")))
+            episode_image_dir = annotation_image_id(episode_item)
             episode_image_path = os.path.join(image_path, episode_image_dir)
 
             episode_image_list = load_episode_images(
@@ -360,11 +439,15 @@ def process_dataset(
                     "action_sequence": list(action_chunk["texts"]),
                     "images": list(user_images),
                     "episode_id": str(episode_id),
-                    "dataset": subset,
+                    # Keep the label identical for the paired ScaleVLN/PanoVLN
+                    # ablation so the published samples differ only in instruction.
+                    "dataset": dataset_label,
                     "step_index": action_chunk["start_step"],
                     "end_step": action_chunk["end_step"],
                     "real_action_count": action_chunk["real_action_count"],
                 }
+                if episode_item.get("trajectory_id") is not None:
+                    sample["trajectory_id"] = str(episode_item["trajectory_id"])
                 if output_handle is None:
                     data2save.append(sample)
                 else:
@@ -386,6 +469,7 @@ def main(
     input_root: str,
     output_path: str,
     max_episodes_per_subset: int = None,
+    subset_seed: int = DEFAULT_SUBSET_SEED,
     pad_stop_to_horizon: bool = False,
     seed: int = DEFAULT_SEED,
     event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
@@ -394,10 +478,12 @@ def main(
     body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
 ) -> None:
     dataset_config = build_dataset_config(input_root)
+    validate_selected_subsets(selected_subset_list, dataset_config)
     annotations_by_subset = load_subset_annotations(
         selected_subset_list=selected_subset_list,
         dataset_config=dataset_config,
         max_episodes_per_subset=max_episodes_per_subset,
+        subset_seed=subset_seed,
     )
 
     event_keep_prob = validate_keep_probability(
@@ -426,22 +512,35 @@ def main(
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(output_path)}.",
+        suffix=".tmp",
+        dir=output_dir or ".",
+        text=True,
+    )
     total_samples = 0
-
-    with open(output_path, "w", encoding="utf-8") as output_handle:
-        total_samples += process_dataset(
-            selected_subset_list=selected_subset_list,
-            dataset_config=dataset_config,
-            annotations_by_subset=annotations_by_subset,
-            input_root=input_root,
-            pad_stop_to_horizon=pad_stop_to_horizon,
-            seed=seed,
-            event_keep_prob=event_keep_prob,
-            background_keep_prob=background_keep_prob,
-            tail_dense_keep_prob=tail_dense_keep_prob,
-            body_keep_advance=body_keep_advance,
-            output_handle=output_handle,
-        )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output_handle:
+            total_samples += process_dataset(
+                selected_subset_list=selected_subset_list,
+                dataset_config=dataset_config,
+                annotations_by_subset=annotations_by_subset,
+                input_root=input_root,
+                pad_stop_to_horizon=pad_stop_to_horizon,
+                seed=seed,
+                event_keep_prob=event_keep_prob,
+                background_keep_prob=background_keep_prob,
+                tail_dense_keep_prob=tail_dense_keep_prob,
+                body_keep_advance=body_keep_advance,
+                output_handle=output_handle,
+            )
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
     print(f"total number of samples = {total_samples}")
 
@@ -467,6 +566,17 @@ if __name__ == "__main__":
         "--max_episodes_per_subset",
         type=int,
         default=None,
+        help=(
+            "If set, deterministically shuffle each source annotation with "
+            "subset_seed and keep the requested prefix. Reusing subset_seed "
+            "makes different subset sizes nested."
+        ),
+    )
+    parser.add_argument(
+        "--subset_seed",
+        type=int,
+        default=DEFAULT_SUBSET_SEED,
+        help="Random seed for deterministic episode subset selection.",
     )
     parser.add_argument(
         "--pad_stop_to_horizon",
@@ -521,6 +631,7 @@ if __name__ == "__main__":
         input_root=args.input_root,
         output_path=args.output_path,
         max_episodes_per_subset=args.max_episodes_per_subset,
+        subset_seed=args.subset_seed,
         pad_stop_to_horizon=args.pad_stop_to_horizon,
         seed=args.seed,
         event_keep_prob=args.event_keep_prob,

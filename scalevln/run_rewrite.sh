@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
+
+PYTHON_BIN="python"
+
+# 只需要修改这三个数据路径。
+SOURCE_JSONL="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl"
+IMAGE_ROOT="/workspace/data1/dataset/PanoVLN/images/scalevln"
+REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl"
+
+BASE_URL="http://127.0.0.1:11426/v1"
+MODEL="Qwen3.5-27B"
+API_KEY="test"
+
+NUM_WORKERS=16
+MAX_WAYPOINTS=12
+START_WINDOW_FRAMES=6
+ENDPOINT_WINDOW_FRAMES=6
+TILE_WIDTH=320
+TILE_HEIGHT=240
+SHEET_JPEG_QUALITY=90
+TEMPERATURE=0.40
+MAX_TOKENS=420
+FACT_MAX_TOKENS=320
+PLANNER_MAX_TOKENS=1200
+REVIEW_MAX_TOKENS=1000
+REQUEST_TIMEOUT=300
+RETRIES=4
+STAGE_RETRIES=2
+
+WORK_DIR="${REWRITE_OUTPUT%.jsonl}_progress"
+
+# 避免系统 HTTP 代理截获本机 Qwen API 请求。
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
+
+"${PYTHON_BIN}" -m data_create.instruction.pipeline \
+  --input-jsonl "${SOURCE_JSONL}" \
+  --image-root "${IMAGE_ROOT}" \
+  --output-jsonl "${REWRITE_OUTPUT}" \
+  --work-dir "${WORK_DIR}" \
+  --mode generate \
+  --instruction-profile concise \
+  --provider qwen \
+  --base-url "${BASE_URL}" \
+  --model "${MODEL}" \
+  --api-key "${API_KEY}" \
+  --num-workers "${NUM_WORKERS}" \
+  --max-waypoints "${MAX_WAYPOINTS}" \
+  --start-window-frames "${START_WINDOW_FRAMES}" \
+  --endpoint-window-frames "${ENDPOINT_WINDOW_FRAMES}" \
+  --tile-width "${TILE_WIDTH}" \
+  --tile-height "${TILE_HEIGHT}" \
+  --jpeg-quality "${SHEET_JPEG_QUALITY}" \
+  --temperature "${TEMPERATURE}" \
+  --max-tokens "${MAX_TOKENS}" \
+  --fact-max-tokens "${FACT_MAX_TOKENS}" \
+  --planner-max-tokens "${PLANNER_MAX_TOKENS}" \
+  --review-max-tokens "${REVIEW_MAX_TOKENS}" \
+  --request-timeout "${REQUEST_TIMEOUT}" \
+  --retries "${RETRIES}" \
+  --stage-retries "${STAGE_RETRIES}" \
+  --start-fact-pass true \
+  --endpoint-fact-pass true \
+  --route-plan-pass true \
+  --require-start-facts true \
+  --require-endpoint-facts true \
+  --require-route-plan true \
+  --self-check true \
+  --blind-grounding-audit true \
+  --route-audit true \
+  --spatial-audit true \
+  --drop-failed false \
+  --allow-incomplete false \
+  --resume true
+
+rm -rf "${WORK_DIR}"
+echo "Rewrite: ${REWRITE_OUTPUT}"

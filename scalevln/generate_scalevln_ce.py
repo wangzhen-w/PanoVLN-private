@@ -24,25 +24,23 @@ except Exception:  # pragma: no cover
 
 
 DEFAULT_RAW_ANNOTATIONS = (
-    "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_total/annotations/"
+    "/workspace/data1/dataset/general_VLN_data/ScaleVLN_total/annotations/"
     "R2R_scalevln_ft_aug_enc.json"
 )
 DEFAULT_EXISTING_SUBSET = (
-    "/workspace/code_dir/a_property/dataset/janusvln_data/datasets/scalevln/"
+    "/workspace/data1/dataset/general_VLN_data/ScaleVLN_150k/"
     "scalevln_subset_150k.json.gz"
 )
 DEFAULT_CONNECTIVITY_DIR = (
-    "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_total/connectivity"
+    "/workspace/data1/dataset/general_VLN_data/ScaleVLN_total/connectivity"
 )
 DEFAULT_CONNECTIVITY_MP3D_DIR = (
-    "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_total/connectivity_mp3d"
+    "/workspace/data1/dataset/general_VLN_data/ScaleVLN_total/connectivity_mp3d"
 )
-DEFAULT_OUTPUT_ROOT = "/workspace/code_dir/a_property/dataset/general_VLN_data/ScaleVLN_CE"
-DEFAULT_SCENES_DIR = "/workspace/code_dir/a_property/dataset/janusvln_data/scene_datasets"
-DEFAULT_CONFIG_PATH = (
-    "/workspace/code_dir/VLN/config/vln_scalevln.yaml"
-)
-DEFAULT_REPO_ROOT = "/workspace/code_dir/VLN"
+DEFAULT_OUTPUT_ROOT = "/workspace/data1/dataset/general_VLN_data/ScaleVLN_CE"
+DEFAULT_SCENES_DIR = "/workspace/data1/dataset/janusvln_data/scene_datasets"
+DEFAULT_CONFIG_PATH = "/workspace/code/VLN/config/vln_scalevln.yaml"
+DEFAULT_REPO_ROOT = "/workspace/code/VLN"
 DEFAULT_DATASET_FILENAME = "scalevln_subset_150k.json.gz"
 DEFAULT_DATASET_JSONL_FILENAME = "scalevln_subset_150k.jsonl"
 DEFAULT_GT_FILENAME = "scalevln_subset_150k_gt.json.gz"
@@ -516,39 +514,6 @@ def choose_target_subset(
     return None
 
 
-def write_subset_manifest(
-    subset_directory: str,
-    subset_index: int,
-    goal_radius: float,
-    raw_count_seen: int,
-    num_episodes: int,
-    first_episode_id: Optional[int],
-    last_episode_id: Optional[int],
-    first_trajectory_id: Optional[str],
-    last_trajectory_id: Optional[str],
-    unique_scenes: int,
-    dataset_filename: str = DEFAULT_DATASET_FILENAME,
-) -> None:
-    os.makedirs(subset_directory, exist_ok=True)
-    manifest_path = os.path.join(subset_directory, "manifest.json")
-    manifest = {
-        "subset_index": subset_index,
-        "num_episodes": num_episodes,
-        "unique_scenes": unique_scenes,
-        "goal_radius": goal_radius,
-        "first_episode_id": first_episode_id,
-        "last_episode_id": last_episode_id,
-        "first_trajectory_id": first_trajectory_id,
-        "last_trajectory_id": last_trajectory_id,
-        "raw_annotations_seen": raw_count_seen,
-        "dataset_filename": dataset_filename,
-        "gt_filename": DEFAULT_GT_FILENAME,
-    }
-
-    with open(manifest_path, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, ensure_ascii=False)
-
-
 def build_subsets(args: argparse.Namespace) -> List[str]:
     output_root = args.output_root
     os.makedirs(output_root, exist_ok=True)
@@ -566,10 +531,6 @@ def build_subsets(args: argparse.Namespace) -> List[str]:
     subset_counts = [0 for _ in range(args.num_subsets)]
     scene_seen_counts: Dict[str, int] = {}
     subset_scene_sets = [set() for _ in range(args.num_subsets)]
-    subset_first_episode_id: List[Optional[int]] = [None for _ in range(args.num_subsets)]
-    subset_first_trajectory_id: List[Optional[str]] = [None for _ in range(args.num_subsets)]
-    subset_last_episode_id: List[Optional[int]] = [None for _ in range(args.num_subsets)]
-    subset_last_trajectory_id: List[Optional[str]] = [None for _ in range(args.num_subsets)]
     subset_jsonl_paths: List[str] = []
 
     for subset_index in range(args.num_subsets):
@@ -632,11 +593,6 @@ def build_subsets(args: argparse.Namespace) -> List[str]:
             excluded_path_ids.add(raw_path_id)
             scene_seen_counts[scene_id] = scene_seen_counts.get(scene_id, 0) + 1
             subset_scene_sets[subset_index].add(scene_id)
-            if subset_first_episode_id[subset_index] is None:
-                subset_first_episode_id[subset_index] = int(episode["episode_id"])
-                subset_first_trajectory_id[subset_index] = str(episode["trajectory_id"])
-            subset_last_episode_id[subset_index] = int(episode["episode_id"])
-            subset_last_trajectory_id[subset_index] = str(episode["trajectory_id"])
             subset_counts[subset_index] += 1
             selected_total += 1
             update_tqdm(
@@ -652,18 +608,6 @@ def build_subsets(args: argparse.Namespace) -> List[str]:
                 )
                 dataset_path = os.path.join(subset_directory, DEFAULT_DATASET_FILENAME)
                 finalize_dataset_jsonl(subset_jsonl_paths[subset_index], dataset_path)
-                write_subset_manifest(
-                    subset_directory=subset_directory,
-                    subset_index=subset_index,
-                    goal_radius=args.goal_radius,
-                    raw_count_seen=raw_seen,
-                    num_episodes=subset_counts[subset_index],
-                    first_episode_id=subset_first_episode_id[subset_index],
-                    last_episode_id=subset_last_episode_id[subset_index],
-                    first_trajectory_id=subset_first_trajectory_id[subset_index],
-                    last_trajectory_id=subset_last_trajectory_id[subset_index],
-                    unique_scenes=len(subset_scene_sets[subset_index]),
-                )
                 subset_paths.append(subset_directory)
                 os.remove(subset_jsonl_paths[subset_index])
                 elapsed = time.time() - start_time
