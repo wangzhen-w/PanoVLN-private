@@ -36,6 +36,17 @@ def frame_index_from_filename(filename: str) -> str:
     return filename.split("_")[1].split(".")[0]
 
 
+def annotation_image_id(episode_item: Dict[str, Any]) -> str:
+    """Resolve shared trajectory images while preserving old episode-keyed data."""
+
+    image_id = episode_item.get("trajectory_id")
+    if image_id is None:
+        image_id = episode_item.get("episode_id", episode_item.get("video_id"))
+    if image_id is None or isinstance(image_id, bool) or not str(image_id).strip():
+        raise ValueError("Annotation has no usable trajectory_id/episode_id/video_id")
+    return str(image_id)
+
+
 def to_relative_path(path: str, root: str) -> str:
     return os.path.relpath(path, root).replace(os.sep, "/")
 
@@ -320,7 +331,7 @@ def process_dataset(
             actions = episode_item["actions"]
             assert actions[-1] == 0
 
-            episode_image_dir = str(episode_item.get("episode_id", episode_item.get("video_id")))
+            episode_image_dir = annotation_image_id(episode_item)
             episode_image_path = os.path.join(image_path, episode_image_dir)
 
             episode_image_list = load_episode_images(
@@ -365,6 +376,8 @@ def process_dataset(
                     "end_step": action_chunk["end_step"],
                     "real_action_count": action_chunk["real_action_count"],
                 }
+                if episode_item.get("trajectory_id") is not None:
+                    sample["trajectory_id"] = str(episode_item["trajectory_id"])
                 if output_handle is None:
                     data2save.append(sample)
                 else:

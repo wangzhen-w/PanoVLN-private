@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Rewrite ScaleVLN instructions from trajectory panoramas.
+"""Generate or rewrite VLN instructions from trajectory panoramas.
 
-The script keeps the training-facing JSONL schema unchanged:
-{"episode_id": ..., "instruction": ..., "actions": [...]}
+Clean JSONL keeps the required training fields and adds provenance:
+{"episode_id": ..., "instruction": ..., "actions": ...,
+ "trajectory_id": ..., "instruction_profile": ..., "pipeline_fingerprint": ...}
 
 Generation metadata, raw model responses, contact sheets, and failures are
 written under a progress directory next to the clean output JSONL by default.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import html
 import io
 import json
@@ -44,15 +46,7 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 
-DEFAULT_INPUT_JSONL = (
-    "/workspace/code_dir/a_property/dataset/PanoVLN/sub_dataset/scalevln.jsonl"
-)
-DEFAULT_IMAGE_ROOT = "/workspace/code_dir/a_property/dataset/PanoVLN/images/scalevln"
-DEFAULT_OUTPUT_JSONL = (
-    "/workspace/code_dir/a_property/dataset/PanoVLN/sub_dataset/"
-    "scalevln_qwen35_27b_r2rstyle.jsonl"
-)
-DEFAULT_QWEN_BASE_URL = "http://127.0.0.1:10426/v1"
+DEFAULT_QWEN_BASE_URL = "http://127.0.0.1:11426/v1"
 DEFAULT_QWEN_MODEL = "Qwen3.5-27B"
 DEFAULT_QWEN_API_KEY = "test"
 
@@ -63,6 +57,16 @@ ACTION_NAMES = {
     3: "right",
 }
 TURN_DEGREES = 15.0
+PIPELINE_SCHEMA_VERSION = "vln-instruction-pipeline-v5"
+STOP_CUE_PATTERN = (
+    r"(?:\b(?:stop|stopping|wait|halt|finish|stand|remain)\b|"
+    r"\b(?:route|path|navigation)\s+ends?\b|"
+    r"\b(?:this|that)\s+(?:is|marks)\s+(?:the\s+)?end\b)"
+)
+
+
+def has_explicit_stop_cue(text: str) -> bool:
+    return bool(re.search(STOP_CUE_PATTERN, str(text), flags=re.IGNORECASE))
 
 DATA_ARTIFACT_PATTERNS = (
     re.compile(r"\bimage\b", re.IGNORECASE),
@@ -178,16 +182,61 @@ def str2bool(value: Any) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
-def read_jsonl(path: str) -> List[Dict[str, Any]]:
+def validate_input_row(
+    row: Dict[str, Any],
+    path: str,
+    line_number: int,
+    require_instruction: bool,
+) -> Dict[str, Any]:
+    required = {"episode_id", "actions"}
+    if require_instruction:
+        required.add("instruction")
+    missing = sorted(required - set(row))
+    if missing:
+        raise ValueError(f"{path}:{line_number} missing fields: {missing}")
+
+    if not isinstance(row.get("actions"), list) or not row["actions"]:
+        raise ValueError(f"{path}:{line_number} actions must be a non-empty list")
+    try:
+        actions = [int(action) for action in row["actions"]]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{path}:{line_number} actions must be integers") from error
+    invalid = sorted(set(actions) - set(ACTION_NAMES))
+    if invalid:
+        raise ValueError(f"{path}:{line_number} invalid action ids: {invalid}")
+    if actions[-1] != 0 or actions.count(0) != 1:
+        raise ValueError(
+            f"{path}:{line_number} actions must contain exactly one terminal stop"
+        )
+    row["actions"] = actions
+
+    instruction = row.get("instruction", "")
+    if require_instruction and not isinstance(instruction, str):
+        raise ValueError(f"{path}:{line_number} instruction must be a string")
+    if require_instruction and not instruction.strip():
+        raise ValueError(f"{path}:{line_number} instruction must not be empty")
+    row["instruction"] = str(instruction or "")
+    return row
+
+
+def read_jsonl(path: str, require_instruction: bool = True) -> List[Dict[str, Any]]:
     rows = []
+    episode_ids = set()
     with open(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             stripped = line.strip()
             if not stripped:
                 continue
-            row = json.loads(stripped)
-            if "episode_id" not in row or "instruction" not in row or "actions" not in row:
-                raise ValueError(f"{path}:{line_number} is not a ScaleVLN row")
+            row = validate_input_row(
+                json.loads(stripped),
+                path=path,
+                line_number=line_number,
+                require_instruction=require_instruction,
+            )
+            key = episode_id_key(row)
+            if key in episode_ids:
+                raise ValueError(f"{path}:{line_number} duplicate episode_id={key}")
+            episode_ids.add(key)
             rows.append(row)
     return rows
 
@@ -211,6 +260,21 @@ def append_jsonl(path: str, row: Dict[str, Any]) -> None:
     with output_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
         handle.flush()
+
+
+def archive_existing_output(path: str) -> Optional[str]:
+    """Move a previous formal dataset aside before an incomplete run returns."""
+    source = Path(path)
+    if not source.exists():
+        return None
+    index = 0
+    while True:
+        suffix = ".stale" if index == 0 else f".stale.{index}"
+        destination = Path(str(source) + suffix)
+        if not destination.exists():
+            os.replace(source, destination)
+            return str(destination)
+        index += 1
 
 
 def episode_id_key(row: Dict[str, Any]) -> str:
@@ -424,7 +488,7 @@ def extract_destination_hint(instruction: str) -> str:
 
     clauses = re.split(r"(?<=[.!?])\s+|,\s+|;\s+|\s+then\s+", text, flags=re.IGNORECASE)
     destination_patterns = [
-        r"\b(?:stop|stopping|wait|halt|finish|end|stand|remain)\b[^.!?;]*",
+        STOP_CUE_PATTERN + r"[^.!?;]*",
         r"\b(?:destination|goal)\b[^.!?;]*",
     ]
     matches: List[str] = []
@@ -474,11 +538,165 @@ def action_runs(actions: Sequence[int]) -> List[Tuple[int, int, int]]:
     return runs
 
 
+def dead_reckoned_action_route_metrics(actions: Sequence[int]) -> Dict[str, Any]:
+    """Approximate path topology from discrete turns/forwards without simulator state."""
+
+    heading = 0.0
+    x = 0.0
+    z = 0.0
+    positions: List[Tuple[float, float]] = [(x, z)]
+    for raw_action in actions:
+        action = int(raw_action)
+        if action == 2:
+            heading += math.radians(TURN_DEGREES)
+        elif action == 3:
+            heading -= math.radians(TURN_DEGREES)
+        elif action == 1:
+            x += 0.25 * math.sin(heading)
+            z += 0.25 * math.cos(heading)
+            positions.append((x, z))
+
+    revisit_later_indices = set()
+    for later in range(len(positions)):
+        for earlier in range(max(0, later - 3)):
+            # Four translated steps correspond to 1 m of intervening travel,
+            # matching the collector's nonlocal-revisit definition.
+            if math.dist(positions[earlier], positions[later]) <= 0.4:
+                revisit_later_indices.add(later)
+                break
+
+    large_turns = []
+    for action, start, end in action_runs(actions):
+        if action not in {2, 3}:
+            continue
+        degrees = (end - start + 1) * TURN_DEGREES
+        if degrees < 90.0:
+            continue
+        has_translation_before = any(int(item) == 1 for item in actions[:start])
+        has_translation_after = any(int(item) == 1 for item in actions[end + 1 :])
+        if has_translation_before and has_translation_after:
+            large_turns.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "direction": "left" if action == 2 else "right",
+                    "degrees": int(degrees),
+                }
+            )
+
+    path_length = 0.25 * max(0, len(positions) - 1)
+    displacement = math.dist(positions[0], positions[-1]) if positions else 0.0
+    return {
+        "forward_steps": max(0, len(positions) - 1),
+        "dead_reckoned_path_length": path_length,
+        "dead_reckoned_displacement": displacement,
+        "dead_reckoned_displacement_ratio": displacement / max(path_length, 1e-6),
+        "nonlocal_revisit_count": len(revisit_later_indices),
+        "large_translated_turns": large_turns,
+    }
+
+
+def action_route_complexity_context(actions: Sequence[int]) -> str:
+    metrics = dead_reckoned_action_route_metrics(actions)
+    large_turns = metrics["large_translated_turns"]
+    if not metrics["nonlocal_revisit_count"] and len(large_turns) < 2:
+        return "No deterministic action-topology warning."
+    turns = ", ".join(
+        f"{item['direction']} {item['degrees']}° at steps {item['start']}-{item['end']}"
+        for item in large_turns
+    ) or "none"
+    return (
+        "Dead-reckoned action topology warning: "
+        f"nonlocal_revisit_count={metrics['nonlocal_revisit_count']}; "
+        f"large translated turns={turns}; displacement/path="
+        f"{metrics['dead_reckoned_displacement_ratio']:.3f}. Inspect the chronological "
+        "views for a real detour or revisit. Do not compress a looping route into a "
+        "direct straight landmark sequence."
+    )
+
+
+def action_route_complexity_hints(
+    instruction: str,
+    actions: Sequence[int],
+) -> List[str]:
+    metrics = dead_reckoned_action_route_metrics(actions)
+    large_turns = metrics["large_translated_turns"]
+    if metrics["nonlocal_revisit_count"] <= 0 or len(large_turns) < 2:
+        return []
+    turn_cues = re.findall(
+        r"\b(?:turn\s+(?:left|right|around|back)|make\s+a\s+u-turn|"
+        r"bear\s+(?:left|right)|veer\s+(?:left|right))\b",
+        normalize_instruction(instruction).lower(),
+    )
+    if re.search(
+        r"\b(?:stairs|staircase|stairway|stairwell|steps|landing|ramp)\b",
+        normalize_instruction(instruction).lower(),
+    ):
+        # A 2-D dead-reckoning revisit can be a legitimate multi-floor stair
+        # route; the visual auditors remain responsible for that case.
+        return []
+    if len(turn_cues) >= 2:
+        return []
+    return [
+        "dead-reckoned actions contain a nonlocal revisit plus "
+        f"{len(large_turns)} large translated turns, but the instruction compresses "
+        "the path into a direct route; preserve the consequential detour/return turns "
+        "or reject the trajectory"
+    ]
+
+
+def trajectory_geometry_context(row: Dict[str, Any]) -> str:
+    metadata = row.get("trajectory_metadata") or {}
+    if not isinstance(metadata, dict):
+        return "No simulator-derived trajectory geometry metadata is available."
+    vertical = str(metadata.get("vertical_motion", "")).strip().lower()
+    if vertical not in {"level", "ascending", "descending", "mixed"}:
+        return "No simulator-derived trajectory geometry metadata is available."
+    return (
+        "Simulator GT vertical motion (authoritative for up/down wording): "
+        f"{vertical}; net={float(metadata.get('net_elevation_change_m', 0.0)):.2f} m; "
+        f"upward travel={float(metadata.get('upward_travel_m', 0.0)):.2f} m; "
+        f"downward travel={float(metadata.get('downward_travel_m', 0.0)):.2f} m."
+    )
+
+
+def vertical_motion_consistency_hints(
+    instruction: str,
+    row: Dict[str, Any],
+) -> List[str]:
+    metadata = row.get("trajectory_metadata") or {}
+    if not isinstance(metadata, dict):
+        return []
+    vertical = str(metadata.get("vertical_motion", "")).strip().lower()
+    lower = normalize_instruction(instruction).lower()
+    says_up = bool(
+        re.search(r"\b(?:go|walk|head|move|climb|continue)\s+up\b|\bascend\b", lower)
+    )
+    says_down = bool(
+        re.search(r"\b(?:go|walk|head|move|continue)\s+down\b|\bdescend\b", lower)
+    )
+    if vertical == "ascending" and says_down:
+        return ["instruction says to descend, but simulator GT elevation is ascending"]
+    if vertical == "descending" and says_up:
+        return ["instruction says to ascend, but simulator GT elevation is descending"]
+    return []
+
+
 def compact_action_summary(actions: Sequence[int], max_runs: int = 14) -> str:
     counts = Counter(int(action) for action in actions)
     runs = action_runs(actions)
     run_parts = []
-    for action, start, end in runs[:max_runs]:
+    if len(runs) <= max_runs:
+        displayed_runs: List[Optional[Tuple[int, int, int]]] = list(runs)
+    else:
+        head_count = max_runs // 2
+        tail_count = max_runs - head_count
+        displayed_runs = list(runs[:head_count]) + [None] + list(runs[-tail_count:])
+    for run in displayed_runs:
+        if run is None:
+            run_parts.append(f"... {len(runs) - max_runs} middle movement runs omitted ...")
+            continue
+        action, start, end = run
         length = end - start + 1
         name = ACTION_NAMES.get(action, str(action))
         if action == 1:
@@ -489,9 +707,6 @@ def compact_action_summary(actions: Sequence[int], max_runs: int = 14) -> str:
             run_parts.append(f"turn {direction} about {degrees} degrees")
         else:
             run_parts.append(f"{name} x{length}")
-    if len(runs) > max_runs:
-        run_parts.append(f"... plus {len(runs) - max_runs} more movement runs")
-
     totals = (
         f"forward={counts.get(1, 0)}, left_turns={counts.get(2, 0)}, "
         f"right_turns={counts.get(3, 0)}, stop={counts.get(0, 0)}"
@@ -527,7 +742,12 @@ def action_turn_requirements(
                 "route_phase": route_phase,
             }
         )
-    return requirements[:max_turns]
+    if len(requirements) <= max_turns:
+        return requirements
+    # Never hide the final route turns: retain balanced head/tail evidence.
+    head_count = max_turns // 2
+    tail_count = max_turns - head_count
+    return requirements[:head_count] + requirements[-tail_count:]
 
 
 def action_turn_requirements_to_prompt(actions: Sequence[int]) -> str:
@@ -539,10 +759,11 @@ def action_turn_requirements_to_prompt(actions: Sequence[int]) -> str:
             "the images show a real route choice."
         )
     lines = [
-        "Major action-derived turns from the ground-truth action list. These are "
-        "higher priority than the original weak instruction. The planner should "
-        "map them to visible route choices and the writer should include them "
-        "unless they are only same-area heading alignment:"
+        "Major low-level turn candidates from the ground-truth action list. Their "
+        "direction/timing is more reliable than the old weak instruction, but a "
+        "camera turn is not automatically a human route decision. The planner "
+        "must map each candidate to translated visual evidence and verbalize only "
+        "a real branch, boundary, staircase, or stay-on-path decision:"
     ]
     for index, item in enumerate(requirements, start=1):
         lines.append(
@@ -588,7 +809,10 @@ def build_segmented_route_plan(
     return "\n".join(lines)
 
 
-def build_route_constraints(actions: Sequence[int]) -> str:
+def build_route_constraints(
+    actions: Sequence[int],
+    trajectory_metadata: Optional[Dict[str, Any]] = None,
+) -> str:
     runs = action_runs(actions)
     if not runs:
         return "The route has no movement before stop."
@@ -633,6 +857,14 @@ def build_route_constraints(actions: Sequence[int]) -> str:
             f"{turn_text}. Preserve them as natural left/right navigation cues "
             "unless visual evidence shows a turn is only same-area heading alignment."
         )
+    topology_context = action_route_complexity_context(actions)
+    if not topology_context.startswith("No deterministic"):
+        constraints.append(topology_context)
+    geometry_context = trajectory_geometry_context(
+        {"trajectory_metadata": trajectory_metadata or {}}
+    )
+    if not geometry_context.startswith("No simulator-derived"):
+        constraints.append(geometry_context)
     return "\n".join(f"- {constraint}" for constraint in constraints)
 
 
@@ -650,6 +882,13 @@ def sorted_frame_paths(image_root: str, episode_id: str) -> List[Path]:
     paths = sorted(episode_dir.glob("frame_*.jpg"), key=frame_index)
     if not paths:
         raise FileNotFoundError(f"No frame_*.jpg images under {episode_dir}")
+    indices = [frame_index(path) for path in paths]
+    expected = list(range(len(paths)))
+    if indices != expected:
+        raise ValueError(
+            f"Non-contiguous frame sequence for episode {episode_id}: "
+            f"expected 0..{len(paths) - 1}, got {indices[:12]}"
+        )
     return paths
 
 
@@ -672,70 +911,103 @@ def build_heading_by_frame(actions: Sequence[int], num_frames: int) -> List[floa
     return headings
 
 
-def select_route_frames(actions: Sequence[int], num_frames: int, max_waypoints: int) -> List[int]:
-    max_waypoints = max(2, int(max_waypoints))
-    last_frame = max(0, num_frames - 1)
-    candidates = {0, last_frame}
+def translated_frame_indices(
+    actions: Sequence[int],
+    num_frames: int,
+) -> List[int]:
+    """Return one frame per unique low-level position.
 
-    frame_index = 0
-    previous_action = None
-    forward_run_start = None
-    forward_run_length = 0
-
+    A panorama recorded after an in-place turn is a rotated copy of the same
+    360-degree observation. Treating those copies as new waypoints encourages a
+    VLM to confuse camera alignment with a route transition. Frame zero plus the
+    frame after each forward action represents the translated trajectory.
+    """
+    indices = [0]
     for action_index, raw_action in enumerate(actions):
         action = int(raw_action)
         if action == 0:
             break
+        if action == 1:
+            indices.append(min(action_index + 1, num_frames - 1))
+    return sorted(set(index for index in indices if 0 <= index < num_frames))
 
-        if previous_action is not None and action != previous_action:
-            candidates.add(min(frame_index, last_frame))
 
-        if action in (2, 3):
-            candidates.add(min(frame_index, last_frame))
-            candidates.add(min(frame_index + 1, last_frame))
-            forward_run_start = None
-            forward_run_length = 0
-        elif action == 1:
-            if forward_run_start is None:
-                forward_run_start = frame_index
-                forward_run_length = 0
-            forward_run_length += 1
-            if forward_run_length in {4, 8, 14, 22}:
-                candidates.add(min(frame_index + 1, last_frame))
+def select_route_frames(actions: Sequence[int], num_frames: int, max_waypoints: int) -> List[int]:
+    max_waypoints = max(2, int(max_waypoints))
+    movement_frames = translated_frame_indices(actions, num_frames)
+    if not movement_frames:
+        return [0]
+    if len(movement_frames) <= max_waypoints:
+        return movement_frames
 
-        frame_index += 1
-        previous_action = action
+    # Prioritize the positions immediately before and after genuine turn+move
+    # events. A turn with no subsequent translation is endpoint orientation, not
+    # a branch choice, and is deliberately excluded.
+    importance: Dict[int, int] = {
+        movement_frames[0]: 10_000,
+        movement_frames[-1]: 10_000,
+    }
+    for action, start, end in action_runs(actions):
+        if action not in {2, 3}:
+            continue
+        degrees = (end - start + 1) * TURN_DEGREES
+        after = next((frame for frame in movement_frames if frame > end), None)
+        before = next((frame for frame in reversed(movement_frames) if frame <= start), None)
+        if before is None or after is None:
+            continue
+        importance[before] = max(importance.get(before, 0), int(degrees))
+        importance[after] = max(importance.get(after, 0), int(degrees))
 
-    if len(candidates) < max_waypoints:
-        evenly_spaced = np.linspace(0, last_frame, num=min(max_waypoints, last_frame + 1))
-        candidates.update(int(round(value)) for value in evenly_spaced)
-
-    ordered = sorted(index for index in candidates if 0 <= index <= last_frame)
+    selected = {movement_frames[0], movement_frames[-1]}
+    rank_by_frame = {frame: rank for rank, frame in enumerate(movement_frames)}
+    while len(selected) < max_waypoints:
+        best_frame = None
+        best_score = -1.0
+        selected_ranks = [rank_by_frame[frame] for frame in selected]
+        for frame in movement_frames:
+            if frame in selected:
+                continue
+            rank = rank_by_frame[frame]
+            temporal_coverage = min(abs(rank - other) for other in selected_ranks)
+            event_bonus = 1.0 + min(2.0, importance.get(frame, 0) / 90.0)
+            score = temporal_coverage * event_bonus
+            if score > best_score:
+                best_frame = frame
+                best_score = score
+        if best_frame is None:
+            break
+        selected.add(best_frame)
+    ordered = sorted(selected)
     if len(ordered) <= max_waypoints:
         return ordered
-
-    selected = {ordered[0], ordered[-1]}
-    interior = ordered[1:-1]
-    slots = max_waypoints - 2
-    if slots > 0 and interior:
-        positions = np.linspace(0, len(interior) - 1, num=slots)
-        selected.update(interior[int(round(position))] for position in positions)
-    return sorted(selected)
+    positions = np.linspace(0, len(ordered) - 1, num=max_waypoints)
+    return sorted(set(ordered[int(round(position))] for position in positions))
 
 
-def select_endpoint_frames(num_frames: int, endpoint_window_frames: int) -> List[int]:
-    last_frame = max(0, num_frames - 1)
+def select_endpoint_frames(
+    actions: Sequence[int],
+    num_frames: int,
+    endpoint_window_frames: int,
+) -> List[int]:
+    movement_frames = translated_frame_indices(actions, num_frames)
+    # The final low-level observation may follow one or more in-place turns. It
+    # is not a new route waypoint, but it is still the true terminal orientation
+    # and must be present in the endpoint sheet.
+    if num_frames > 0:
+        movement_frames = sorted(set(movement_frames + [num_frames - 1]))
     window = max(1, int(endpoint_window_frames))
-    first_frame = max(0, last_frame - window + 1)
-    return list(range(first_frame, last_frame + 1))
+    return movement_frames[-window:]
 
 
-def select_start_frames(num_frames: int, start_window_frames: int) -> List[int]:
+def select_start_frames(
+    actions: Sequence[int],
+    num_frames: int,
+    start_window_frames: int,
+) -> List[int]:
     if num_frames <= 0:
         return []
     window = max(1, int(start_window_frames))
-    last_frame = min(num_frames - 1, window - 1)
-    return list(range(0, last_frame + 1))
+    return translated_frame_indices(actions, num_frames)[:window]
 
 
 def equirect_to_perspective(
@@ -747,7 +1019,10 @@ def equirect_to_perspective(
     height: int = 192,
 ) -> Image.Image:
     if cv2 is None:
-        return image.convert("RGB").resize((width, height), Image.Resampling.BICUBIC)
+        raise RuntimeError(
+            "OpenCV is required for equirectangular projection; refusing to "
+            "silently resize the full panorama into duplicate direction tiles"
+        )
 
     source = np.asarray(image.convert("RGB"))
     source_h, source_w = source.shape[:2]
@@ -810,7 +1085,7 @@ def render_view_sheet(
     tile_width: int,
     tile_height: int,
     jpeg_quality: int,
-    final_frame_prefix: str = "step",
+    last_frame_prefix: Optional[str] = "FINAL",
 ) -> bytes:
     rows = []
     gap = 4
@@ -827,8 +1102,8 @@ def render_view_sheet(
                     width=tile_width,
                     height=tile_height,
                 )
-                if frame_index == last_selected_frame and final_frame_prefix:
-                    frame_label = f"FINAL {frame_index}"
+                if frame_index == last_selected_frame and last_frame_prefix:
+                    frame_label = f"{last_frame_prefix} {frame_index}"
                 else:
                     frame_label = f"step {frame_index}"
                 tiles.append(draw_label(view, f"{frame_label} - {label}"))
@@ -870,15 +1145,27 @@ def render_contact_sheet(
     episode_id = episode_id_key(row)
     actions = [int(action) for action in row["actions"]]
     frame_paths = sorted_frame_paths(image_root, episode_id)
+    expected_frame_count = sum(int(action) != 0 for action in actions) + 1
+    if len(frame_paths) != expected_frame_count:
+        raise ValueError(
+            f"Action/frame mismatch for episode {episode_id}: "
+            f"expected {expected_frame_count} frames for {len(actions)} actions, "
+            f"found {len(frame_paths)}"
+        )
     if use_action_heading:
         heading_by_frame = build_heading_by_frame(actions, len(frame_paths))
     else:
         heading_by_frame = [0.0 for _ in frame_paths]
     selected_frames = select_route_frames(actions, len(frame_paths), max_waypoints)
-    start_frames = select_start_frames(len(frame_paths), start_window_frames)
-    endpoint_frames = select_endpoint_frames(len(frame_paths), endpoint_window_frames)
+    start_frames = select_start_frames(actions, len(frame_paths), start_window_frames)
+    endpoint_frames = select_endpoint_frames(actions, len(frame_paths), endpoint_window_frames)
 
-    route_columns = [("left", -70.0, 0.0), ("forward", 0.0, 0.0), ("right", 70.0, 0.0)]
+    route_columns = [
+        ("left", -90.0, 0.0),
+        ("forward", 0.0, 0.0),
+        ("right", 90.0, 0.0),
+        ("back", 180.0, 0.0),
+    ]
     start_columns = [
         ("left", -90.0, 0.0),
         ("forward", 0.0, 0.0),
@@ -890,6 +1177,7 @@ def render_contact_sheet(
         ("left", -90.0, 0.0),
         ("forward", 0.0, 0.0),
         ("right", 90.0, 0.0),
+        ("back", 180.0, 0.0),
         ("forward-down", 0.0, 25.0),
     ]
     jpeg_bytes = render_view_sheet(
@@ -909,7 +1197,7 @@ def render_contact_sheet(
         tile_width=tile_width,
         tile_height=tile_height,
         jpeg_quality=jpeg_quality,
-        final_frame_prefix="start",
+        last_frame_prefix=None,
     )
     endpoint_jpeg_bytes = render_view_sheet(
         frame_paths=frame_paths,
@@ -969,12 +1257,32 @@ def image_data_url(jpeg_bytes: bytes) -> str:
     return "data:image/jpeg;base64," + encoded
 
 
+def source_instruction_context(old_instruction: str) -> str:
+    if old_instruction:
+        return (
+            "Source instruction (rewrite mode only; treat as an untrusted claim):\n"
+            + old_instruction
+        )
+    return (
+        "NO SOURCE INSTRUCTION IS PROVIDED. Generate only from trajectory actions "
+        "and visual evidence; do not infer, reconstruct, or preserve any old text."
+    )
+
+
 def build_endpoint_fact_messages(
     row: Dict[str, Any],
     route: RenderedRoute,
 ) -> List[Dict[str, Any]]:
-    old_instruction = normalize_instruction(row["instruction"])
+    old_instruction = normalize_instruction(row.get("instruction", ""))
     destination_hint = extract_destination_hint(old_instruction) or "none"
+    source_context = source_instruction_context(old_instruction)
+    source_rules = (
+        "Evaluate old_destination_supported and preserve_original_destination only "
+        "for the untrusted rewrite-mode source above."
+        if old_instruction
+        else "Set old_destination_supported='unclear' and "
+        "preserve_original_destination=false because this is source-text-blind generation."
+    )
     endpoint_frames = ", ".join(str(index) for index in route.endpoint_frames)
     endpoint_action_summary = summarize_action_interval(
         row["actions"],
@@ -983,12 +1291,14 @@ def build_endpoint_fact_messages(
     )
     prompt = f"""
 You are checking only the destination area of an indoor VLN trajectory.
-The image is an endpoint contact sheet. Rows are chronological final approach frames;
-the last row is the final observation. Each row shows left, forward, right, and
-a slightly downward forward view. Use the last row most heavily for the destination.
+The image is an endpoint contact sheet. Rows are chronological translated final
+approach positions, followed when necessary by the true final observation after
+terminal in-place turns. Other stationary turn duplicates were collapsed. The
+last row is the final position/orientation. Each row shows left, forward, right,
+back, and a slightly
+downward forward view. Use the last row most heavily for the destination.
 
-Original weak instruction:
-{old_instruction}
+{source_context}
 
 Original destination hint:
 {destination_hint}
@@ -1009,6 +1319,7 @@ Return JSON only:
 }}
 
 Rules:
+- {source_rules}
 - Be conservative. If the endpoint is visually ambiguous, preserve only the
   generic area type from the original hint. Do not preserve exact doorway,
   closet, appliance, landing, top/bottom-of-stairs, or numbered-step wording
@@ -1021,7 +1332,7 @@ Rules:
   use side views alone to decide "on the stairs", "in the doorway", "on a
   landing", or an exact step count.
 - If the old hint says a doorway, closet, second step, landing, or a specific
-  appliance but the final left/forward/right/forward-down views do not clearly
+  appliance but the final left/forward/right/back/forward-down views do not clearly
   support it, set old_destination_supported to "no" or "unclear" and recommend
   a safer generic stop phrase.
 - For stairs, first decide whether the final observation is on visible steps, on
@@ -1227,14 +1538,17 @@ def build_start_fact_messages(
     row: Dict[str, Any],
     route: RenderedRoute,
 ) -> List[Dict[str, Any]]:
-    old_instruction = normalize_instruction(row["instruction"])
+    old_instruction = normalize_instruction(row.get("instruction", ""))
+    source_context = source_instruction_context(old_instruction)
     start_frames = ", ".join(str(index) for index in route.start_frames)
     start_action_summary = summarize_action_interval(
         row["actions"],
         route.start_frames[0] if route.start_frames else 0,
         route.start_frames[-1] if route.start_frames else 0,
     )
-    route_constraints = build_route_constraints(row["actions"])
+    route_constraints = build_route_constraints(
+        row["actions"], row.get("trajectory_metadata")
+    )
     prompt = f"""
 You are the start-transition agent in a multi-agent VLN instruction generation
 pipeline. Inspect only the beginning of the route and decide whether the final
@@ -1245,8 +1559,7 @@ row has left, forward, right, back, and forward-down views. The first row is the
 initial observation. Use the first few rows to decide if the agent starts inside
 a room, at a doorway/threshold, in a hallway, in an open area, or on/near stairs.
 
-Original weak instruction:
-{old_instruction}
+{source_context}
 
 Start frames: {start_frames}
 Initial action summary: {start_action_summary}
@@ -1353,15 +1666,11 @@ def align_start_facts_with_actions(
     if degrees < TURN_DEGREES:
         return facts
 
+    conflicting_fields = []
     for key in ("recommended_start_phrase", "departure_transition"):
         text = str(facts.get(key, ""))
         if re.search(rf"\bturn {opposite}\b", text, flags=re.IGNORECASE):
-            facts[key] = re.sub(
-                rf"\bturn {opposite}\b",
-                f"turn {direction}",
-                text,
-                flags=re.IGNORECASE,
-            )
+            conflicting_fields.append(key)
     avoid = facts.get("uncertain_or_avoid")
     if not isinstance(avoid, list):
         avoid = []
@@ -1369,7 +1678,200 @@ def align_start_facts_with_actions(
         f"initial turn direction conflicting with action summary: turn {opposite}"
     )
     facts["uncertain_or_avoid"] = avoid
+    if conflicting_fields:
+        facts["action_direction_conflict"] = {
+            "fields": conflicting_fields,
+            "action_direction": direction,
+            "visual_fact_direction": opposite,
+            "resolution": "unresolved_do_not_string_replace",
+        }
     return facts
+
+
+def require_structured_fields(
+    payload: Dict[str, Any],
+    required: Sequence[str],
+    stage: str,
+) -> None:
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError(f"{stage} JSON missing required fields: {missing}")
+
+
+def validate_fact_payload(payload: Dict[str, Any], stage: str) -> None:
+    if stage == "start_facts":
+        require_structured_fields(
+            payload,
+            (
+                "visible_start_area",
+                "departure_transition",
+                "certain_landmarks",
+                "uncertain_or_avoid",
+                "recommended_start_phrase",
+                "must_preserve_start_boundary",
+            ),
+            stage,
+        )
+    elif stage == "endpoint_facts":
+        require_structured_fields(
+            payload,
+            (
+                "visible_destination_area",
+                "certain_landmarks",
+                "uncertain_or_avoid",
+                "stop_surface",
+                "surface_evidence",
+                "recommended_stop_phrase",
+                "old_destination_supported",
+                "preserve_original_destination",
+            ),
+            stage,
+        )
+        if str(payload["stop_surface"]).strip().lower() not in {
+            "floor",
+            "step",
+            "landing",
+            "threshold",
+            "unknown",
+        }:
+            raise ValueError(f"{stage} invalid stop_surface={payload['stop_surface']!r}")
+        if str(payload["old_destination_supported"]).strip().lower() not in {
+            "yes",
+            "no",
+            "unclear",
+        }:
+            raise ValueError(
+                f"{stage} invalid old_destination_supported="
+                f"{payload['old_destination_supported']!r}"
+            )
+    for key in ("certain_landmarks", "uncertain_or_avoid"):
+        if not isinstance(payload.get(key), list):
+            raise ValueError(f"{stage}.{key} must be a list")
+
+
+def validate_route_plan_payload(payload: Dict[str, Any]) -> None:
+    stage = "route_plan"
+    require_structured_fields(
+        payload,
+        (
+            "route_overview",
+            "major_segments",
+            "action_turn_coverage",
+            "safe_landmarks",
+            "passed_landmarks",
+            "near_not_passed_landmarks",
+            "avoid_claims",
+            "start",
+            "destination",
+            "writing_guidance",
+        ),
+        stage,
+    )
+    segments = payload.get("major_segments")
+    if not isinstance(segments, list) or not segments:
+        raise ValueError("route_plan.major_segments must be a non-empty list")
+    if len(segments) > 12:
+        raise ValueError("route_plan.major_segments exceeds the maximum of 12")
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError(f"route_plan.major_segments[{index}] must be an object")
+        require_structured_fields(
+            segment,
+            (
+                "start_step",
+                "end_step",
+                "movement",
+                "confirmed_landmarks",
+                "uncertain",
+                "confidence",
+            ),
+            f"route_plan.major_segments[{index}]",
+        )
+        if not str(segment.get("movement", "")).strip():
+            raise ValueError(f"route_plan.major_segments[{index}].movement is empty")
+        if str(segment.get("confidence", "")).strip().lower() not in {
+            "high",
+            "medium",
+            "low",
+        }:
+            raise ValueError(
+                f"route_plan.major_segments[{index}].confidence has invalid value"
+            )
+    destination = payload.get("destination")
+    if not isinstance(destination, dict):
+        raise ValueError("route_plan.destination must be an object")
+    require_structured_fields(
+        destination,
+        (
+            "safe_stop_phrase",
+            "visual_evidence",
+            "final_approach_direction",
+            "final_direction_evidence",
+            "old_final_turn_supported",
+            "avoid",
+        ),
+        "route_plan.destination",
+    )
+    if str(destination["final_approach_direction"]).strip().lower() not in {
+        "left",
+        "right",
+        "straight",
+        "none",
+        "unclear",
+    }:
+        raise ValueError("route_plan.destination.final_approach_direction is invalid")
+
+
+def reconcile_route_plan_landmark_relations(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Conservatively resolve contradictory pass/near/avoid landmark labels."""
+
+    def tokens(value: Any) -> Tuple[str, ...]:
+        return tuple(
+            token
+            for token in re.findall(r"[a-z0-9]+", str(value).lower())
+            if token not in {"a", "an", "the"}
+        )
+
+    passed = [str(item).strip() for item in payload.get("passed_landmarks") or [] if str(item).strip()]
+    near = [
+        str(item).strip()
+        for item in payload.get("near_not_passed_landmarks") or []
+        if str(item).strip()
+    ]
+    avoid = [str(item).strip() for item in payload.get("avoid_claims") or [] if str(item).strip()]
+    near_keys = {tokens(item) for item in near}
+    traversal_pattern = re.compile(
+        r"\b(?:pass|passes|passing|past|walk\s+past|go\s+past|move\s+past|beyond)\b",
+        re.IGNORECASE,
+    )
+    repairs: List[str] = []
+    kept_passed: List[str] = []
+    seen_passed = set()
+    for landmark in passed:
+        key = tokens(landmark)
+        if not key or key in seen_passed:
+            continue
+        seen_passed.add(key)
+        avoid_conflict = any(
+            traversal_pattern.search(claim)
+            and set(key).issubset(set(tokens(claim)))
+            for claim in avoid
+        )
+        if key in near_keys or avoid_conflict:
+            if key not in near_keys:
+                near.append(landmark)
+                near_keys.add(key)
+            repairs.append(
+                f"downgraded {landmark!r} from passed to near-not-passed due to "
+                + ("avoid_claim conflict" if avoid_conflict else "relation overlap")
+            )
+            continue
+        kept_passed.append(landmark)
+    payload["passed_landmarks"] = kept_passed
+    payload["near_not_passed_landmarks"] = near
+    if repairs:
+        payload["relation_repairs"] = repairs
+    return payload
 
 
 def extract_start_facts(
@@ -1392,6 +1894,7 @@ def extract_start_facts(
         '"certain_landmarks": [], "uncertain_or_avoid": [], '
         '"recommended_start_phrase": "...", "must_preserve_start_boundary": true}',
     )
+    validate_fact_payload(parsed, "start_facts")
     parsed = sanitize_start_facts(parsed)
     parsed = align_start_facts_with_actions(parsed, row["actions"])
     parsed["raw_response"] = raw_response
@@ -1420,7 +1923,11 @@ def extract_endpoint_facts(
         '"old_destination_supported": "yes|no|unclear", '
         '"preserve_original_destination": true}',
     )
+    validate_fact_payload(parsed, "endpoint_facts")
     parsed = sanitize_endpoint_facts(parsed)
+    if not normalize_instruction(row.get("instruction", "")):
+        parsed["old_destination_supported"] = "unclear"
+        parsed["preserve_original_destination"] = False
     parsed["raw_response"] = raw_response
     return parsed
 
@@ -1474,13 +1981,24 @@ def build_route_plan_messages(
     route: RenderedRoute,
     start_facts: Optional[Dict[str, Any]],
     endpoint_facts: Optional[Dict[str, Any]],
+    instruction_profile: str = "concise",
 ) -> List[Dict[str, Any]]:
-    old_instruction = normalize_instruction(row["instruction"])
+    old_instruction = normalize_instruction(row.get("instruction", ""))
+    source_context = source_instruction_context(old_instruction)
     action_summary = compact_action_summary(row["actions"])
     action_turn_text = action_turn_requirements_to_prompt(row["actions"])
-    route_constraints = build_route_constraints(row["actions"])
+    route_constraints = build_route_constraints(
+        row["actions"], row.get("trajectory_metadata")
+    )
     start_fact_text = start_facts_to_prompt(start_facts)
     endpoint_fact_text = endpoint_facts_to_prompt(endpoint_facts)
+    segment_guidance = (
+        "Use as many ordered segments as needed for every consequential decision; "
+        "4-10 is typical for this dense profile, but do not pad or omit events."
+        if instruction_profile == "dense"
+        else "Use 3-6 human-level segments when possible; expand only when a longer "
+        "route has additional consequential decisions."
+    )
     selected = ", ".join(str(index) for index in route.selected_frames)
     endpoint_selected = ", ".join(str(index) for index in route.endpoint_frames)
     prompt = f"""
@@ -1488,13 +2006,12 @@ You are the planning agent in a multi-agent VLN instruction generation pipeline.
 Your job is not to write the final instruction. Your job is to visually inspect
 the route and produce a structured, conservative route plan for the writer.
 
-Image 1 is the route overview. Rows are chronological selected waypoints with
-left, forward, and right views.
+Image 1 is the route overview. Rows are chronological translated waypoints with
+left, forward, right, and back views. In-place turn duplicates were collapsed.
 Image 2 is the endpoint evidence. Rows are the final approach; the final row is
 the final observation.
 
-Original weak instruction:
-{old_instruction}
+{source_context}
 
 Trajectory support:
 {action_summary}
@@ -1558,8 +2075,8 @@ Return JSON only:
 }}
 
 Planning rules:
-- Split the route into 3 to 6 major human-level segments. Do not describe every
-  small turn or every selected frame.
+- Target instruction profile: {instruction_profile}. {segment_guidance} Do not
+  describe every small turn or every selected frame.
 - Do not put numeric degree values in movement text. Use natural turn language
   such as "turn right", "turn left", "turn slightly right", or "make a sharp
   right turn".
@@ -1573,13 +2090,13 @@ Planning rules:
 - Use the original weak instruction only as a hint. If it conflicts with the
   route images, action constraints, or endpoint facts, mark the old claim in
   avoid_claims.
-- Treat the Action-derived major turns as the authoritative turn backbone. For
-  each listed turn, fill action_turn_coverage. Use write_in_instruction="yes"
-  when the turn changes which hallway, doorway, room, staircase, or open-area
-  branch the route takes. Use "no" only when the images show it is merely
-  same-area heading alignment, endpoint facing adjustment, or a small correction
-  that should not be verbalized. Do not omit a major turn just because the
-  original weak instruction omitted it or described a different turn.
+- Treat Action-derived major turns as direction/timing candidates, not automatic
+  language events. For each listed turn, fill action_turn_coverage. Use
+  write_in_instruction="yes" only when translated visual evidence shows that it
+  changes a hallway, doorway, room, staircase, or open-area branch, or is needed
+  to disambiguate the path. Use "no" for same-area heading alignment, endpoint
+  facing adjustment, path curvature, or a correction that a person would not
+  verbalize. The old weak instruction cannot by itself promote a turn to "yes".
 - Same-area orientation changes inside one open room must not become a chain of
   human commands. If a turn only makes the view face or align with a sofa,
   artwork, television, balcony doors, or other landmark without entering a new
@@ -1661,6 +2178,7 @@ def extract_route_plan(
         route=route,
         start_facts=start_facts,
         endpoint_facts=endpoint_facts,
+        instruction_profile=args.instruction_profile,
     )
     planner_args = getattr(args, "planner_args", args)
     raw_response = call_chat_completion(
@@ -1675,11 +2193,15 @@ def extract_route_plan(
         '{"route_overview": "...", "major_segments": [], "action_turn_coverage": [], '
         '"safe_landmarks": [], '
         '"passed_landmarks": [], "near_not_passed_landmarks": [], '
-        '"avoid_claims": [], "destination": {"safe_stop_phrase": "...", '
+        '"avoid_claims": [], "start": {"safe_start_phrase": "...", '
+        '"visual_evidence": "...", "avoid": []}, '
+        '"destination": {"safe_stop_phrase": "...", '
         '"visual_evidence": "...", "final_approach_direction": "left|right|straight|none|unclear", '
         '"final_direction_evidence": "...", "old_final_turn_supported": "yes|no|unclear", '
         '"avoid": []}, "writing_guidance": "..."}',
     )
+    validate_route_plan_payload(parsed)
+    parsed = reconcile_route_plan_landmark_relations(parsed)
     parsed = align_route_plan_with_late_action_turns(
         route_plan=parsed,
         actions=row["actions"],
@@ -1700,8 +2222,10 @@ def build_generation_messages(
     endpoint_facts: Optional[Dict[str, Any]] = None,
     route_plan: Optional[Dict[str, Any]] = None,
     repair_note: Optional[str] = None,
+    instruction_profile: str = "concise",
 ) -> List[Dict[str, Any]]:
-    old_instruction = normalize_instruction(row["instruction"])
+    old_instruction = normalize_instruction(row.get("instruction", ""))
+    source_context = source_instruction_context(old_instruction)
     destination_hint = extract_destination_hint(old_instruction) or "none"
     action_summary = compact_action_summary(row["actions"])
     action_turn_text = action_turn_requirements_to_prompt(row["actions"])
@@ -1711,28 +2235,49 @@ def build_generation_messages(
         actions=row["actions"],
         selected_frames=route.selected_frames,
     )
-    route_constraints = build_route_constraints(row["actions"])
+    route_constraints = build_route_constraints(
+        row["actions"], row.get("trajectory_metadata")
+    )
     start_fact_text = start_facts_to_prompt(start_facts)
     endpoint_fact_text = endpoint_facts_to_prompt(endpoint_facts)
     route_plan_text = route_plan_to_prompt(route_plan)
     route_segment_checklist = route_segment_checklist_to_prompt(route_plan)
 
+    if instruction_profile == "dense":
+        profile_guidance = (
+            "Write a dense RxR-English-style instruction: cover every supported "
+            "consequential decision and useful state-verification cue in order. "
+            "Density must come from grounded events, never filler, repeated motion, "
+            "or extra objects. A 55-120 word range is typical, but route complexity "
+            "rather than a fixed quota controls length."
+        )
+        profile_role = "dense RxR-English-style"
+    else:
+        profile_guidance = (
+            "Write a concise R2R-style instruction: use one reliable cue per "
+            "consequential decision and compress non-decision path curvature. A "
+            "25-75 word range is typical, but do not omit a required event merely "
+            "to hit the range."
+        )
+        profile_role = "concise R2R-style"
+
     system_prompt = (
-        "You are an expert Room-to-Room navigation instruction writer. "
+        f"You are an expert {profile_role} navigation instruction writer. "
         "Write grounded indoor navigation instructions from visual trajectory evidence. "
         "Return valid JSON only."
     )
     user_prompt = f"""
 You are given two contact sheets for a single indoor navigation route.
-Image 1 is the route overview. Its rows are chronological waypoints; each row has
-left, forward, and right views.
-Image 2 is the endpoint evidence. Its rows are the final approach; the last row is
-the final observation, with left, forward, right, and forward-down views. Use the
+Image 1 is the route overview. Its rows are chronological translated waypoints;
+each row has left, forward, right, and back views. Stationary turn duplicates
+were collapsed.
+Image 2 is the endpoint evidence. Its rows are translated final-approach positions
+plus the true terminal orientation when it follows an in-place turn; the last row
+is the final observation, with left, forward, right, back, and forward-down views. Use the
 last row most heavily for the destination.
 Use the route overview for the path and the endpoint evidence for the final stop.
 
-Original weak instruction:
-{old_instruction}
+{source_context}
 
 Original destination hint:
 {destination_hint}
@@ -1766,6 +2311,7 @@ Segmented route plan:
 Requirements:
 - Output JSON only: {{"instruction": "..."}}
 - The instruction must be one fluent English navigation instruction for a person.
+- Target instruction profile: {instruction_profile}. {profile_guidance}
 - Treat the original weak instruction as a rough route skeleton, not as ground
   truth. Preserve its high-level route order only when it agrees with the action
   constraints and visual evidence. If the original says "turn around" but the
@@ -1776,11 +2322,11 @@ Requirements:
   order. Do not
   verbalize every small action interval, and do not turn every interval into a new
   left/right command.
-- The ground-truth action list is authoritative for actual turns. Include major
-  action-derived turns as natural navigation cues when route_plan.action_turn_coverage
-  marks write_in_instruction="yes". Do not delete a true major turn because the
-  original weak instruction omitted it, and do not copy a turn from the original
-  weak instruction when it conflicts with the action-derived turn sequence.
+- The ground-truth action list is authoritative for low-level turn direction,
+  not for whether every camera rotation belongs in human language. Include a
+  major turn only when route_plan.action_turn_coverage marks
+  write_in_instruction="yes" from translated visual evidence. Do not copy a turn
+  solely from the original weak instruction when it conflicts with the route.
 - If a major action turn leads into a doorway, hallway, room, staircase, or
   open-area branch, write it. If destination.final_approach_direction is
   "straight", you may still write the earlier route-choice turn, then describe
@@ -1861,7 +2407,6 @@ Requirements:
   turn left to align with...". Compress same-room orientation adjustments into
   natural landmark guidance, for example "continue through the living area
   toward the glass balcony doors".
-- Target length: 25 to 75 words. Longer is allowed only if the route is long.
 """.strip()
     if repair_note:
         user_prompt += "\n\nYour previous answer failed validation:\n" + repair_note
@@ -1934,7 +2479,11 @@ def build_self_check_messages(
     endpoint_facts: Optional[Dict[str, Any]] = None,
     route_plan: Optional[Dict[str, Any]] = None,
     quality_hints: Optional[Sequence[str]] = None,
+    instruction_profile: str = "concise",
 ) -> List[Dict[str, Any]]:
+    source_context = source_instruction_context(
+        normalize_instruction(row.get("instruction", ""))
+    )
     action_summary = compact_action_summary(row["actions"])
     action_turn_text = action_turn_requirements_to_prompt(row["actions"])
     destination_hint = extract_destination_hint(row.get("instruction", "")) or "none"
@@ -1946,23 +2495,33 @@ def build_self_check_messages(
         selected_frames=route.selected_frames,
     )
     hint_text = "\n".join(f"- {hint}" for hint in (quality_hints or [])) or "none"
+    profile_standard = (
+        "dense but non-redundant RxR-English-style coverage of every supported "
+        "consequential decision and state-verification cue"
+        if instruction_profile == "dense"
+        else "concise but complete R2R-style coverage with one reliable cue per decision"
+    )
     prompt = f"""
 You are a strict human-style VLN dataset quality judge. Simulate a careful
 manual annotator who visually checks whether the instruction matches the route
 and endpoint. Do not judge by code rules alone; inspect the images.
 
 Image 1 is the chronological route overview. Each row has left, forward,
-and right perspective views at the agent's current position.
+right, and back perspective views at a translated agent position; stationary
+turn duplicates were collapsed.
 Image 2 is the endpoint evidence. Its final row is the final observation.
 
-Original weak instruction:
-{normalize_instruction(row.get("instruction", ""))}
+{source_context}
 
 Original destination hint:
 {destination_hint}
 
 Generated instruction:
 {instruction}
+
+Target instruction profile: {instruction_profile}. Judge style as
+{profile_standard}. The legacy JSON key r2r_style_score means target-profile
+style score in this run.
 
 Trajectory support:
 {action_summary}
@@ -2018,15 +2577,15 @@ Judging standard:
   fragments such as "keeping the fireplace and television" with no relation.
 - Penalize numeric degree wording such as "turn right about 30 degrees"; replace
   it with natural language such as "turn right" or "turn slightly right".
-- Major action-derived turns are key navigation information. If the route plan's
-  action_turn_coverage marks a major turn write_in_instruction="yes", the
+- Major action-derived turns are low-level evidence. If the route plan's
+  visually adjudicated action_turn_coverage marks a turn write_in_instruction="yes", the
   generated instruction should include that turn or an equivalent route-choice
   phrase. Do not remove a true major turn just because the original weak
   instruction omitted it. If a final straight approach follows an earlier true
   route-choice turn, keep both the turn and the straight approach.
 - Do not reward same-room camera-orientation chains. If the instruction says
   "turn ... to face" and then "turn ... to align" while staying in one open
-  living/dining/kitchen area, mark it borderline or fail for R2R style and
+  living/dining/kitchen area, mark it borderline or fail for target-profile style and
   correct it to a concise landmark-based route description.
 - Penalize invented hallway/corridor labels when the route is visibly through
   open connected spaces; use area or landmark wording instead.
@@ -2059,7 +2618,7 @@ Judging standard:
   endpoint are correct.
 - If an object left/right position is uncertain, correct it by removing the object
   side while keeping useful landmarks.
-- The corrected_instruction must be one natural R2R-style instruction, grounded
+- The corrected_instruction must follow the selected target profile, grounded
   in visible evidence, and must not mention images, rows, actions, or datasets.
 """.strip()
     return [
@@ -2084,6 +2643,193 @@ Judging standard:
     ]
 
 
+def build_blind_grounding_audit_messages(
+    row: Dict[str, Any],
+    route: RenderedRoute,
+    instruction: str,
+    prior_critical_findings: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Build an audit that cannot see the old instruction or planner claims."""
+    prior_summary = []
+    for finding in list(prior_critical_findings or [])[-2:]:
+        prior_summary.append(
+            {
+                "unsupported_claims": finding.get("unsupported_claims") or [],
+                "missing_decisions": finding.get("missing_decisions") or [],
+                "reason": str(finding.get("reason", "")),
+            }
+        )
+    prior_text = (
+        json.dumps(prior_summary, ensure_ascii=False, indent=2)
+        if prior_summary
+        else "none"
+    )
+    prompt = f"""
+You are an independent VLN grounding auditor. You are intentionally blind to
+the old instruction and every upstream fact/route-plan object. Judge only the
+candidate, the low-level action macros, and the projected perspective evidence.
+
+Image 1 contains start positions, image 2 contains chronological translated
+route positions, and image 3 contains final translated positions. Each row
+covers left, forward, right, and back views. In-place turn duplicates were removed.
+
+Candidate instruction:
+{instruction}
+
+Action totals and balanced head/tail macro sequence:
+{compact_action_summary(row["actions"])}
+
+Selected-position action intervals:
+{build_segmented_route_plan(row["actions"], route.selected_frames)}
+
+Deterministic action-topology check:
+{action_route_complexity_context(row["actions"])}
+
+Simulator geometry check:
+{trajectory_geometry_context(row)}
+
+Critical findings raised by an earlier blind audit of a previous candidate for
+this same trajectory (never source text or planner claims):
+{prior_text}
+
+Return JSON only:
+{{
+  "verdict": "pass|borderline|fail",
+  "endpoint_supported": "yes|no|unclear",
+  "direction_supported": "yes|no|unclear",
+  "unsupported_claims": [
+    {{"phrase": "exact candidate phrase", "severity": "major|minor", "reason": "evidence conflict"}}
+  ],
+  "missing_decisions": ["important translated route choice omitted by the candidate"],
+  "reason": "short independent judgment"
+}}
+
+Rules:
+- Every unsupported phrase must be copied from the candidate, never from this prompt.
+- A turn is a route decision only when it is followed by translation into a new
+  branch/space. Do not interpret endpoint-facing rotation as room entry.
+- Verify landmark traversal over time: visible does not imply passed.
+- The final stop must match the last position, including doorway/stair boundaries.
+- Fail for a wrong turn, wrong room/landmark, wrong stop, hallucinated traversal,
+  or a missing decision that makes the route ambiguous.
+- Borderline is permitted only for minor wording specificity that would not lead
+  a follower to a different place. Do not rewrite the candidate.
+- If prior critical findings are listed, do not erase them merely because this
+  candidate is fluent or reaches the same endpoint. Return pass only if the
+  current candidate explicitly resolves every still-visible omitted detour,
+  revisit, wrong direction, or unsupported traversal. Re-check the images rather
+  than blindly trusting the prior finding.
+""".strip()
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a blind evidence-only VLN grounding auditor. Return JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url(route.start_jpeg_bytes)}},
+                {"type": "image_url", "image_url": {"url": image_data_url(route.jpeg_bytes)}},
+                {"type": "image_url", "image_url": {"url": image_data_url(route.endpoint_jpeg_bytes)}},
+            ],
+        },
+    ]
+
+
+def blind_grounding_audit_instruction(
+    args: argparse.Namespace,
+    row: Dict[str, Any],
+    route: RenderedRoute,
+    instruction: str,
+    prior_critical_findings: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    review_args = getattr(args, "blind_args", args)
+    raw_response = call_chat_completion(
+        review_args,
+        build_blind_grounding_audit_messages(
+            row,
+            route,
+            instruction,
+            prior_critical_findings=prior_critical_findings,
+        ),
+        temperature=args.review_temperature,
+        max_tokens=args.review_max_tokens,
+    )
+    parsed = parse_json_response_with_repair(
+        review_args,
+        raw_response,
+        '{"verdict":"pass|borderline|fail","endpoint_supported":"yes|no|unclear",'
+        '"direction_supported":"yes|no|unclear","unsupported_claims":[],'
+        '"missing_decisions":[],"reason":"..."}',
+    )
+    require_structured_fields(
+        parsed,
+        (
+            "verdict",
+            "endpoint_supported",
+            "direction_supported",
+            "unsupported_claims",
+            "missing_decisions",
+            "reason",
+        ),
+        "blind_grounding_audit",
+    )
+    if str(parsed["verdict"]).strip().lower() not in {"pass", "borderline", "fail"}:
+        raise ValueError("blind_grounding_audit invalid verdict")
+    for key in ("unsupported_claims", "missing_decisions"):
+        if not isinstance(parsed.get(key), list):
+            raise ValueError(f"blind_grounding_audit.{key} must be a list")
+    parsed["raw_response"] = raw_response
+    return parsed
+
+
+def blind_grounding_audit_is_critical(audit: Dict[str, Any]) -> bool:
+    unsupported = audit.get("unsupported_claims") or []
+    major = any(
+        isinstance(issue, dict)
+        and str(issue.get("severity", "")).strip().lower() == "major"
+        for issue in unsupported
+    )
+    return (
+        str(audit.get("verdict", "")).strip().lower() == "fail"
+        or str(audit.get("endpoint_supported", "")).strip().lower() == "no"
+        or str(audit.get("direction_supported", "")).strip().lower() == "no"
+        or major
+        or bool(audit.get("missing_decisions") or [])
+    )
+
+
+def blind_grounding_audit_is_acceptable(audit: Dict[str, Any]) -> bool:
+    verdict = str(audit.get("verdict", "")).strip().lower()
+    endpoint = str(audit.get("endpoint_supported", "")).strip().lower()
+    direction = str(audit.get("direction_supported", "")).strip().lower()
+    unsupported = audit.get("unsupported_claims") or []
+    missing = audit.get("missing_decisions") or []
+    major = any(
+        isinstance(issue, dict)
+        and str(issue.get("severity", "")).strip().lower() == "major"
+        for issue in unsupported
+    )
+    if (
+        verdict == "pass"
+        and endpoint == "yes"
+        and direction != "no"
+        and not major
+        and not missing
+    ):
+        return True
+    return (
+        verdict == "borderline"
+        and endpoint == "yes"
+        and direction != "no"
+        and not major
+        and not missing
+    )
+
+
 def self_check_instruction(
     args: argparse.Namespace,
     row: Dict[str, Any],
@@ -2100,6 +2846,7 @@ def self_check_instruction(
         endpoint_facts=endpoint_facts,
         route_plan=route_plan,
         quality_hints=quality_hints,
+        instruction_profile=args.instruction_profile,
     )
     review_args = getattr(args, "review_args", args)
     raw_response = call_chat_completion(
@@ -2128,7 +2875,11 @@ def build_route_audit_messages(
     endpoint_facts: Optional[Dict[str, Any]] = None,
     route_plan: Optional[Dict[str, Any]] = None,
     quality_hints: Optional[Sequence[str]] = None,
+    instruction_profile: str = "concise",
 ) -> List[Dict[str, Any]]:
+    source_context = source_instruction_context(
+        normalize_instruction(row.get("instruction", ""))
+    )
     start_fact_text = start_facts_to_prompt(start_facts)
     endpoint_fact_text = endpoint_facts_to_prompt(endpoint_facts)
     route_plan_text = route_plan_to_prompt(route_plan)
@@ -2140,20 +2891,27 @@ def build_route_audit_messages(
         selected_frames=route.selected_frames,
     )
     hint_text = "\n".join(f"- {hint}" for hint in (quality_hints or [])) or "none"
+    profile_standard = (
+        "dense RxR-English-style event coverage without filler or repetition"
+        if instruction_profile == "dense"
+        else "concise R2R-style coverage without dropping a consequential event"
+    )
     prompt = f"""
 You are the route-coherence auditor in a multi-agent VLN instruction generation
-pipeline. Simulate a careful human R2R dataset reviewer. Your job is to check
+pipeline. Simulate a careful human VLN dataset reviewer. Your job is to check
 the whole instruction, not just the start or endpoint.
 
 Image 1 is the start evidence for the first few frames.
 Image 2 is the chronological route overview.
 Image 3 is the endpoint evidence.
 
-Original weak instruction:
-{normalize_instruction(row.get("instruction", ""))}
+{source_context}
 
 Generated instruction:
 {instruction}
+
+Target instruction profile: {instruction_profile}; expected style is
+{profile_standard}.
 
 Start facts:
 {start_fact_text}
@@ -2186,7 +2944,7 @@ Return JSON only:
     {{"segment": 1, "severity": "minor|major", "text": "what is skipped, wrong, repeated, or contradictory"}}
   ],
   "style_issues": [
-    {{"severity": "minor|major", "text": "R2R style issue"}}
+    {{"severity": "minor|major", "text": "target-profile style issue"}}
   ],
   "corrected_instruction": "corrected instruction if verdict is borderline or fail, otherwise null",
   "reason": "short reason"
@@ -2196,8 +2954,9 @@ Audit standard:
 - The instruction must cover all major route segments in order: starting
   transition, intermediate space changes, important turns/door choices, reliable
   landmarks, and final stop.
-- Major action-derived turns are authoritative route evidence. If
-  route_plan.action_turn_coverage marks a turn write_in_instruction="yes", the
+- Major action-derived turns are low-level direction/timing evidence. If the
+  visually adjudicated route_plan.action_turn_coverage marks a turn
+  write_in_instruction="yes", the
   instruction must preserve it as a natural left/right navigation cue. Do not
   drop true action-derived turns while making the language more conservative;
   separate them from final straight approach wording when needed.
@@ -2212,8 +2971,8 @@ Audit standard:
   endpoint facts or route_plan avoid_claims list a term as uncertain, do not put
   that term in corrected_instruction even when it looks like a useful landmark.
   Use the recommended safe stop phrase or a nearby unambiguous landmark instead.
-- The instruction should sound like a high-quality R2R human instruction:
-  concise but complete, natural sentence flow, no action-token list, no repeated
+- The instruction should follow the selected target profile: natural sentence
+  flow, no action-token list, no repeated
   clauses, no conflicting connectors, no image/frame/action terminology.
 - Penalize camera-alignment prose such as "turn right to face..., then turn left
   to align with...". If the route stays inside one open room, correct it to
@@ -2284,6 +3043,7 @@ def route_audit_instruction(
         endpoint_facts=endpoint_facts,
         route_plan=route_plan,
         quality_hints=quality_hints,
+        instruction_profile=args.instruction_profile,
     )
     review_args = getattr(args, "review_args", args)
     raw_response = call_chat_completion(
@@ -2303,7 +3063,18 @@ def route_audit_instruction(
 
 
 def route_audit_passed(audit: Dict[str, Any]) -> bool:
-    return str(audit.get("verdict", "")).strip().lower() == "pass"
+    if str(audit.get("verdict", "")).strip().lower() != "pass":
+        return False
+    for key in ("segment_issues", "style_issues"):
+        issues = audit.get(key) or []
+        if not isinstance(issues, list):
+            return False
+        for issue in issues:
+            if not isinstance(issue, dict):
+                return False
+            if str(issue.get("severity", "")).strip().lower() == "major":
+                return False
+    return True
 
 
 def route_audit_is_acceptable_borderline(audit: Dict[str, Any]) -> bool:
@@ -2353,6 +3124,9 @@ def build_spatial_audit_messages(
     endpoint_facts: Optional[Dict[str, Any]] = None,
     route_plan: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    source_context = source_instruction_context(
+        normalize_instruction(row.get("instruction", ""))
+    )
     prompt = f"""
 You are the final spatial-boundary auditor for a VLN instruction.
 The normal critic already checked general route quality. Your only job is to
@@ -2362,8 +3136,7 @@ would mark as borderline.
 Image 1 is the chronological route overview. Image 2 is the final approach and
 endpoint. Inspect both images carefully.
 
-Original weak instruction:
-{normalize_instruction(row.get("instruction", ""))}
+{source_context}
 
 Generated instruction:
 {instruction}
@@ -2496,7 +3269,8 @@ def accept_neutral_spatial_borderline(
         return False
     lower = normalize_instruction(instruction).lower()
     neutral_patterns = (
-        r"\bnear the (?:top of the |bottom of the )?(?:wooden |carpeted )?"
+        r"\bnear the (?:top of the |bottom of the |base of the )?"
+        r"(?:white |wooden |carpeted )?"
         r"(?:stairs|staircase|stairway)\b",
         r"\b(?:at|by|beside|next to) the (?:wooden |carpeted )?"
         r"(?:stairs|staircase|stairway)\b",
@@ -2514,12 +3288,12 @@ def accept_stale_spatial_audit(
     audit: Dict[str, Any],
 ) -> bool:
     verdict = str(audit.get("verdict", "")).strip().lower()
-    if verdict not in {"borderline", "fail"}:
+    # A fail verdict must never be converted to success by a stale-phrase
+    # heuristic. Borderline can be accepted only when every cited phrase is
+    # demonstrably absent from the candidate currently under review.
+    if verdict != "borderline":
         return False
     normalized = normalize_instruction(instruction)
-    corrected = normalize_instruction(str(audit.get("corrected_instruction") or ""))
-    if corrected and corrected != "." and corrected == normalized:
-        return True
 
     issues = audit.get("boundary_issues") or []
     phrases = []
@@ -2529,7 +3303,7 @@ def accept_stale_spatial_audit(
                 phrase = str(issue.get("phrase", "")).strip()
                 if phrase:
                     phrases.append(phrase)
-    if phrases and not any(phrase.lower() in normalized.lower() for phrase in phrases):
+    if phrases and all(phrase.lower() not in normalized.lower() for phrase in phrases):
         return True
     return False
 
@@ -2540,12 +3314,21 @@ def self_check_passed(check: Dict[str, Any]) -> bool:
     grounding = int(check.get("grounding_score", 0) or 0)
     navigation = int(check.get("navigation_score", 0) or 0)
     endpoint = int(check.get("endpoint_score", 0) or 0)
+    style = int(check.get("r2r_style_score", 0) or 0)
     if verdict != "pass":
         return False
     if hallucination == "high":
         return False
-    if grounding < 4 or navigation < 4 or endpoint < 4:
+    if grounding < 4 or navigation < 4 or endpoint < 4 or style < 4:
         return False
+    issues = check.get("issues") or []
+    if not isinstance(issues, list):
+        return False
+    for issue in issues:
+        if not isinstance(issue, dict):
+            return False
+        if str(issue.get("severity", "")).strip().lower() == "major":
+            return False
     return True
 
 
@@ -2767,8 +3550,9 @@ def endpoint_consistency_hints(
                     )
     if not destination:
         sensitive_stop = re.search(
-            r"\b(?:stop|stopping|wait|halt|finish|end|stand|remain)\b[^.!?;]*",
+            STOP_CUE_PATTERN + r"[^.!?;]*",
             instruction_lower,
+            flags=re.IGNORECASE,
         )
         if sensitive_stop:
             destination = sensitive_stop.group(0)
@@ -2826,11 +3610,7 @@ def endpoint_specificity_hints(
     ]
     stop_index = None
     for index, sentence in enumerate(sentences):
-        if re.search(
-            r"\b(?:stop|stopping|wait|halt|finish|end|stand|remain)\b",
-            sentence,
-            flags=re.IGNORECASE,
-        ):
+        if has_explicit_stop_cue(sentence):
             stop_index = index
     if stop_index is None:
         return []
@@ -2865,6 +3645,7 @@ def final_blocking_hints(
             or "begins with turn around" in hint
         ):
             hints.append(hint)
+    hints.extend(action_route_complexity_hints(instruction, actions))
     hints.extend(start_consistency_hints(instruction, start_facts))
     for hint in endpoint_consistency_hints(instruction, endpoint_facts):
         if (
@@ -2909,7 +3690,7 @@ def final_destination_turn_hints(
         return []
     stop_index = None
     for index, sentence in enumerate(sentences):
-        if re.search(r"\b(?:stop|stopping|wait|halt|finish|end|remain|stand)\b", sentence, re.IGNORECASE):
+        if has_explicit_stop_cue(sentence):
             stop_index = index
     if stop_index is None:
         return []
@@ -3309,197 +4090,87 @@ def align_route_plan_with_late_action_turns(
     actions: Sequence[int],
     endpoint_facts: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    """Record late-turn evidence without rewriting visual route facts.
+
+    In a panoramic trajectory, a late in-place turn can be either a real branch
+    choice or merely terminal camera alignment. The previous implementation
+    overwrote planner fields with the action-only heuristic, then asked the
+    writer and gate to enforce the overwritten value. That creates circular
+    confirmation. This function now preserves the independent visual plan and
+    exposes an explicit conflict for downstream neutral wording/adjudication.
+    """
     expected = last_late_major_turn(actions)
     if not expected:
         return route_plan
-    if not endpoint_supports_directional_entry(endpoint_facts):
-        return route_plan
-
-    terms = destination_entry_terms(endpoint_facts, route_plan)
-    if not terms:
-        return route_plan
-
-    if route_plan_treats_late_turn_as_alignment(route_plan, expected):
-        return route_plan
-
-    must_write_entry_turn = requires_directional_entry_mention(endpoint_facts)
-    expected_direction = str(expected["direction"])
-    opposite = "right" if expected_direction == "left" else "left"
-    term_pattern = "|".join(re.escape(term) for term in terms)
-    opposite_entry_pattern = re.compile(
-        rf"\bturn\s+{opposite}\b(?P<tail>[^.!?]{{0,100}}"
-        rf"\b(?:into|toward|towards|onto|through|to enter|enter)\b"
-        rf"[^.!?]{{0,100}}\b(?:{term_pattern})\b)",
-        re.IGNORECASE,
+    destination = route_plan.get("destination") or {}
+    planned_direction = (
+        str(destination.get("final_approach_direction", "")).strip().lower()
+        if isinstance(destination, dict)
+        else ""
     )
-    expected_entry_pattern = re.compile(
-        rf"\bturn\s+{expected_direction}\b[^.!?]{{0,100}}"
-        rf"\b(?:into|toward|towards|onto|through|to enter|enter)\b"
-        rf"[^.!?]{{0,100}}\b(?:{term_pattern})\b",
-        re.IGNORECASE,
-    )
+    action_direction = str(expected["direction"])
+    evidence = {
+        "turn_steps": f"{expected['start']}-{expected['end']}",
+        "direction": action_direction,
+        "degrees": int(expected["degrees"]),
+        "interpretation": "unresolved_route_turn_or_in_place_alignment",
+    }
+    route_plan["late_action_turn_candidate"] = evidence
 
-    changed = False
+    warnings = route_plan.setdefault("_sanitizer_warnings", [])
+    if planned_direction in {"left", "right"} and planned_direction != action_direction:
+        warning = (
+            "late action turn conflicts with visual planner direction; preserve "
+            "both observations and use neutral destination-entry wording until "
+            "an independent geometry/visual resolver adjudicates the conflict"
+        )
+    else:
+        warning = (
+            "late action turn recorded as unresolved evidence; it did not "
+            "overwrite final_approach_direction or action_turn_coverage"
+        )
+    if warning not in warnings:
+        warnings.append(warning)
+    return route_plan
 
-    def replace_opposite_entry(text: str) -> str:
-        nonlocal changed
 
-        def replacement(match: re.Match[str]) -> str:
-            nonlocal changed
-            changed = True
-            return f"turn {expected_direction}{match.group('tail')}"
-
-        return opposite_entry_pattern.sub(replacement, text)
-
-    for segment in route_plan.get("major_segments") or []:
-        if not isinstance(segment, dict):
-            continue
-        movement = str(segment.get("movement", ""))
-        fixed = replace_opposite_entry(movement)
-        if fixed != movement:
-            segment["movement"] = fixed
-            uncertain = segment.get("uncertain")
-            if not isinstance(uncertain, list):
-                uncertain = []
-            uncertain.append(
-                f"opposite final destination entry turn ({opposite}) was corrected "
-                f"from late action steps {expected['start']}-{expected['end']}"
-            )
-            segment["uncertain"] = uncertain
-
-    avoid_claims = []
-    expected_turn_avoid_pattern = re.compile(
-        rf"\bturn\s+{expected_direction}\b",
-        re.IGNORECASE,
-    )
-    for item in route_plan.get("avoid_claims") or []:
-        text = str(item)
-        lower = text.lower()
-        if expected_entry_pattern.search(lower) or (
-            expected_turn_avoid_pattern.search(lower)
-            and (
-                lower.strip(" .;") == f"turn {expected_direction}"
-                or any(term in lower for term in terms)
-                or "end of the hallway" in lower
-                or "end of the hall" in lower
-                or "final" in lower
-                or "destination" in lower
-            )
-        ):
-            changed = True
-            continue
-        avoid_claims.append(text)
-    opposite_avoid = (
-        f"turn {opposite} into/toward the final destination area; late action "
-        f"steps {expected['start']}-{expected['end']} support {expected_direction}"
-    )
-    if opposite_avoid not in avoid_claims:
-        avoid_claims.append(opposite_avoid)
-        changed = True
-    route_plan["avoid_claims"] = avoid_claims
-
-    destination = route_plan.get("destination")
+def route_plan_independently_supports_late_turn(
+    route_plan: Optional[Dict[str, Any]],
+    expected: Dict[str, Any],
+) -> bool:
+    """Require visual/planner support before action-only direction is binding."""
+    if not route_plan:
+        return False
+    destination = route_plan.get("destination") or {}
     if not isinstance(destination, dict):
-        destination = {}
-    destination_avoid = []
-    expected_turn_pattern = re.compile(rf"\bturn\s+{expected_direction}\b", re.IGNORECASE)
-    for item in destination.get("avoid") or []:
-        text = str(item)
-        lower = text.lower()
-        if expected_turn_pattern.search(lower) and (
-            lower.strip(" .;") == f"turn {expected_direction}"
-            or any(term in lower for term in terms)
-            or "final" in lower
-            or "destination" in lower
-        ):
-            changed = True
-            continue
-        destination_avoid.append(text)
-    destination["avoid"] = destination_avoid
-    destination["final_approach_direction"] = expected_direction
-    evidence = str(destination.get("final_direction_evidence", "")).strip()
-    action_evidence = (
-        f"Late action steps {expected['start']}-{expected['end']} form a major "
-        f"{expected_direction} turn of about {expected['degrees']} degrees before "
-        "the final approach."
-    )
-    if action_evidence not in evidence:
-        destination["final_direction_evidence"] = (
-            f"{evidence} {action_evidence}".strip()
-        )
-    destination["old_final_turn_supported"] = (
-        "no" if opposite_entry_pattern.search(evidence) else destination.get(
-            "old_final_turn_supported", "unclear"
-        )
-    )
-    route_plan["destination"] = destination
-
-    coverage = route_plan.get("action_turn_coverage")
-    if not isinstance(coverage, list):
-        coverage = []
+        return False
+    if str(destination.get("final_approach_direction", "")).strip().lower() != str(
+        expected["direction"]
+    ):
+        return False
+    evidence = str(destination.get("final_direction_evidence", "")).lower()
+    if not evidence or re.fullmatch(r".*late action steps.*", evidence):
+        return False
     expected_steps = f"{expected['start']}-{expected['end']}"
-    matched_coverage = False
-    for item in coverage:
+    for item in route_plan.get("action_turn_coverage") or []:
         if not isinstance(item, dict):
             continue
-        if (
-            str(item.get("direction", "")).strip().lower() == expected_direction
-            and str(item.get("turn_steps", "")).strip() == expected_steps
-        ):
-            item["write_in_instruction"] = "yes" if must_write_entry_turn else "no"
-            if must_write_entry_turn:
-                item["reason"] = (
-                    "Late major action turn before a destination area entry; "
-                    "preserve it as the final destination entry direction."
-                )
-            else:
-                item["reason"] = (
-                    "Late major action turn before a boundary/threshold stop; "
-                    "avoid the opposite turn but neutral continue/approach "
-                    "wording is preferable."
-                )
-            matched_coverage = True
-            changed = True
-    if not matched_coverage:
-        coverage.append(
-            {
-                "turn_steps": expected_steps,
-                "direction": expected_direction,
-                "degrees": int(expected["degrees"]),
-                "write_in_instruction": "yes" if must_write_entry_turn else "no",
-                "covered_by_segment": "final destination entry",
-                "reason": (
-                    "Late major action turn before a destination area entry; "
-                    "preserve it as the final destination entry direction."
-                    if must_write_entry_turn
-                    else "Late major action turn before a boundary/threshold stop; "
-                    "avoid the opposite turn but neutral continue/approach wording "
-                    "is preferable."
-                ),
-            }
+        if str(item.get("turn_steps", "")).strip() != expected_steps:
+            continue
+        if str(item.get("direction", "")).strip().lower() != str(expected["direction"]):
+            continue
+        if str(item.get("write_in_instruction", "")).strip().lower() not in {
+            "yes",
+            "true",
+            "required",
+        }:
+            continue
+        combined = " ".join(
+            [str(item.get("reason", "")), str(item.get("covered_by_segment", ""))]
         )
-        changed = True
-    route_plan["action_turn_coverage"] = coverage
-
-    guidance = str(route_plan.get("writing_guidance", "")).strip()
-    action_guidance = (
-        f"For the final destination entry, do not write turn {opposite}; use "
-        f"turn {expected_direction} if visually supported, otherwise use neutral "
-        "enter/continue wording."
-    )
-    if action_guidance not in guidance:
-        route_plan["writing_guidance"] = f"{guidance} {action_guidance}".strip()
-        changed = True
-
-    if changed:
-        warning = (
-            f"aligned final destination entry with late major action turn: "
-            f"{expected_direction} at steps {expected['start']}-{expected['end']}"
-        )
-        warnings = route_plan.setdefault("_sanitizer_warnings", [])
-        if warning not in warnings:
-            warnings.append(warning)
-    return route_plan
+        if is_route_transition_text(combined) and not is_orientation_alignment_text(combined):
+            return True
+    return False
 
 
 def destination_entry_turn_hints(
@@ -3529,7 +4200,7 @@ def destination_entry_turn_hints(
         return []
     stop_index = None
     for index, sentence in enumerate(sentences):
-        if re.search(r"\b(?:stop|stopping|wait|halt|finish|end|remain|stand)\b", sentence, re.IGNORECASE):
+        if has_explicit_stop_cue(sentence):
             stop_index = index
     if stop_index is None:
         context_sentences = sentences[-2:]
@@ -3537,6 +4208,8 @@ def destination_entry_turn_hints(
         context_sentences = sentences[max(0, stop_index - 1) : stop_index + 1]
 
     if route_plan_treats_late_turn_as_alignment(route_plan, expected):
+        return []
+    if not route_plan_independently_supports_late_turn(route_plan, expected):
         return []
 
     terms = destination_entry_terms(endpoint_facts, route_plan)
@@ -3593,24 +4266,93 @@ def unsupported_passing_hints(
     lower = normalize_instruction(instruction).lower()
     pass_claims = []
     pass_patterns = (
+        r"\bpass(?:es)?\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
         r"\bpassing\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
         r"\bwalk(?:ing)?\s+past\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
         r"\bgo(?:ing)?\s+past\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
         r"\bmov(?:e|ing)\s+past\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
-        r"\bcontinue(?:ing)?(?:\s+straight)?\s+past\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
+        r"\bcontinu(?:e|ing)(?:\s+straight)?\s+past\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
         r"\bproceed(?:ing)?(?:\s+straight)?\s+past\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
+        # Also cover adverbial forms such as "walk down the hall, past the
+        # stairs". The earlier verb-specific expressions do not see these.
+        r"\bpast\s+(?:the\s+|a\s+|an\s+)?([^.!?;,]{3,60})",
     )
     for pattern in pass_patterns:
         for match in re.finditer(pattern, lower):
             phrase = re.split(
-                r"\b(?:then|before|after|until|toward|towards|into|through|and)\b",
+                (
+                    r"\b(?:then|before|after|until|toward|towards|into|through)\b"
+                    r"|\band\s+(?=(?:turn|walk|continue|head|go|move|enter|exit|"
+                    r"stop|proceed)\b)"
+                ),
                 match.group(1),
                 maxsplit=1,
             )[0].strip(" ,")
-            if phrase:
-                pass_claims.append(phrase)
+            # A single traversal verb can govern a coordinated landmark list:
+            # "passing the table and the staircase". Check every conjunct so a
+            # supported first landmark cannot hide a near-only second one.
+            for conjunct_index, conjunct in enumerate(re.split(r"\band\b", phrase)):
+                conjunct = conjunct.strip(" ,")
+                if conjunct_index > 0 and re.match(
+                    r"^(?:move|moving|walk|walking|go|going|continue|continuing|"
+                    r"proceed|proceeding)\s+(?:near|by|along|toward|towards|beside)\b",
+                    conjunct,
+                ):
+                    # The coordinated clause starts a new non-traversal relation:
+                    # "passing the stove and moving near the railing" passes only
+                    # the stove; do not let the first verb govern the railing.
+                    continue
+                if conjunct:
+                    pass_claims.append(conjunct)
     if not pass_claims:
         return []
+
+    # Normalize common lexical variants so planner evidence and writer wording
+    # are compared semantically (for example, ``stairs`` vs ``staircase``).
+    landmark_aliases = {
+        "staircase": "stairs",
+        "staircases": "stairs",
+        "stairway": "stairs",
+        "stairways": "stairs",
+        "stairwell": "stairs",
+        "stairwells": "stairs",
+        "television": "tv",
+        "televisions": "tv",
+        "couches": "couch",
+        "sofas": "sofa",
+    }
+
+    generic_relation_tokens = {
+        "black",
+        "blue",
+        "brown",
+        "dark",
+        "framed",
+        "gray",
+        "green",
+        "grey",
+        "large",
+        "light",
+        "long",
+        "orange",
+        "purple",
+        "small",
+        "tall",
+        "white",
+        "wooden",
+        "yellow",
+    }
+
+    def canonical_token(token: str) -> str:
+        return landmark_aliases.get(token, token)
+
+    def usable_relation_token(token: str) -> Optional[str]:
+        canonical = canonical_token(token)
+        if canonical in generic_relation_tokens:
+            return None
+        if len(canonical) >= 4 or canonical == "tv":
+            return canonical
+        return None
 
     def token_set(values: Any) -> set[str]:
         tokens: set[str] = set()
@@ -3620,8 +4362,9 @@ def unsupported_passing_hints(
             iterator = [values]
         for value in iterator:
             for token in re.findall(r"[a-z]+", str(value).lower()):
-                if len(token) >= 5:
-                    tokens.add(token)
+                canonical = usable_relation_token(token)
+                if canonical:
+                    tokens.add(canonical)
         return tokens
 
     passed_tokens = token_set(route_plan.get("passed_landmarks") or [])
@@ -3639,6 +4382,7 @@ def unsupported_passing_hints(
         if re.search(r"\b(?:pass|passing|past)\b", movement):
             pass_movement_texts.append(movement)
     pass_movement_text = " ".join(pass_movement_texts)
+    pass_movement_tokens = token_set(pass_movement_text)
 
     hints = []
     stop_tokens = {
@@ -3671,9 +4415,11 @@ def unsupported_passing_hints(
     }
     for claim in pass_claims:
         tokens = [
-            token
+            canonical
             for token in re.findall(r"[a-z]+", claim)
-            if len(token) >= 5 and token not in stop_tokens
+            if token not in stop_tokens
+            for canonical in [usable_relation_token(token)]
+            if canonical
         ]
         strict_claim = any(term in tokens or term in claim for term in strict_pass_terms)
         if tokens and near_not_passed_tokens and any(
@@ -3705,7 +4451,7 @@ def unsupported_passing_hints(
                     "not explicitly say to pass/go past that landmark; inspect whether "
                     "the route really moves beyond it or only turns near it"
                 )
-        elif tokens and not any(token in pass_movement_text for token in tokens):
+        elif tokens and not any(token in pass_movement_tokens for token in tokens):
             if (
                 not strict_claim
                 and confirmed_tokens
@@ -3717,6 +4463,81 @@ def unsupported_passing_hints(
                 "is not named in any route-plan pass/past movement; inspect before accepting"
             )
     return sorted(set(hints))
+
+
+def neutralize_near_not_passed_phrasing(
+    instruction: str,
+    route_plan: Optional[Dict[str, Any]],
+) -> str:
+    """Downgrade pass/past to by only for explicitly near-only landmarks.
+
+    This is deliberately narrower than general text cleanup: RouteSpec has
+    already declared the relation, and the replacement removes an unsupported
+    traversal claim. The resulting candidate is still sent through the second
+    route audit, blind visual audit, and final deterministic gate.
+    """
+    if not route_plan:
+        return instruction
+    values = route_plan.get("near_not_passed_landmarks") or []
+    if not isinstance(values, list):
+        values = [values]
+    surface_forms: set[str] = set()
+    for value in values:
+        surface = " ".join(re.findall(r"[a-z0-9]+", str(value).lower()))
+        if not surface:
+            continue
+        surface_forms.add(surface)
+        if surface in {"stairs", "staircase", "stairway", "stairwell"}:
+            surface_forms.update({"stairs", "staircase", "stairway", "stairwell"})
+        if surface in {"tv", "television"}:
+            surface_forms.update({"tv", "television"})
+    result = instruction
+    for surface in sorted(surface_forms, key=len, reverse=True):
+        landmark = re.escape(surface).replace(r"\ ", r"[\s-]+")
+        coordinated_relation = re.compile(
+            (
+                r"(?P<prefix>\b(?:passing|walking\s+past|walk\s+past|going\s+past|"
+                r"go\s+past|moving\s+past|move\s+past|continuing\s+past|"
+                r"continue\s+past|past)\b[^.!?;,]{0,80}?)"
+                rf"\band\s+(?:near|by|along|beside)\s+"
+                rf"(?P<landmark>(?:(?:the|a|an)\s+)?{landmark}\b)"
+            ),
+            flags=re.IGNORECASE,
+        )
+        result = coordinated_relation.sub(
+            lambda match: (
+                f"{match.group('prefix')}and going by {match.group('landmark')}"
+            ),
+            result,
+        )
+        coordinated = re.compile(
+            (
+                r"(?P<prefix>\b(?:passing|walking\s+past|walk\s+past|going\s+past|"
+                r"go\s+past|continuing\s+past|continue\s+past|past)\b[^.!?;,]{0,80}?)"
+                rf"\band\s+(?P<landmark>(?:(?:the|a|an)\s+)?{landmark}\b)"
+            ),
+            flags=re.IGNORECASE,
+        )
+        result = coordinated.sub(
+            lambda match: (
+                f"{match.group('prefix')}and going by {match.group('landmark')}"
+            ),
+            result,
+        )
+        lookahead = rf"(?=\s+(?:(?:the|a|an)\s+)?{landmark}\b)"
+        replacements = (
+            (rf"\bwalking\s+past\b{lookahead}", "walking by"),
+            (rf"\bwalk\s+past\b{lookahead}", "walk by"),
+            (rf"\bgoing\s+past\b{lookahead}", "going by"),
+            (rf"\bgo\s+past\b{lookahead}", "go by"),
+            (rf"\bcontinuing\s+past\b{lookahead}", "continuing by"),
+            (rf"\bcontinue\s+past\b{lookahead}", "continue by"),
+            (rf"\bpassing\b{lookahead}", "going by"),
+            (rf"\bpast\b{lookahead}", "by"),
+        )
+        for pattern, replacement in replacements:
+            result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+    return normalize_instruction(result)
 
 
 def route_plan_final_direction_hints(
@@ -3839,7 +4660,7 @@ def route_plan_final_direction_hints(
 
     stop_index = None
     for index, sentence in enumerate(sentences):
-        if re.search(r"\b(?:stop|stopping|wait|halt|finish|end|remain|stand)\b", sentence, re.IGNORECASE):
+        if has_explicit_stop_cue(sentence):
             stop_index = index
     if stop_index is None:
         context = " ".join(destination_context)
@@ -3939,6 +4760,24 @@ def route_plan_action_turn_coverage_hints(
         if direction not in {"left", "right"}:
             continue
         turn_steps = str(item.get("turn_steps", "")).strip()
+        try:
+            turn_degrees = float(item.get("degrees", 0))
+        except (TypeError, ValueError):
+            turn_degrees = 0.0
+        # For an initial large reorientation, natural R2R language commonly says
+        # "turn around" without choosing left versus right.  The action-level
+        # direction is still checked by route_language_hints when the text does
+        # name one.  Do not require a redundant "turn left" after a valid initial
+        # turnaround phrase.
+        initial_turn = bool(re.match(r"^0(?:\D|$)", turn_steps))
+        begins_with_turnaround = bool(
+            re.match(
+                r"^(?:please\s+)?(?:turn around|turn back|make a u-turn)\b",
+                lower,
+            )
+        )
+        if initial_turn and turn_degrees >= 120.0 and begins_with_turnaround:
+            continue
         direction_pattern = (
             rf"\b(?:turn|bear|veer|go|head|take|enter|move)\b[^.!?]{{0,45}}\b{direction}\b"
             rf"|\b{direction}\b[^.!?]{{0,45}}\b(?:turn|doorway|door|hall|hallway|room|branch|stair|stairs)\b"
@@ -4157,10 +4996,10 @@ def style_quality_hints(instruction: str) -> List[str]:
             )
             break
     if lower.count("walk forward") >= 3:
-        hints.append("repeats 'walk forward' too often; improve R2R style")
+        hints.append("repeats 'walk forward' too often; improve human VLN style")
     if re.search(r"\bstop there\.?$", lower):
         hints.append("uses vague final phrase 'stop there'; prefer an explicit landmark stop phrase")
-    if not re.search(r"\b(?:stop|stopping|wait|halt|finish|end|stand|remain)\b", lower):
+    if not has_explicit_stop_cue(lower):
         hints.append("does not explicitly tell the navigator where to stop")
     if re.search(r"\b(?:about|approximately|around)?\s*\d{2,3}\s*degrees\b", lower):
         hints.append("uses numeric degree wording; replace it with natural R2R turn language")
@@ -4230,7 +5069,7 @@ def style_quality_hints(instruction: str) -> List[str]:
 def final_style_blocking_hints(instruction: str) -> List[str]:
     lower = normalize_instruction(instruction).lower()
     blockers = []
-    if not re.search(r"\b(?:stop|stopping|wait|halt|finish|end|stand|remain)\b", lower):
+    if not has_explicit_stop_cue(lower):
         blockers.append("final instruction does not explicitly tell the navigator where to stop")
     if re.search(r"\b(?:about|approximately|around)?\s*\d{2,3}\s*degrees\b", lower):
         blockers.append("final instruction still uses numeric degree wording")
@@ -4375,7 +5214,7 @@ def parse_and_validate_response(
 
 @dataclass
 class EpisodeState:
-    """Mutable state passed between the rewrite agents for one episode."""
+    """Mutable state passed between instruction agents for one episode."""
 
     row: Dict[str, Any]
     args: argparse.Namespace
@@ -4390,8 +5229,15 @@ class EpisodeState:
         candidate: Dict[str, Any] = {
             "episode_id": episode_id,
             "status": "failed",
-            "old_instruction": row["instruction"],
+            "old_instruction": row.get("instruction", ""),
             "actions": [int(action) for action in row["actions"]],
+            "row_fingerprint": input_row_fingerprint(row),
+            "input_fingerprint": None,
+            "route_evidence_error": None,
+            "pipeline_fingerprint": getattr(args, "pipeline_fingerprint", None),
+            "pipeline_schema_version": PIPELINE_SCHEMA_VERSION,
+            "mode": getattr(args, "mode", "rewrite"),
+            "instruction_profile": getattr(args, "instruction_profile", "concise"),
             "provider": args.provider,
             "model": args.model,
             "base_url": args.base_url,
@@ -4403,7 +5249,7 @@ class EpisodeState:
             "contact_sheet": None,
             "start_sheet": None,
             "endpoint_sheet": None,
-            "destination_hint": extract_destination_hint(row["instruction"]),
+            "destination_hint": extract_destination_hint(row.get("instruction", "")),
             "start_facts": None,
             "endpoint_facts": None,
             "route_plan": None,
@@ -4413,6 +5259,7 @@ class EpisodeState:
             "warnings": [],
             "error": None,
             "raw_response": None,
+            "blind_grounding_audits": [],
             "self_checks": [],
             "route_audits": [],
             "spatial_audits": [],
@@ -4443,6 +5290,7 @@ class RouteEvidenceAgent:
     def run(self, state: EpisodeState) -> bool:
         args = state.args
         try:
+            input_fingerprint = input_row_fingerprint(state.row, args)
             route = render_contact_sheet(
                 row=state.row,
                 image_root=args.image_root,
@@ -4457,11 +5305,16 @@ class RouteEvidenceAgent:
                 use_action_heading=args.use_action_heading,
             )
         except Exception as error:
+            state.candidate["route_evidence_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
             state.fail(f"render_failed: {type(error).__name__}: {error}")
             return False
 
         state.route = route
         candidate = state.candidate
+        candidate["input_fingerprint"] = input_fingerprint
+        candidate["route_evidence_error"] = None
         candidate["selected_frames"] = route.selected_frames
         candidate["start_frames"] = route.start_frames
         candidate["endpoint_frames"] = route.endpoint_frames
@@ -4642,7 +5495,7 @@ def build_quality_hints(state: EpisodeState, instruction: str) -> List[str]:
 
 
 class InstructionWriterAgent:
-    """Writes the final R2R-style instruction from agent facts and route plan."""
+    """Writes the selected instruction profile from agent facts and route plan."""
 
     name = "writer"
 
@@ -4660,19 +5513,82 @@ class InstructionWriterAgent:
             endpoint_facts=state.candidate.get("endpoint_facts"),
             route_plan=state.candidate.get("route_plan"),
             repair_note=repair_note,
+            instruction_profile=state.args.instruction_profile,
         )
-        raw_response = call_chat_completion(args, messages)
+        writer_args = getattr(args, "writer_args", args)
+        raw_response = call_chat_completion(writer_args, messages)
         state.candidate["raw_response"] = raw_response
         return parse_and_validate_response(
             raw_response=raw_response,
-            old_instruction=state.row["instruction"],
+            old_instruction=state.row.get("instruction", ""),
             min_words=args.min_words,
             max_words=args.max_words,
         )
 
 
+class BlindGroundingAuditorAgent:
+    """Audits raw evidence without access to old text or upstream plans."""
+
+    name = "blind_grounding_auditor"
+
+    def run(self, state: EpisodeState, instruction: str) -> None:
+        if not state.args.blind_grounding_audit:
+            return
+        assert state.route is not None
+        prior_critical = [
+            item
+            for item in state.candidate["blind_grounding_audits"]
+            if isinstance(item, dict) and blind_grounding_audit_is_critical(item)
+        ]
+        audit = blind_grounding_audit_instruction(
+            args=state.args,
+            row=state.row,
+            route=state.route,
+            instruction=instruction,
+            prior_critical_findings=prior_critical,
+        )
+        state.candidate["blind_grounding_audits"].append(audit)
+        # Once an independent audit has found a critical grounding failure, one
+        # stochastic pass cannot erase it.  A repaired candidate must obtain two
+        # consecutive evidence-only acceptances, both shown the earlier findings.
+        if prior_critical and blind_grounding_audit_is_acceptable(audit):
+            confirmation = blind_grounding_audit_instruction(
+                args=state.args,
+                row=state.row,
+                route=state.route,
+                instruction=instruction,
+                prior_critical_findings=prior_critical,
+            )
+            confirmation["confirmation_of_prior_critical"] = True
+            state.candidate["blind_grounding_audits"].append(confirmation)
+            audit = confirmation
+        verdict = str(audit.get("verdict", "")).strip().lower()
+        endpoint = str(audit.get("endpoint_supported", "")).strip().lower()
+        direction = str(audit.get("direction_supported", "")).strip().lower()
+        unsupported = audit.get("unsupported_claims") or []
+        missing = audit.get("missing_decisions") or []
+        major = any(
+            isinstance(issue, dict)
+            and str(issue.get("severity", "")).strip().lower() == "major"
+            for issue in unsupported
+        )
+        if blind_grounding_audit_is_acceptable(audit) and verdict == "pass":
+            return
+        if (
+            blind_grounding_audit_is_acceptable(audit)
+            and verdict == "borderline"
+        ):
+            state.candidate["warnings"].append("accepted blind grounding borderline")
+            return
+        raise ValueError(
+            "blind_grounding_audit_failed: "
+            f"verdict={verdict} endpoint={endpoint} direction={direction} "
+            f"unsupported={unsupported} missing={missing} reason={audit.get('reason')}"
+        )
+
+
 class SelfCheckCriticAgent:
-    """Reviews grounding, navigation, endpoint, and R2R style."""
+    """Reviews grounding, navigation, endpoint, and target-profile style."""
 
     name = "self_check_critic"
 
@@ -4705,6 +5621,10 @@ class SelfCheckCriticAgent:
         )
         if corrected and corrected != ".":
             instruction = corrected
+            instruction = neutralize_near_not_passed_phrasing(
+                instruction,
+                state.candidate.get("route_plan"),
+            )
             final_check = self_check_instruction(
                 args=args,
                 row=state.row,
@@ -4725,8 +5645,11 @@ class SelfCheckCriticAgent:
                 str(final_check.get("corrected_instruction") or "")
             )
             if final_corrected and final_corrected != "." and final_corrected != instruction:
-                warnings.append("accepted self-check final correction after non-pass")
-                return final_corrected, warnings
+                raise ValueError(
+                    "self_check_proposed_unreviewed_second_correction: "
+                    "send the issue back to the writer retry instead of accepting it. "
+                    f"Suggested reviewed repair: {final_corrected}"
+                )
             raise ValueError(
                 "review_repair_failed: "
                 f"verdict={final_check.get('verdict')} "
@@ -4758,6 +5681,16 @@ class RouteCoherenceAuditorAgent:
             return instruction, warnings
         assert state.route is not None
 
+        neutralized = neutralize_near_not_passed_phrasing(
+            instruction,
+            state.candidate.get("route_plan"),
+        )
+        if neutralized != instruction:
+            instruction = neutralized
+            warnings.append(
+                "deterministically downgraded a near-only landmark from pass/past to by"
+            )
+
         route_audit = route_audit_instruction(
             args=args,
             row=state.row,
@@ -4786,6 +5719,15 @@ class RouteCoherenceAuditorAgent:
             )
 
         instruction = corrected
+        neutralized = neutralize_near_not_passed_phrasing(
+            instruction,
+            state.candidate.get("route_plan"),
+        )
+        if neutralized != instruction:
+            instruction = neutralized
+            warnings.append(
+                "deterministically downgraded a near-only landmark from pass/past to by"
+            )
         final_route_audit = route_audit_instruction(
             args=args,
             row=state.row,
@@ -4801,15 +5743,26 @@ class RouteCoherenceAuditorAgent:
             warnings.append("route auditor revised the instruction")
             return instruction, warnings
 
+        # A second review may prefer a different but equivalent preposition or
+        # other minor wording after the first review has already repaired the
+        # route.  Accept an explicitly minor-only borderline here and let the
+        # independent blind-grounding audit plus final deterministic gate inspect
+        # the accepted text.  Requiring another unreviewed rewrite caused stable
+        # candidates to oscillate (for example, "past" <-> "through") until all
+        # writer retries were exhausted.
+        if route_audit_is_acceptable_borderline(final_route_audit):
+            warnings.append("accepted minor route-audit borderline after repair")
+            return instruction, warnings
+
         final_corrected = clean_generated_instruction(
             str(final_route_audit.get("corrected_instruction") or "")
         )
         if final_corrected and final_corrected != "." and final_corrected != instruction:
-            warnings.append("accepted route auditor final correction after non-pass")
-            return final_corrected, warnings
-        if route_audit_is_acceptable_borderline(final_route_audit):
-            warnings.append("accepted minor route-audit borderline after repair")
-            return instruction, warnings
+            raise ValueError(
+                "route_audit_proposed_unreviewed_second_correction: "
+                "send the issue back to the writer retry instead of accepting it. "
+                f"Suggested reviewed repair: {final_corrected}"
+            )
         raise ValueError(
             "route_audit_repair_failed: "
             f"verdict={final_route_audit.get('verdict')} "
@@ -4877,32 +5830,12 @@ class SpatialBoundaryAuditorAgent:
         final_corrected = clean_generated_instruction(
             str(final_audit.get("corrected_instruction") or "")
         )
-        if (
-            final_corrected
-            and final_corrected != "."
-            and accept_neutral_spatial_borderline(final_corrected, final_audit)
-        ):
-            warnings.append("accepted neutral spatial wording from borderline audit")
-            return final_corrected, warnings
         if final_corrected and final_corrected != ".":
-            hygiene_hints = []
-            hygiene_hints.extend(unsupported_passing_hints(
-                instruction=final_corrected,
-                route_plan=state.candidate.get("route_plan"),
-            ))
-            hygiene_hints.extend(route_plan_final_direction_hints(
-                instruction=final_corrected,
-                route_plan=state.candidate.get("route_plan"),
-                endpoint_facts=state.candidate.get("endpoint_facts"),
-            ))
-            if (
-                str(final_audit.get("verdict", "")).lower() == "borderline"
-                and not hygiene_hints
-            ):
-                warnings.append(
-                    "accepted spatial auditor final correction after borderline audit"
-                )
-                return final_corrected, warnings
+            raise ValueError(
+                "spatial_audit_proposed_unreviewed_second_correction: "
+                "send the issue back to the writer retry instead of accepting it. "
+                f"Suggested reviewed repair: {final_corrected}"
+            )
         raise ValueError(
             "spatial_audit_repair_failed: "
             f"verdict={final_audit.get('verdict')} reason={final_audit.get('reason')}"
@@ -4915,6 +5848,14 @@ class FinalQualityGateAgent:
     name = "final_quality_gate"
 
     def run(self, state: EpisodeState, instruction: str) -> None:
+        basic_errors, _basic_warnings = validate_generated_instruction(
+            instruction=instruction,
+            old_instruction=state.row.get("instruction", ""),
+            min_words=state.args.min_words,
+            max_words=state.args.max_words,
+        )
+        if basic_errors:
+            raise ValueError("final_basic_validation: " + "; ".join(basic_errors))
         final_blockers = final_blocking_hints(
             instruction=instruction,
             actions=state.row["actions"],
@@ -4941,13 +5882,16 @@ class FinalQualityGateAgent:
             instruction=instruction,
             route_plan=state.candidate.get("route_plan"),
         ))
+        final_blockers.extend(
+            vertical_motion_consistency_hints(instruction, state.row)
+        )
         final_blockers.extend(final_style_blocking_hints(instruction))
         if final_blockers:
             raise ValueError("final_quality_blockers: " + "; ".join(final_blockers))
 
 
-class ScaleVLNRewritePipeline:
-    """Agent graph for one ScaleVLN episode."""
+class InstructionPipeline:
+    """Source-text-blind generation or explicitly requested rewrite agent graph."""
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -4956,6 +5900,7 @@ class ScaleVLNRewritePipeline:
         self.endpoint_agent = EndpointFactAgent()
         self.planner_agent = RoutePlannerAgent()
         self.writer_agent = InstructionWriterAgent()
+        self.blind_grounding_agent = BlindGroundingAuditorAgent()
         self.self_check_agent = SelfCheckCriticAgent()
         self.route_auditor_agent = RouteCoherenceAuditorAgent()
         self.spatial_auditor_agent = SpatialBoundaryAuditorAgent()
@@ -4975,8 +5920,18 @@ class ScaleVLNRewritePipeline:
         repair_note = None
         for attempt in range(1, self.args.retries + 2):
             state.candidate["attempts"] = attempt
+            instruction = ""
             try:
                 instruction, warnings = self.writer_agent.run(state, repair_note)
+                normalized_instruction = neutralize_near_not_passed_phrasing(
+                    instruction,
+                    state.candidate.get("route_plan"),
+                )
+                if normalized_instruction != instruction:
+                    instruction = normalized_instruction
+                    warnings.append(
+                        "normalized near-only landmark relations before model review"
+                    )
                 instruction, warnings = self.self_check_agent.run(
                     state,
                     instruction,
@@ -4992,14 +5947,45 @@ class ScaleVLNRewritePipeline:
                     instruction,
                     warnings,
                 )
+                normalized_instruction = neutralize_near_not_passed_phrasing(
+                    instruction,
+                    state.candidate.get("route_plan"),
+                )
+                if normalized_instruction != instruction:
+                    instruction = normalized_instruction
+                    warnings.append(
+                        "re-applied near-only landmark normalization after all model reviewers"
+                    )
+                # Reviewers are allowed to repair text, so the independent raw-
+                # evidence audit must inspect the final candidate rather than the
+                # writer's pre-repair draft.
+                self.blind_grounding_agent.run(state, instruction)
                 self.final_gate_agent.run(state, instruction)
                 state.candidate["status"] = "success"
                 state.candidate["instruction"] = instruction
-                state.candidate["warnings"] = warnings
+                state.candidate["warnings"] = list(
+                    dict.fromkeys(
+                        [str(item) for item in state.candidate.get("warnings", [])]
+                        + [str(item) for item in warnings]
+                    )
+                )
                 state.candidate["error"] = None
                 break
             except Exception as error:
-                repair_note = f"{type(error).__name__}: {error}"
+                error_text = f"{type(error).__name__}: {error}"
+                attempt_record = {"attempt": attempt, "error": error_text}
+                if instruction:
+                    # Preserve the reviewed draft across retries. Long-route
+                    # regeneration otherwise tends to fix one phrase while
+                    # reintroducing an issue that a previous reviewer removed.
+                    attempt_record["reviewed_instruction"] = instruction
+                    repair_note = (
+                        f"{error_text}\nPrevious reviewed candidate (repair only the "
+                        f"reported issue): {instruction}"
+                    )
+                else:
+                    repair_note = error_text
+                state.candidate.setdefault("attempt_errors", []).append(attempt_record)
                 state.candidate["error"] = repair_note
                 if self.args.sleep_between_retries > 0:
                     time.sleep(self.args.sleep_between_retries)
@@ -5020,7 +6006,134 @@ class ScaleVLNRewritePipeline:
 
 
 def process_episode(row: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    return ScaleVLNRewritePipeline(args).run_episode(row)
+    return InstructionPipeline(args).run_episode(row)
+
+
+def evidence_frame_fingerprint(
+    row: Dict[str, Any],
+    args: argparse.Namespace,
+) -> str:
+    """Hash exactly the source frames that can affect this episode's prompts."""
+    episode_id = episode_id_key(row)
+    frame_paths = sorted_frame_paths(args.image_root, episode_id)
+    actions = [int(action) for action in row.get("actions", [])]
+    expected_frame_count = sum(action != 0 for action in actions) + 1
+    if len(frame_paths) != expected_frame_count:
+        raise ValueError(
+            f"Action/frame mismatch for episode {episode_id}: expected "
+            f"{expected_frame_count}, found {len(frame_paths)}"
+        )
+    selected = sorted(
+        set(select_route_frames(actions, len(frame_paths), args.max_waypoints))
+        | set(
+            select_start_frames(
+                actions, len(frame_paths), args.start_window_frames
+            )
+        )
+        | set(
+            select_endpoint_frames(
+                actions, len(frame_paths), args.endpoint_window_frames
+            )
+        )
+    )
+    mode = getattr(args, "evidence_fingerprint_mode", "content")
+    digest = hashlib.sha256()
+    digest.update(mode.encode("utf-8"))
+    for index in selected:
+        path = frame_paths[index]
+        digest.update(f"\0{index}\0{path.name}\0".encode("utf-8"))
+        if mode == "content":
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif mode == "metadata":
+            stat = path.stat()
+            digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode("ascii"))
+        else:
+            raise ValueError(f"Unknown evidence fingerprint mode: {mode}")
+    return digest.hexdigest()
+
+
+def input_row_fingerprint(
+    row: Dict[str, Any],
+    args: Optional[argparse.Namespace] = None,
+) -> str:
+    cache = getattr(args, "_input_fingerprint_cache", None) if args else None
+    cache_key = episode_id_key(row)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    payload = {
+        "episode_id": str(row.get("episode_id", "")),
+        "instruction": str(row.get("instruction", "")),
+        "actions": [int(action) for action in row.get("actions", [])],
+        "trajectory_metadata": row.get("trajectory_metadata") or {},
+    }
+    if args is not None:
+        payload["evidence_frames_sha256"] = evidence_frame_fingerprint(row, args)
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    fingerprint = hashlib.sha256(encoded).hexdigest()
+    if cache is not None:
+        lock = getattr(args, "_input_fingerprint_lock", None)
+        if lock is None:
+            cache[cache_key] = fingerprint
+        else:
+            with lock:
+                cache.setdefault(cache_key, fingerprint)
+                fingerprint = cache[cache_key]
+    return fingerprint
+
+
+def build_pipeline_fingerprint(args: argparse.Namespace) -> str:
+    script_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    payload = {
+        "schema_version": PIPELINE_SCHEMA_VERSION,
+        "script_sha256": script_sha256,
+        "mode": args.mode,
+        "instruction_profile": args.instruction_profile,
+        "image_root": os.path.abspath(args.image_root),
+        "stage_models": args.stage_models,
+        "disable_thinking": args.disable_thinking,
+        "max_waypoints": args.max_waypoints,
+        "start_window_frames": args.start_window_frames,
+        "endpoint_window_frames": args.endpoint_window_frames,
+        "tile_width": args.tile_width,
+        "tile_height": args.tile_height,
+        "jpeg_quality": args.jpeg_quality,
+        "evidence_fingerprint_mode": args.evidence_fingerprint_mode,
+        "use_action_heading": args.use_action_heading,
+        "temperature": args.temperature,
+        "fact_temperature": args.fact_temperature,
+        "planner_temperature": args.planner_temperature,
+        "review_temperature": args.review_temperature,
+        "max_tokens": args.max_tokens,
+        "fact_max_tokens": args.fact_max_tokens,
+        "planner_max_tokens": args.planner_max_tokens,
+        "review_max_tokens": args.review_max_tokens,
+        "retries": args.retries,
+        "stage_retries": args.stage_retries,
+        "passes": {
+            "start": args.start_fact_pass,
+            "endpoint": args.endpoint_fact_pass,
+            "planner": args.route_plan_pass,
+            "blind_grounding": args.blind_grounding_audit,
+            "self_check": args.self_check,
+            "route_audit": args.route_audit,
+            "spatial_audit": args.spatial_audit,
+        },
+        "required_stages": {
+            "start": args.require_start_facts,
+            "endpoint": args.require_endpoint_facts,
+            "planner": args.require_route_plan,
+        },
+        "min_words": args.min_words,
+        "max_words": args.max_words,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def candidate_paths(work_dir: str) -> List[Path]:
@@ -5076,6 +6189,8 @@ def merge_progress_files(
     work_dir: str,
     selected_rows: Sequence[Dict[str, Any]],
     candidates_by_episode: Dict[str, Dict[str, Any]],
+    pipeline_fingerprint: Optional[str] = None,
+    args: Optional[argparse.Namespace] = None,
 ) -> Tuple[int, int]:
     candidate_rows = []
     failed_rows = []
@@ -5084,7 +6199,17 @@ def merge_progress_files(
         if not candidate:
             continue
         candidate_rows.append(candidate)
-        if not candidate_is_usable(candidate):
+        if args is None:
+            usable = candidate_is_usable(
+                candidate,
+                pipeline_fingerprint=pipeline_fingerprint,
+                input_fingerprint=input_row_fingerprint(row),
+            )
+        else:
+            usable = candidate_is_current(
+                candidate, row, args, pipeline_fingerprint
+            )
+        if not usable:
             failed_rows.append(candidate)
 
     root = Path(work_dir)
@@ -5143,29 +6268,81 @@ def choose_rows(
     raise ValueError(f"Unknown sample mode: {sample_mode}")
 
 
-def candidate_is_usable(candidate: Dict[str, Any]) -> bool:
-    return candidate.get("status") == "success" and bool(candidate.get("instruction"))
+def candidate_is_usable(
+    candidate: Dict[str, Any],
+    pipeline_fingerprint: Optional[str] = None,
+    input_fingerprint: Optional[str] = None,
+) -> bool:
+    if candidate.get("status") != "success" or not candidate.get("instruction"):
+        return False
+    if pipeline_fingerprint is not None and candidate.get("pipeline_fingerprint") != pipeline_fingerprint:
+        return False
+    if input_fingerprint is not None and candidate.get("input_fingerprint") != input_fingerprint:
+        return False
+    return True
+
+
+def candidate_is_current(
+    candidate: Dict[str, Any],
+    row: Dict[str, Any],
+    args: argparse.Namespace,
+    pipeline_fingerprint: Optional[str] = None,
+) -> bool:
+    """Short-circuit failed rows before touching potentially invalid images."""
+    if not candidate_is_usable(
+        candidate,
+        pipeline_fingerprint=pipeline_fingerprint,
+    ):
+        return False
+    try:
+        current_input_fingerprint = input_row_fingerprint(row, args)
+    except Exception:
+        return False
+    return candidate_is_usable(
+        candidate,
+        pipeline_fingerprint=pipeline_fingerprint,
+        input_fingerprint=current_input_fingerprint,
+    )
 
 
 def build_clean_rows(
     selected_rows: List[Dict[str, Any]],
     candidates_by_episode: Dict[str, Dict[str, Any]],
+    pipeline_fingerprint: Optional[str] = None,
+    args: Optional[argparse.Namespace] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     clean_rows = []
     missing = []
     for row in selected_rows:
         episode_id = episode_id_key(row)
         candidate = candidates_by_episode.get(episode_id)
-        if not candidate_is_usable(candidate or {}):
+        if args is None:
+            usable = candidate_is_usable(
+                candidate or {},
+                pipeline_fingerprint=pipeline_fingerprint,
+                input_fingerprint=input_row_fingerprint(row),
+            )
+        else:
+            usable = candidate_is_current(
+                candidate or {}, row, args, pipeline_fingerprint
+            )
+        if not usable:
             missing.append(episode_id)
             continue
-        clean_rows.append(
-            {
-                "episode_id": row["episode_id"],
-                "instruction": candidate["instruction"],
-                "actions": row["actions"],
-            }
-        )
+        clean_row = {
+            "episode_id": row["episode_id"],
+            "instruction": candidate["instruction"],
+            "actions": row["actions"],
+            # These fields are a backwards-compatible schema superset and let
+            # the strict VLN-CE exporter prove that paired styles came from the
+            # same trajectory and an auditable pipeline run.
+            "instruction_profile": candidate.get("instruction_profile"),
+            "pipeline_fingerprint": candidate.get("pipeline_fingerprint"),
+            "input_fingerprint": candidate.get("input_fingerprint"),
+        }
+        if row.get("trajectory_id") is not None:
+            clean_row["trajectory_id"] = row["trajectory_id"]
+        clean_rows.append(clean_row)
     return clean_rows, missing
 
 
@@ -5179,7 +6356,7 @@ def write_gallery(
     parts = [
         "<!doctype html>",
         "<html><head><meta charset='utf-8'>",
-        "<title>ScaleVLN Instruction Rewrite Gallery</title>",
+        "<title>VLN Instruction Generation Gallery</title>",
         "<style>",
         "body{font-family:Arial,sans-serif;margin:24px;line-height:1.35;color:#202124}",
         ".item{border:1px solid #ddd;border-radius:6px;padding:16px;margin:18px 0}",
@@ -5187,7 +6364,7 @@ def write_gallery(
         "img{max-width:100%;height:auto;border:1px solid #ddd}",
         "pre{white-space:pre-wrap;background:#f6f8fa;padding:8px;border-radius:4px}",
         "</style></head><body>",
-        "<h1>ScaleVLN Instruction Rewrite Gallery</h1>",
+        "<h1>VLN Instruction Generation Gallery</h1>",
     ]
     for row in selected_rows:
         episode_id = episode_id_key(row)
@@ -5242,6 +6419,31 @@ def provider_defaults(args: argparse.Namespace) -> None:
     args.api_key = args.api_key or DEFAULT_QWEN_API_KEY
 
 
+def configure_stage_args(args: argparse.Namespace) -> None:
+    """Build per-role API configs so reviewers can be epistemically independent."""
+    stage_to_prefix = {
+        "start": "start",
+        "endpoint": "endpoint",
+        "planner": "planner",
+        "writer": "writer",
+        "blind": "blind",
+        "review": "review",
+    }
+    stage_models = {}
+    for stage, prefix in stage_to_prefix.items():
+        stage_args = argparse.Namespace(**vars(args))
+        stage_args.base_url = getattr(args, f"{prefix}_base_url", None) or args.base_url
+        stage_args.model = getattr(args, f"{prefix}_model", None) or args.model
+        stage_args.api_key = getattr(args, f"{prefix}_api_key", None) or args.api_key
+        setattr(args, f"{stage}_args", stage_args)
+        stage_models[stage] = {
+            "provider": stage_args.provider,
+            "model": stage_args.model,
+            "base_url": stage_args.base_url,
+        }
+    args.stage_models = stage_models
+
+
 def check_api_available(args: argparse.Namespace) -> None:
     url = args.base_url.rstrip("/") + "/models"
     request = urllib.request.Request(
@@ -5266,6 +6468,56 @@ def default_progress_dir(output_jsonl: str) -> str:
     return str(output_path.parent / f"{output_path.stem}_progress")
 
 
+def run_scope_payload(
+    all_rows: Sequence[Dict[str, Any]],
+    selected_rows: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    all_ids = [episode_id_key(row) for row in all_rows]
+    selected_ids = [episode_id_key(row) for row in selected_rows]
+    is_full = selected_ids == all_ids
+    encoded_ids = "\n".join(selected_ids).encode("utf-8")
+    return {
+        "schema_version": 1,
+        "kind": "full" if is_full else "subset",
+        "input_jsonl": os.path.abspath(args.input_jsonl),
+        "selected_count": len(selected_ids),
+        "selected_ids_sha256": hashlib.sha256(encoded_ids).hexdigest(),
+    }
+
+
+def enforce_run_scope(
+    scope: Dict[str, Any],
+    work_dir: str,
+    output_jsonl: str,
+) -> None:
+    """Prevent a subset run from truncating full progress or output."""
+    root = Path(work_dir)
+    scope_path = root / "run_scope.json"
+    if scope_path.exists():
+        previous = json.loads(scope_path.read_text(encoding="utf-8"))
+        if previous != scope:
+            raise ValueError(
+                f"Run scope mismatch in {scope_path}: existing={previous}, "
+                f"requested={scope}. Use a separate --work-dir/--output-jsonl."
+            )
+        return
+
+    has_progress = bool(candidate_paths(work_dir) or failed_paths(work_dir))
+    output_exists = Path(output_jsonl).exists() or Path(output_jsonl + ".partial").exists()
+    if scope["kind"] == "subset" and (has_progress or output_exists):
+        raise ValueError(
+            "Refusing to run a subset selection against existing progress "
+            "or output. Provide fresh --work-dir and --output-jsonl paths."
+        )
+    temporary = scope_path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(scope, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, scope_path)
+
+
 def parse_episode_ids(value: Optional[str]) -> Optional[List[str]]:
     if not value:
         return None
@@ -5279,44 +6531,43 @@ def parse_episode_ids(value: Optional[str]) -> Optional[List[str]]:
 
 def run(args: argparse.Namespace) -> int:
     provider_defaults(args)
+    configure_stage_args(args)
+    args._input_fingerprint_cache = {}
+    args._input_fingerprint_lock = threading.Lock()
     if args.api_preflight:
-        check_api_available(args)
+        checked = set()
+        for stage_args in (
+            args,
+            args.start_args,
+            args.endpoint_args,
+            args.planner_args,
+            args.writer_args,
+            args.blind_args,
+            args.review_args,
+        ):
+            key = (stage_args.base_url, stage_args.api_key)
+            if key in checked:
+                continue
+            check_api_available(stage_args)
+            checked.add(key)
     if not args.work_dir:
         args.work_dir = default_progress_dir(args.output_jsonl)
-    args.stage_models = {
-        "writer": {
-            "provider": args.provider,
-            "model": args.model,
-            "base_url": args.base_url,
-        },
-        "start": {
-            "provider": args.provider,
-            "model": args.model,
-            "base_url": args.base_url,
-        },
-        "endpoint": {
-            "provider": args.provider,
-            "model": args.model,
-            "base_url": args.base_url,
-        },
-        "planner": {
-            "provider": args.provider,
-            "model": args.model,
-            "base_url": args.base_url,
-        },
-        "review": {
-            "provider": args.provider,
-            "model": args.model,
-            "base_url": args.base_url,
-        },
-    }
+    args.pipeline_fingerprint = build_pipeline_fingerprint(args)
     Path(args.work_dir).mkdir(parents=True, exist_ok=True)
     gallery_path = args.gallery_path or str(Path(args.work_dir) / "gallery.html")
 
-    if not args.resume:
-        clear_progress_files(args.work_dir)
-
-    all_rows = read_jsonl(args.input_jsonl)
+    all_rows = read_jsonl(
+        args.input_jsonl,
+        require_instruction=args.mode == "rewrite",
+    )
+    ignored_source_text_count = 0
+    if args.mode == "generate":
+        # Hard information barrier: from-scratch generation must be invariant to
+        # any source instruction accidentally present in an adapter row.
+        for row in all_rows:
+            if str(row.get("instruction", "")).strip():
+                ignored_source_text_count += 1
+            row["instruction"] = ""
     selected_rows = choose_rows(
         rows=all_rows,
         max_episodes=args.max_episodes,
@@ -5324,6 +6575,10 @@ def run(args: argparse.Namespace) -> int:
         seed=args.seed,
         episode_ids=parse_episode_ids(args.episode_ids),
     )
+    scope = run_scope_payload(all_rows, selected_rows, args)
+    enforce_run_scope(scope, args.work_dir, args.output_jsonl)
+    if not args.resume:
+        clear_progress_files(args.work_dir)
     existing = load_existing_candidates(args.work_dir)
     candidates_by_episode = dict(existing)
 
@@ -5332,9 +6587,15 @@ def run(args: argparse.Namespace) -> int:
     for row in selected_rows:
         episode_id = episode_id_key(row)
         existing_candidate = candidates_by_episode.get(episode_id)
-        if args.resume and candidate_is_usable(existing_candidate or {}):
-            resumed_success_count += 1
-            continue
+        if args.resume and candidate_is_usable(
+            existing_candidate or {},
+            pipeline_fingerprint=args.pipeline_fingerprint,
+        ):
+            if candidate_is_current(
+                existing_candidate or {}, row, args, args.pipeline_fingerprint
+            ):
+                resumed_success_count += 1
+                continue
         pending_rows.append(row)
 
     print(
@@ -5358,7 +6619,7 @@ def run(args: argparse.Namespace) -> int:
         progress = tqdm(
             total=len(selected_rows),
             initial=resumed_success_count,
-            desc="rewrite",
+            desc="instruction",
             dynamic_ncols=True,
         )
         refresh_progress_postfix()
@@ -5374,7 +6635,10 @@ def run(args: argparse.Namespace) -> int:
                 str(Path(args.work_dir) / f"candidates_rank{rank}.jsonl"),
                 candidate,
             )
-            if not candidate_is_usable(candidate):
+            if not candidate_is_usable(
+                candidate,
+                pipeline_fingerprint=args.pipeline_fingerprint,
+            ):
                 append_jsonl(
                     str(Path(args.work_dir) / f"failed_rank{rank}.jsonl"),
                     candidate,
@@ -5384,7 +6648,9 @@ def run(args: argparse.Namespace) -> int:
         for row in pending_rows:
             candidate = process_episode(row, args)
             record_candidate(0, candidate)
-            if candidate_is_usable(candidate):
+            if candidate_is_current(
+                candidate, row, args, args.pipeline_fingerprint
+            ):
                 successful_episode_count += 1
             else:
                 failed_episode_count += 1
@@ -5407,14 +6673,20 @@ def run(args: argparse.Namespace) -> int:
                     candidate = {
                         "episode_id": episode_id_key(row),
                         "status": "failed",
-                        "old_instruction": row["instruction"],
+                        "old_instruction": row.get("instruction", ""),
                         "actions": row["actions"],
+                        "row_fingerprint": input_row_fingerprint(row),
+                        "input_fingerprint": None,
+                        "pipeline_fingerprint": args.pipeline_fingerprint,
+                        "pipeline_schema_version": PIPELINE_SCHEMA_VERSION,
                         "provider": args.provider,
                         "model": args.model,
                         "error": f"worker_failed: {type(error).__name__}: {error}",
                     }
                 record_candidate(rank, candidate)
-                if candidate_is_usable(candidate):
+                if candidate_is_current(
+                    candidate, row, args, args.pipeline_fingerprint
+                ):
                     successful_episode_count += 1
                 else:
                     failed_episode_count += 1
@@ -5429,8 +6701,15 @@ def run(args: argparse.Namespace) -> int:
         args.work_dir,
         selected_rows,
         candidates_by_episode,
+        pipeline_fingerprint=args.pipeline_fingerprint,
+        args=args,
     )
-    clean_rows, missing_episode_ids = build_clean_rows(selected_rows, candidates_by_episode)
+    clean_rows, missing_episode_ids = build_clean_rows(
+        selected_rows,
+        candidates_by_episode,
+        pipeline_fingerprint=args.pipeline_fingerprint,
+        args=args,
+    )
     summary = {
         "input_jsonl": args.input_jsonl,
         "output_jsonl": args.output_jsonl,
@@ -5438,6 +6717,12 @@ def run(args: argparse.Namespace) -> int:
         "provider": args.provider,
         "model": args.model,
         "stage_models": args.stage_models,
+        "pipeline_fingerprint": args.pipeline_fingerprint,
+        "pipeline_schema_version": PIPELINE_SCHEMA_VERSION,
+        "mode": args.mode,
+        "instruction_profile": args.instruction_profile,
+        "run_scope": scope,
+        "ignored_source_text_count": ignored_source_text_count,
         "selected": len(selected_rows),
         "merged_candidates": merged_count,
         "clean_rows": len(clean_rows),
@@ -5451,16 +6736,39 @@ def run(args: argparse.Namespace) -> int:
     output_path = args.output_jsonl
     if missing_episode_ids:
         if args.drop_failed:
-            written = write_jsonl(output_path, clean_rows)
+            final_path = output_path if args.allow_incomplete else output_path + ".partial"
+            if not args.allow_incomplete:
+                stale_path = archive_existing_output(output_path)
+                if stale_path:
+                    summary["archived_stale_official_output"] = stale_path
+                    summary_path.write_text(
+                        json.dumps(summary, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+            written = write_jsonl(final_path, clean_rows)
             print(
-                f"wrote clean output rows={written} after dropping "
-                f"{len(missing_episode_ids)} failed/missing episodes: {output_path}"
+                f"wrote incomplete clean rows={written} after dropping "
+                f"{len(missing_episode_ids)} failed/missing episodes: {final_path}"
             )
             if args.write_gallery:
                 write_gallery(selected_rows, candidates_by_episode, gallery_path)
                 print(f"wrote gallery: {gallery_path}")
             print(f"wrote summary: {summary_path}")
+            if not args.allow_incomplete:
+                print(
+                    "refusing to finalize an incomplete dataset; pass "
+                    "--allow-incomplete true only after reviewing failed.jsonl",
+                    file=sys.stderr,
+                )
+                return 3
             return 0
+        stale_path = archive_existing_output(output_path)
+        if stale_path:
+            summary["archived_stale_official_output"] = stale_path
+            summary_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         partial_path = output_path + ".partial"
         if args.write_partial_output:
             written = write_jsonl(partial_path, clean_rows)
@@ -5485,11 +6793,29 @@ def run(args: argparse.Namespace) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rewrite ScaleVLN instructions using trajectory panoramas and a VLM."
+        description="Generate or rewrite grounded VLN instructions from trajectory panoramas."
     )
-    parser.add_argument("--input-jsonl", default=DEFAULT_INPUT_JSONL)
-    parser.add_argument("--image-root", default=DEFAULT_IMAGE_ROOT)
-    parser.add_argument("--output-jsonl", default=DEFAULT_OUTPUT_JSONL)
+    parser.add_argument("--input-jsonl", required=True)
+    parser.add_argument("--image-root", required=True)
+    parser.add_argument("--output-jsonl", required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("rewrite", "generate"),
+        default="generate",
+        help=(
+            "rewrite uses an old instruction only as a weak prior; generate "
+            "accepts trajectory rows without an instruction and grounds from scratch"
+        ),
+    )
+    parser.add_argument(
+        "--instruction-profile",
+        choices=("concise", "dense"),
+        default="concise",
+        help=(
+            "Language realization profile. Run both profiles on the same trajectory "
+            "set for a controlled 2x2 trajectory-by-language ablation."
+        ),
+    )
     parser.add_argument(
         "--work-dir",
         default=None,
@@ -5503,6 +6829,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--api-key", default=None)
+    for stage in ("start", "endpoint", "planner", "writer", "blind", "review"):
+        parser.add_argument(
+            f"--{stage}-base-url",
+            default=None,
+            help=f"Optional independent OpenAI-compatible endpoint for the {stage} role.",
+        )
+        parser.add_argument(
+            f"--{stage}-model",
+            default=None,
+            help=f"Optional independent model for the {stage} role.",
+        )
+        parser.add_argument(
+            f"--{stage}-api-key",
+            default=None,
+            help=argparse.SUPPRESS,
+        )
     parser.add_argument("--disable-thinking", type=str2bool, default=True)
     parser.add_argument("--api-preflight", type=str2bool, default=True)
 
@@ -5523,6 +6865,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-width", type=int, default=256)
     parser.add_argument("--tile-height", type=int, default=192)
     parser.add_argument("--jpeg-quality", type=int, default=85)
+    parser.add_argument(
+        "--evidence-fingerprint-mode",
+        choices=("content", "metadata"),
+        default="content",
+        help=(
+            "Hash the selected source frames so resume cannot reuse candidates "
+            "after panorama changes. content is exact; metadata is faster but "
+            "trusts file size and mtime."
+        ),
+    )
     parser.add_argument(
         "--use-action-heading",
         type=str2bool,
@@ -5555,6 +6907,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--stage-retries", type=int, default=1)
     parser.add_argument("--self-check", type=str2bool, default=True)
+    parser.add_argument("--blind-grounding-audit", type=str2bool, default=True)
     parser.add_argument("--route-audit", type=str2bool, default=True)
     parser.add_argument("--spatial-audit", type=str2bool, default=True)
     parser.add_argument("--sleep-between-retries", type=float, default=0.5)
@@ -5563,6 +6916,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-words", type=int, default=12)
     parser.add_argument("--max-words", type=int, default=120)
     parser.add_argument("--drop-failed", type=str2bool, default=False)
+    parser.add_argument(
+        "--allow-incomplete",
+        type=str2bool,
+        default=False,
+        help=(
+            "Allow a subset with failed/missing episodes dropped to be finalized "
+            "at output_jsonl. "
+            "Without this explicit opt-in, incomplete output is written as .partial "
+            "and the command returns non-zero."
+        ),
+    )
     parser.add_argument("--write-partial-output", action="store_true")
     return parser
 
