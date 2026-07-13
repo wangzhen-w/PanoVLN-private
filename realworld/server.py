@@ -140,8 +140,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--unik3d-source-path", default=None)
-    parser.add_argument("--unik3d-model-path", default=None)
+    parser.add_argument("--dap-source-path", default=None)
+    parser.add_argument("--dap-model-path", default=None)
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--max-memory-images", type=int, default=10)
     parser.add_argument("--memory-pool-window-frames", type=int, default=100)
@@ -153,8 +153,8 @@ def main() -> None:
     args = parse_args()
     settings = InferenceConfig(
         model_path=args.model_path,
-        unik3d_source_path=args.unik3d_source_path,
-        unik3d_model_path=args.unik3d_model_path,
+        dap_source_path=args.dap_source_path,
+        dap_model_path=args.dap_model_path,
         attn_implementation=args.attn_implementation,
         max_memory_images=args.max_memory_images,
         memory_pool_window_frames=args.memory_pool_window_frames,

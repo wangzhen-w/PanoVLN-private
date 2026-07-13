@@ -8,10 +8,10 @@ echo "Switched to directory: $PROJECT_ROOT"
 
 HOST="0.0.0.0"
 PORT="8000"
-MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/Unik3D"
+MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/DAP"
 GPU_IDS="4"
-UNIK3D_SOURCE_PATH="bundled"
-UNIK3D_MODEL_PATH=""
+DAP_SOURCE_PATH="bundled"
+DAP_MODEL_PATH=""
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES="10"
 MEMORY_POOL_WINDOW_FRAMES="100"
@@ -25,8 +25,8 @@ echo "HOST=$HOST"
 echo "PORT=$PORT"
 echo "MODEL_PATH=$MODEL_PATH"
 echo "GPU_IDS=$GPU_IDS"
-echo "UNIK3D_SOURCE_PATH=$UNIK3D_SOURCE_PATH"
-echo "UNIK3D_MODEL_PATH=${UNIK3D_MODEL_PATH:-<VLN checkpoint>}"
+echo "DAP_SOURCE_PATH=$DAP_SOURCE_PATH"
+echo "DAP_MODEL_PATH=${DAP_MODEL_PATH:-<VLN checkpoint>}"
 echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
 echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
 echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
@@ -39,14 +39,14 @@ CMD=(
     --host "$HOST"
     --port "$PORT"
     --model-path "$MODEL_PATH"
-    --unik3d-source-path "$UNIK3D_SOURCE_PATH"
+    --dap-source-path "$DAP_SOURCE_PATH"
     --attn-implementation "$ATTN_IMPLEMENTATION"
     --max-memory-images "$MAX_MEMORY_IMAGES"
     --memory-pool-window-frames "$MEMORY_POOL_WINDOW_FRAMES"
 )
 
-if [[ -n "$UNIK3D_MODEL_PATH" ]]; then
-    CMD+=(--unik3d-model-path "$UNIK3D_MODEL_PATH")
+if [[ -n "$DAP_MODEL_PATH" ]]; then
+    CMD+=(--dap-model-path "$DAP_MODEL_PATH")
 fi
 
 echo "Starting server; model will load before the HTTP interface is available..."

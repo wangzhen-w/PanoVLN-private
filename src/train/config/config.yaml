@@ -11,20 +11,20 @@ model:
     visual_merger: true
     language_model: true
     erp_fourier_linear_adapter: false
-    unik3d_mlp: true
+    dap_mlp: true
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
   erp_fourier_linear_enabled: false
   erp_fourier_linear_alpha_value: 0.01
   erp_fourier_linear_apply_to_current_only: true
-  unik3d_enabled: true
-  unik3d_source_path: "bundled"
-  unik3d_model_path: "/workspace/data1/model/UniK3D-Large"
-  unik3d_alpha_value: 0.20
-  unik3d_feature_source: "lowres_features"  # 512维、经Spherical rays条件化的decoder latent
-  unik3d_injection_stage: "pre_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
-  unik3d_sampling_mode: "singlepoint"    #"singlepoint"每个 Qwen token 采一个 UniK3D token / "grouping"每个 Qwen token 聚合局部2x2 UniK3D latent
-  unik3d_force_fp32: false
+  dap_enabled: true
+  dap_source_path: "bundled"
+  dap_model_path: "/workspace/data1/model/DAP"
+  dap_alpha_value: 0.20
+  dap_feature_source: "path_4"       # 256维、DAP metric-depth decoder的首个融合latent
+  dap_injection_stage: "pre_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
+  dap_sampling_mode: "singlepoint"    #"singlepoint"每个 Qwen token 采一个 DAP token / "grouping"每个 Qwen token 聚合局部2x2 DAP latent
+  dap_force_fp32: false
 
 data:
   train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
@@ -45,7 +45,7 @@ data:
     mixing_strategy: "sample"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data1/model/ablation_new/spatial_encoder/Unik3D"
+  output_dir: "/workspace/data1/model/ablation_new/spatial_encoder/DAP"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -55,7 +55,7 @@ training:
   visual_lr: 2e-6
   visual_merger_lr: 1.0e-5
   erp_fourier_linear_lr: null
-  unik3d_mlp_lr: 2.0e-5
+  dap_mlp_lr: 2.0e-5
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5

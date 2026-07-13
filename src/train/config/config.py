@@ -19,14 +19,14 @@ class ModelConfig:
     erp_fourier_linear_enabled: bool = False
     erp_fourier_linear_alpha_value: float = 0.01
     erp_fourier_linear_apply_to_current_only: bool = True
-    unik3d_enabled: bool = False
-    unik3d_source_path: str = "bundled"
-    unik3d_model_path: str = "/workspace/data1/model/UniK3D-Large"
-    unik3d_alpha_value: float = 0.1
-    unik3d_feature_source: str = "lowres_features"
-    unik3d_injection_stage: str = "post_merger"
-    unik3d_sampling_mode: str = "grouping"
-    unik3d_force_fp32: bool = False
+    dap_enabled: bool = False
+    dap_source_path: str = "bundled"
+    dap_model_path: str = "/workspace/data1/model/DAP"
+    dap_alpha_value: float = 0.1
+    dap_feature_source: str = "path_4"
+    dap_injection_stage: str = "post_merger"
+    dap_sampling_mode: str = "grouping"
+    dap_force_fp32: bool = False
 
 
 @dataclass
@@ -72,7 +72,7 @@ class TrainingConfig:
     visual_lr: Optional[float] = None
     visual_merger_lr: Optional[float] = None
     erp_fourier_linear_lr: Optional[float] = None
-    unik3d_mlp_lr: Optional[float] = None
+    dap_mlp_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10

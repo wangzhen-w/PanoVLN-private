@@ -34,7 +34,7 @@ class PanoVLNTrainer(Trainer):
         "visual",
         "visual_merger",
         "erp_fourier_linear_adapter",
-        "unik3d_mlp",
+        "dap_mlp",
     )
 
     def __init__(
@@ -59,8 +59,8 @@ class PanoVLNTrainer(Trainer):
             return "erp_fourier_linear_adapter"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
-        if self._name_has_module(name, "unik3d_mlp"):
-            return "unik3d_mlp"
+        if self._name_has_module(name, "dap_mlp"):
+            return "dap_mlp"
         if self._name_has_module(name, "visual"):
             return "visual"
         if (
@@ -162,17 +162,17 @@ def load_optional_text(path):
 
 
 def validate_training_config(cfg) -> None:
-    if cfg.model.unik3d_enabled:
-        required_unik3d_paths = {
-            "model.unik3d_model_path": cfg.model.unik3d_model_path,
+    if cfg.model.dap_enabled:
+        required_dap_paths = {
+            "model.dap_model_path": cfg.model.dap_model_path,
         }
         missing = [
             f"{name}: {path}"
-            for name, path in required_unik3d_paths.items()
+            for name, path in required_dap_paths.items()
             if not path or not os.path.exists(path)
         ]
         if missing:
-            raise FileNotFoundError("Missing UniK3D path(s):\n" + "\n".join(missing))
+            raise FileNotFoundError("Missing DAP path(s):\n" + "\n".join(missing))
 
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
@@ -220,14 +220,14 @@ def print_training_config(cfg) -> None:
         "erp_fourier_linear_apply_to_current_only: "
         f"{_config_value(cfg.model.erp_fourier_linear_apply_to_current_only)}",
     )
-    rank0_print(RANK, f"unik3d_enabled: {_config_value(cfg.model.unik3d_enabled)}")
-    rank0_print(RANK, f"unik3d_source_path: {_config_value(cfg.model.unik3d_source_path)}")
-    rank0_print(RANK, f"unik3d_model_path: {_config_value(cfg.model.unik3d_model_path)}")
-    rank0_print(RANK, f"unik3d_alpha_value: {_config_value(cfg.model.unik3d_alpha_value)}")
-    rank0_print(RANK, f"unik3d_feature_source: {_config_value(cfg.model.unik3d_feature_source)}")
-    rank0_print(RANK, f"unik3d_injection_stage: {_config_value(cfg.model.unik3d_injection_stage)}")
-    rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(cfg.model.unik3d_sampling_mode)}")
-    rank0_print(RANK, f"unik3d_force_fp32: {_config_value(cfg.model.unik3d_force_fp32)}")
+    rank0_print(RANK, f"dap_enabled: {_config_value(cfg.model.dap_enabled)}")
+    rank0_print(RANK, f"dap_source_path: {_config_value(cfg.model.dap_source_path)}")
+    rank0_print(RANK, f"dap_model_path: {_config_value(cfg.model.dap_model_path)}")
+    rank0_print(RANK, f"dap_alpha_value: {_config_value(cfg.model.dap_alpha_value)}")
+    rank0_print(RANK, f"dap_feature_source: {_config_value(cfg.model.dap_feature_source)}")
+    rank0_print(RANK, f"dap_injection_stage: {_config_value(cfg.model.dap_injection_stage)}")
+    rank0_print(RANK, f"dap_sampling_mode: {_config_value(cfg.model.dap_sampling_mode)}")
+    rank0_print(RANK, f"dap_force_fp32: {_config_value(cfg.model.dap_force_fp32)}")
     rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
     rank0_print(RANK, f"panoworld_enabled: {_config_value(cfg.data.panoworld.enabled)}")
     if cfg.data.panoworld.enabled:
@@ -242,7 +242,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"erp_fourier_linear_lr: {_config_value(cfg.training.erp_fourier_linear_lr)}")
-    rank0_print(RANK, f"unik3d_mlp_lr: {_config_value(cfg.training.unik3d_mlp_lr)}")
+    rank0_print(RANK, f"dap_mlp_lr: {_config_value(cfg.training.dap_mlp_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -296,7 +296,7 @@ def main():
     model = load_model(cfg)
     model_config = model.config
     vision_config = getattr(model_config, "vision_config", None)
-    effective_unik3d_enabled = bool(getattr(model_config, "unik3d_enabled", cfg.model.unik3d_enabled))
+    effective_dap_enabled = bool(getattr(model_config, "dap_enabled", cfg.model.dap_enabled))
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
     )
@@ -305,13 +305,13 @@ def main():
     )
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
-        rank0_print(RANK, f"unik3d_enabled: {_config_value(effective_unik3d_enabled)}")
-        rank0_print(RANK, f"unik3d_source_path: {_config_value(getattr(model_config, 'unik3d_source_path', None))}")
-        rank0_print(RANK, f"unik3d_model_path: {_config_value(getattr(model_config, 'unik3d_model_path', None))}")
-        rank0_print(RANK, f"unik3d_alpha_value: {_config_value(getattr(model_config, 'unik3d_alpha_value', None))}")
-        rank0_print(RANK, f"unik3d_feature_source: {_config_value(getattr(model_config, 'unik3d_feature_source', None))}")
-        rank0_print(RANK, f"unik3d_injection_stage: {_config_value(getattr(model_config, 'unik3d_injection_stage', None))}")
-        rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(getattr(model_config, 'unik3d_sampling_mode', None))}")
+        rank0_print(RANK, f"dap_enabled: {_config_value(effective_dap_enabled)}")
+        rank0_print(RANK, f"dap_source_path: {_config_value(getattr(model_config, 'dap_source_path', None))}")
+        rank0_print(RANK, f"dap_model_path: {_config_value(getattr(model_config, 'dap_model_path', None))}")
+        rank0_print(RANK, f"dap_alpha_value: {_config_value(getattr(model_config, 'dap_alpha_value', None))}")
+        rank0_print(RANK, f"dap_feature_source: {_config_value(getattr(model_config, 'dap_feature_source', None))}")
+        rank0_print(RANK, f"dap_injection_stage: {_config_value(getattr(model_config, 'dap_injection_stage', None))}")
+        rank0_print(RANK, f"dap_sampling_mode: {_config_value(getattr(model_config, 'dap_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(
@@ -343,7 +343,7 @@ def main():
         model_max_length=cfg.model.model_max_length,
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
-        unik3d_enabled=effective_unik3d_enabled,
+        dap_enabled=effective_dap_enabled,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
         prompt_format=cfg.data.prompt_format,
@@ -358,7 +358,7 @@ def main():
             model_max_length=cfg.model.model_max_length,
             erp_top_crop_degrees=panoworld_cfg.top_crop_degrees,
             erp_bottom_crop_degrees=panoworld_cfg.bottom_crop_degrees,
-            unik3d_enabled=effective_unik3d_enabled,
+            dap_enabled=effective_dap_enabled,
             max_samples=panoworld_cfg.max_samples,
             prompt_format=cfg.data.prompt_format,
             system_prompt=(
@@ -398,7 +398,7 @@ def main():
             model_max_length=cfg.model.model_max_length,
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
-            unik3d_enabled=effective_unik3d_enabled,
+            dap_enabled=effective_dap_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
@@ -461,7 +461,7 @@ def main():
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "erp_fourier_linear_adapter": cfg.training.erp_fourier_linear_lr,
-            "unik3d_mlp": cfg.training.unik3d_mlp_lr,
+            "dap_mlp": cfg.training.dap_mlp_lr,
         },
         compute_metrics=(
             build_action_accuracy(

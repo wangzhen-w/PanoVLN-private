@@ -24,7 +24,7 @@ for _path in (str(REPO_ROOT), str(SRC_ROOT)):
 from src.qwen_vl import (
     Qwen3_5Config,
     Qwen3_5ForConditionalGenerationForPanoVLN,
-    resolve_unik3d_source_path,
+    resolve_dap_source_path,
 )
 from src.train.data.data import (
     DEFAULT_ERP_BOTTOM_CROP_DEGREES,
@@ -35,7 +35,7 @@ from src.train.data.data import (
     build_erp_image_geometry_batch,
     build_vln_image_selection,
     build_vln_user_content,
-    preprocess_unik3d_current_image,
+    preprocess_dap_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
@@ -44,7 +44,7 @@ from src.train.data.data import (
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
 
-DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/spatial_encoder/Unik3D"
+DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/spatial_encoder/DAP"
 ACTION_WORDS = ("stop", "forward", "left", "right")
 ACTION_SEQUENCE_LENGTH = 4
 DEFAULT_REALWORLD_GENERATION_KWARGS = {
@@ -78,8 +78,8 @@ ATOMIC_ACTION_PATTERNS = [
 @dataclass
 class InferenceConfig:
     model_path: str = DEFAULT_MODEL_PATH
-    unik3d_source_path: Optional[str] = None
-    unik3d_model_path: Optional[str] = None
+    dap_source_path: Optional[str] = None
+    dap_model_path: Optional[str] = None
     attn_implementation: Optional[str] = "flash_attention_2"
     max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES
     memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES
@@ -221,34 +221,34 @@ class PanoVLNPredictor:
 
         return None
 
-    def _resolve_unik3d_paths(self, model_config: Any) -> None:
-        if not bool(getattr(model_config, "unik3d_enabled", False)):
-            _log_stage("UniK3D disabled in model config")
+    def _resolve_dap_paths(self, model_config: Any) -> None:
+        if not bool(getattr(model_config, "dap_enabled", False)):
+            _log_stage("DAP disabled in model config")
             return
 
-        _log_stage("UniK3D enabled; checking saved unik3d.* weights in VLN checkpoint")
-        has_saved_unik3d_weights = self._checkpoint_has_weight_prefix(
+        _log_stage("DAP enabled; checking saved dap.* weights in VLN checkpoint")
+        has_saved_dap_weights = self._checkpoint_has_weight_prefix(
             self.config.model_path,
-            "unik3d.",
+            "dap.",
         )
-        if has_saved_unik3d_weights is True:
-            _log_stage("UniK3D weights found inside VLN checkpoint")
+        if has_saved_dap_weights is True:
+            _log_stage("DAP weights found inside VLN checkpoint")
 
-        requested_source_path = self.config.unik3d_source_path or getattr(
+        requested_source_path = self.config.dap_source_path or getattr(
             model_config,
-            "unik3d_source_path",
+            "dap_source_path",
             None,
         )
         setattr(
             model_config,
-            "unik3d_source_path",
-            str(resolve_unik3d_source_path(requested_source_path)),
+            "dap_source_path",
+            str(resolve_dap_source_path(requested_source_path)),
         )
-        if self.config.unik3d_model_path:
-            setattr(model_config, "unik3d_model_path", str(self.config.unik3d_model_path))
+        if self.config.dap_model_path:
+            setattr(model_config, "dap_model_path", str(self.config.dap_model_path))
 
         required_paths = {
-            "UniK3D source": getattr(model_config, "unik3d_source_path", None),
+            "DAP source": getattr(model_config, "dap_source_path", None),
         }
         missing = [
             f"{name}: {path}"
@@ -256,10 +256,10 @@ class PanoVLNPredictor:
             if not path or not Path(str(path)).exists()
         ]
         if missing:
-            raise FileNotFoundError("Missing UniK3D path(s):\n" + "\n".join(missing))
+            raise FileNotFoundError("Missing DAP path(s):\n" + "\n".join(missing))
         _log_stage(
-            "Using bundled UniK3D source from "
-            f"{required_paths['UniK3D source']}; encoder weights will be restored from the VLN checkpoint"
+            "Using bundled DAP source from "
+            f"{required_paths['DAP source']}; encoder weights will be restored from the VLN checkpoint"
         )
 
     def _load(self) -> None:
@@ -303,13 +303,13 @@ class PanoVLNPredictor:
             model_config = Qwen3_5Config.from_pretrained(model_path)
             _log_stage(
                 "model config loaded "
-                f"unik3d_enabled={bool(getattr(model_config, 'unik3d_enabled', False))} "
+                f"dap_enabled={bool(getattr(model_config, 'dap_enabled', False))} "
                 f"in {_format_elapsed(step_start)}"
             )
 
             step_start = time.perf_counter()
-            self._resolve_unik3d_paths(model_config)
-            _log_stage(f"UniK3D paths resolved in {_format_elapsed(step_start)}")
+            self._resolve_dap_paths(model_config)
+            _log_stage(f"DAP paths resolved in {_format_elapsed(step_start)}")
 
             kwargs: dict[str, Any] = {
                 "config": model_config,
@@ -380,11 +380,11 @@ class PanoVLNPredictor:
                     )
                 )
 
-        unik3d_enabled = bool(getattr(self.model.config, "unik3d_enabled", False))
-        unik3d_pixel_values = None
-        if unik3d_enabled:
-            unik3d_pixel_values = preprocess_unik3d_current_image(raw_images[-1]).unsqueeze(0)
-        return processed_images, unik3d_pixel_values
+        dap_enabled = bool(getattr(self.model.config, "dap_enabled", False))
+        dap_pixel_values = None
+        if dap_enabled:
+            dap_pixel_values = preprocess_dap_current_image(raw_images[-1]).unsqueeze(0)
+        return processed_images, dap_pixel_values
 
     def _move_batch_to_device(self, batch: dict[str, Any]) -> dict[str, Any]:
         device = self._input_device()
@@ -414,11 +414,11 @@ class PanoVLNPredictor:
             memory_pool_window_frames=self.config.memory_pool_window_frames,
         )
         _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
-        processed_images, unik3d_pixel_values = self._prepare_images(selected_images)
+        processed_images, dap_pixel_values = self._prepare_images(selected_images)
         _log_stage(
             "images preprocessed "
             f"prompt_images={len(processed_images)} "
-            f"unik3d_enabled={unik3d_pixel_values is not None}"
+            f"dap_enabled={dap_pixel_values is not None}"
         )
 
         messages = [
@@ -458,8 +458,8 @@ class PanoVLNPredictor:
             [resolve_current_image_index(image_count)],
             dtype=torch.long,
         )
-        if unik3d_pixel_values is not None:
-            encoded["unik3d_pixel_values"] = unik3d_pixel_values
+        if dap_pixel_values is not None:
+            encoded["dap_pixel_values"] = dap_pixel_values
 
         batch = self._move_batch_to_device(dict(encoded))
         input_len = int(batch["input_ids"].shape[-1])
