@@ -67,7 +67,7 @@ from src.eval.eval import (
 DEFAULT_ALPHA = 0.5
 DEFAULT_DAGGER_GOAL_RADIUS = 0.25
 DEFAULT_DAGGER_SUCCESS_RADIUS = 0.5
-DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
+DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/spatial_encoder/Unik3D"
 DEFAULT_OUTPUT_ROOT = "/workspace/data1/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
 DEFAULT_SOURCE_DATASETS = ("r2r", "rxr")

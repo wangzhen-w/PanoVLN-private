@@ -8,9 +8,10 @@ echo "Switched to directory: $PROJECT_ROOT"
 
 HOST="0.0.0.0"
 PORT="8000"
-MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
+MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/Unik3D"
 GPU_IDS="4"
-PANOVGGT_CHECKPOINT=""
+UNIK3D_SOURCE_PATH="bundled"
+UNIK3D_MODEL_PATH=""
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES="10"
 MEMORY_POOL_WINDOW_FRAMES="100"
@@ -20,16 +21,12 @@ if [ ! -d "$MODEL_PATH" ]; then
     exit 1
 fi
 
-if [[ -n "$PANOVGGT_CHECKPOINT" && ! -f "$PANOVGGT_CHECKPOINT" ]]; then
-    echo "PanoVGGT checkpoint does not exist: $PANOVGGT_CHECKPOINT" >&2
-    exit 1
-fi
-
 echo "HOST=$HOST"
 echo "PORT=$PORT"
 echo "MODEL_PATH=$MODEL_PATH"
 echo "GPU_IDS=$GPU_IDS"
-echo "PANOVGGT_CHECKPOINT=$PANOVGGT_CHECKPOINT"
+echo "UNIK3D_SOURCE_PATH=$UNIK3D_SOURCE_PATH"
+echo "UNIK3D_MODEL_PATH=${UNIK3D_MODEL_PATH:-<VLN checkpoint>}"
 echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
 echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
 echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
@@ -42,13 +39,14 @@ CMD=(
     --host "$HOST"
     --port "$PORT"
     --model-path "$MODEL_PATH"
+    --unik3d-source-path "$UNIK3D_SOURCE_PATH"
     --attn-implementation "$ATTN_IMPLEMENTATION"
     --max-memory-images "$MAX_MEMORY_IMAGES"
     --memory-pool-window-frames "$MEMORY_POOL_WINDOW_FRAMES"
 )
 
-if [[ -n "$PANOVGGT_CHECKPOINT" ]]; then
-    CMD+=(--panovggt-checkpoint "$PANOVGGT_CHECKPOINT")
+if [[ -n "$UNIK3D_MODEL_PATH" ]]; then
+    CMD+=(--unik3d-model-path "$UNIK3D_MODEL_PATH")
 fi
 
 echo "Starting server; model will load before the HTTP interface is available..."

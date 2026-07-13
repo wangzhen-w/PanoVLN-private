@@ -27,7 +27,7 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "erp_fourier_linear_adapter": True,
-    "panovggt_mlp": True,
+    "unik3d_mlp": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,7 +74,7 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "erp_fourier_linear_adapter": getattr(model, "erp_fourier_linear_adapter", None),
-        "panovggt_mlp": getattr(model, "panovggt_mlp", None),
+        "unik3d_mlp": getattr(model, "unik3d_mlp", None),
         "language_model": language_model,
     }
 
@@ -111,14 +111,15 @@ def _load_model_config(cfg):
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
     )
-    panovggt_fields = (
-        "panovggt_enabled",
-        "panovggt_checkpoint_path",
-        "panovggt_alpha_value",
-        "panovggt_feature_source",
-        "panovggt_injection_stage",
-        "panovggt_sampling_mode",
-        "panovggt_force_fp32",
+    unik3d_fields = (
+        "unik3d_enabled",
+        "unik3d_source_path",
+        "unik3d_model_path",
+        "unik3d_alpha_value",
+        "unik3d_feature_source",
+        "unik3d_injection_stage",
+        "unik3d_sampling_mode",
+        "unik3d_force_fp32",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -159,7 +160,7 @@ def _load_model_config(cfg):
     apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
-    apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
+    apply_module_fields_preserve_checkpoint(bool(cfg.model.unik3d_enabled), unik3d_fields)
     return config
 
 

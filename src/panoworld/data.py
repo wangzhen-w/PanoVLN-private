@@ -13,7 +13,7 @@ try:
         DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE,
         build_erp_image_geometry_batch,
         crop_erp_latitude,
-        preprocess_panovggt_current_image,
+        preprocess_unik3d_current_image,
         resolve_current_image_index,
     )
     from src.train.utils import build_prompt_and_target
@@ -22,7 +22,7 @@ except ModuleNotFoundError:
         DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE,
         build_erp_image_geometry_batch,
         crop_erp_latitude,
-        preprocess_panovggt_current_image,
+        preprocess_unik3d_current_image,
         resolve_current_image_index,
     )
     from train.utils import build_prompt_and_target
@@ -142,7 +142,7 @@ class PanoworldSupervisedDataset(Dataset):
         model_max_length: Optional[int],
         erp_top_crop_degrees: float = 0.0,
         erp_bottom_crop_degrees: float = 0.0,
-        panovggt_enabled: bool = False,
+        unik3d_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -159,7 +159,7 @@ class PanoworldSupervisedDataset(Dataset):
         self.model_max_length = model_max_length
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
-        self.panovggt_enabled = bool(panovggt_enabled)
+        self.unik3d_enabled = bool(unik3d_enabled)
         self.prompt_format = prompt_format
         self.system_prompt = system_prompt
         self.auto_insert_media_placeholders = bool(auto_insert_media_placeholders)
@@ -303,8 +303,8 @@ class PanoworldSupervisedDataset(Dataset):
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
 
-        if self.panovggt_enabled and raw_images:
-            item["panovggt_pixel_values"] = preprocess_panovggt_current_image(
+        if self.unik3d_enabled and raw_images:
+            item["unik3d_pixel_values"] = preprocess_unik3d_current_image(
                 raw_images[-1],
             ).unsqueeze(0)
 

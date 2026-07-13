@@ -59,8 +59,8 @@ class PanoWorldSFTTrainer(Trainer):
             return "erp_fourier_linear_adapter"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
-        if self._name_has_module(name, "panovggt_mlp"):
-            return "panovggt_mlp"
+        if self._name_has_module(name, "unik3d_mlp"):
+            return "unik3d_mlp"
         if self._name_has_module(name, "visual"):
             return "visual"
         if (
@@ -160,8 +160,8 @@ def _validate_required_paths(cfg) -> None:
         if not cfg.data.eval_jsonl:
             raise ValueError("data.eval_jsonl is required when run.do_eval=true")
         required_paths["data.eval_jsonl"] = cfg.data.eval_jsonl
-    if cfg.model.panovggt_enabled:
-        required_paths["model.panovggt_checkpoint_path"] = cfg.model.panovggt_checkpoint_path
+    if cfg.model.unik3d_enabled:
+        required_paths["model.unik3d_model_path"] = cfg.model.unik3d_model_path
     if cfg.training.deepspeed:
         required_paths["training.deepspeed"] = cfg.training.deepspeed
 
@@ -193,10 +193,10 @@ def print_training_config(cfg) -> None:
         "erp_fourier_linear_apply_to_current_only: "
         f"{_config_value(cfg.model.erp_fourier_linear_apply_to_current_only)}",
     )
-    rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
-    rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
-    rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
-    rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
+    rank0_print(RANK, f"unik3d_enabled: {_config_value(cfg.model.unik3d_enabled)}")
+    rank0_print(RANK, f"unik3d_alpha_value: {_config_value(cfg.model.unik3d_alpha_value)}")
+    rank0_print(RANK, f"unik3d_feature_source: {_config_value(cfg.model.unik3d_feature_source)}")
+    rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(cfg.model.unik3d_sampling_mode)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -204,7 +204,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"erp_fourier_linear_lr: {_config_value(cfg.training.erp_fourier_linear_lr)}")
-    rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
+    rank0_print(RANK, f"unik3d_mlp_lr: {_config_value(cfg.training.unik3d_mlp_lr)}")
     rank0_print(RANK, "============================")
 
 
@@ -240,7 +240,7 @@ def safe_save_model_for_hf_trainer(
     trainer.accelerator.wait_for_everyone()
 
 
-def _build_dataset(cfg, processor, tokenizer, *, split: str, panovggt_enabled: bool):
+def _build_dataset(cfg, processor, tokenizer, *, split: str, unik3d_enabled: bool):
     is_train = split == "train"
     jsonl_path = cfg.data.train_jsonl if is_train else cfg.data.eval_jsonl
     image_root = cfg.data.train_image_root if is_train else (cfg.data.eval_image_root or cfg.data.train_image_root)
@@ -255,7 +255,7 @@ def _build_dataset(cfg, processor, tokenizer, *, split: str, panovggt_enabled: b
         model_max_length=cfg.model.model_max_length,
         erp_top_crop_degrees=cfg.model.erp_top_crop_degrees,
         erp_bottom_crop_degrees=cfg.model.erp_bottom_crop_degrees,
-        panovggt_enabled=panovggt_enabled,
+        unik3d_enabled=unik3d_enabled,
         max_samples=cfg.data.train_max_samples if is_train else cfg.data.eval_max_samples,
         shuffle=cfg.data.shuffle if is_train else cfg.data.eval_shuffle,
         prompt_format=cfg.data.prompt_format,
@@ -292,8 +292,8 @@ def main() -> None:
     sync_model_special_tokens(model, tokenizer)
 
     model_config = model.config
-    effective_panovggt_enabled = bool(
-        getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled)
+    effective_unik3d_enabled = bool(
+        getattr(model_config, "unik3d_enabled", cfg.model.unik3d_enabled)
     )
 
     train_dataset = (
@@ -302,7 +302,7 @@ def main() -> None:
             processor,
             tokenizer,
             split="train",
-            panovggt_enabled=effective_panovggt_enabled,
+            unik3d_enabled=effective_unik3d_enabled,
         )
         if cfg.run.do_train else None
     )
@@ -315,7 +315,7 @@ def main() -> None:
             processor,
             tokenizer,
             split="eval",
-            panovggt_enabled=effective_panovggt_enabled,
+            unik3d_enabled=effective_unik3d_enabled,
         )
         if cfg.run.do_eval else None
     )
@@ -376,10 +376,10 @@ def main() -> None:
 
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
-        rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
-        rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
-        rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
-        rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
+        rank0_print(RANK, f"unik3d_enabled: {_config_value(effective_unik3d_enabled)}")
+        rank0_print(RANK, f"unik3d_alpha_value: {_config_value(getattr(model_config, 'unik3d_alpha_value', None))}")
+        rank0_print(RANK, f"unik3d_feature_source: {_config_value(getattr(model_config, 'unik3d_feature_source', None))}")
+        rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(getattr(model_config, 'unik3d_sampling_mode', None))}")
         vision_config = getattr(model_config, "vision_config", None)
         rank0_print(
             RANK,
@@ -413,7 +413,7 @@ def main() -> None:
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "erp_fourier_linear_adapter": cfg.training.erp_fourier_linear_lr,
-            "panovggt_mlp": cfg.training.panovggt_mlp_lr,
+            "unik3d_mlp": cfg.training.unik3d_mlp_lr,
         },
     )
 

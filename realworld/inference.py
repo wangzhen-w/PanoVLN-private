@@ -21,7 +21,11 @@ for _path in (str(REPO_ROOT), str(SRC_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from src.qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
+from src.qwen_vl import (
+    Qwen3_5Config,
+    Qwen3_5ForConditionalGenerationForPanoVLN,
+    resolve_unik3d_source_path,
+)
 from src.train.data.data import (
     DEFAULT_ERP_BOTTOM_CROP_DEGREES,
     DEFAULT_ERP_TOP_CROP_DEGREES,
@@ -31,7 +35,7 @@ from src.train.data.data import (
     build_erp_image_geometry_batch,
     build_vln_image_selection,
     build_vln_user_content,
-    preprocess_panovggt_current_image,
+    preprocess_unik3d_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
@@ -40,7 +44,7 @@ from src.train.data.data import (
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
 
-DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
+DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/spatial_encoder/Unik3D"
 ACTION_WORDS = ("stop", "forward", "left", "right")
 ACTION_SEQUENCE_LENGTH = 4
 DEFAULT_REALWORLD_GENERATION_KWARGS = {
@@ -74,7 +78,8 @@ ATOMIC_ACTION_PATTERNS = [
 @dataclass
 class InferenceConfig:
     model_path: str = DEFAULT_MODEL_PATH
-    panovggt_checkpoint_path: Optional[str] = None
+    unik3d_source_path: Optional[str] = None
+    unik3d_model_path: Optional[str] = None
     attn_implementation: Optional[str] = "flash_attention_2"
     max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES
     memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES
@@ -216,41 +221,45 @@ class PanoVLNPredictor:
 
         return None
 
-    def _resolve_panovggt_checkpoint(self, model_config: Any) -> None:
-        if not bool(getattr(model_config, "panovggt_enabled", False)):
-            _log_stage("PanoVGGT disabled in model config")
+    def _resolve_unik3d_paths(self, model_config: Any) -> None:
+        if not bool(getattr(model_config, "unik3d_enabled", False)):
+            _log_stage("UniK3D disabled in model config")
             return
 
-        _log_stage("PanoVGGT enabled; checking saved panovggt.* weights in VLN checkpoint")
-        has_saved_panovggt_weights = self._checkpoint_has_weight_prefix(
+        _log_stage("UniK3D enabled; checking saved unik3d.* weights in VLN checkpoint")
+        has_saved_unik3d_weights = self._checkpoint_has_weight_prefix(
             self.config.model_path,
-            "panovggt.",
+            "unik3d.",
         )
-        if has_saved_panovggt_weights is True:
-            _log_stage("PanoVGGT weights found inside VLN checkpoint")
-            return
+        if has_saved_unik3d_weights is True:
+            _log_stage("UniK3D weights found inside VLN checkpoint")
 
-        selected = self.config.panovggt_checkpoint_path
-        if selected:
-            if Path(str(selected)).exists():
-                setattr(model_config, "panovggt_checkpoint_path", str(selected))
-                _log_stage(f"Using explicit PanoVGGT checkpoint: {selected}")
-                return
-            raise FileNotFoundError(f"Explicit PanoVGGT checkpoint does not exist: {selected}")
+        requested_source_path = self.config.unik3d_source_path or getattr(
+            model_config,
+            "unik3d_source_path",
+            None,
+        )
+        setattr(
+            model_config,
+            "unik3d_source_path",
+            str(resolve_unik3d_source_path(requested_source_path)),
+        )
+        if self.config.unik3d_model_path:
+            setattr(model_config, "unik3d_model_path", str(self.config.unik3d_model_path))
 
-        config_checkpoint = getattr(model_config, "panovggt_checkpoint_path", None)
-        if config_checkpoint and Path(str(config_checkpoint)).exists():
-            _log_stage(f"Using PanoVGGT checkpoint from config: {config_checkpoint}")
-            return
-
-        if has_saved_panovggt_weights is None:
-            _log_stage("Could not determine whether VLN checkpoint contains PanoVGGT weights")
-            return
-
-        raise FileNotFoundError(
-            "PanoVGGT is enabled, but the VLN checkpoint does not appear to contain "
-            "saved PanoVGGT weights and config.json does not point to an existing "
-            "PanoVGGT checkpoint. Pass --panovggt-checkpoint with the correct model.pt path."
+        required_paths = {
+            "UniK3D source": getattr(model_config, "unik3d_source_path", None),
+        }
+        missing = [
+            f"{name}: {path}"
+            for name, path in required_paths.items()
+            if not path or not Path(str(path)).exists()
+        ]
+        if missing:
+            raise FileNotFoundError("Missing UniK3D path(s):\n" + "\n".join(missing))
+        _log_stage(
+            "Using bundled UniK3D source from "
+            f"{required_paths['UniK3D source']}; encoder weights will be restored from the VLN checkpoint"
         )
 
     def _load(self) -> None:
@@ -294,13 +303,13 @@ class PanoVLNPredictor:
             model_config = Qwen3_5Config.from_pretrained(model_path)
             _log_stage(
                 "model config loaded "
-                f"panovggt_enabled={bool(getattr(model_config, 'panovggt_enabled', False))} "
+                f"unik3d_enabled={bool(getattr(model_config, 'unik3d_enabled', False))} "
                 f"in {_format_elapsed(step_start)}"
             )
 
             step_start = time.perf_counter()
-            self._resolve_panovggt_checkpoint(model_config)
-            _log_stage(f"PanoVGGT checkpoint resolved in {_format_elapsed(step_start)}")
+            self._resolve_unik3d_paths(model_config)
+            _log_stage(f"UniK3D paths resolved in {_format_elapsed(step_start)}")
 
             kwargs: dict[str, Any] = {
                 "config": model_config,
@@ -371,11 +380,11 @@ class PanoVLNPredictor:
                     )
                 )
 
-        panovggt_enabled = bool(getattr(self.model.config, "panovggt_enabled", False))
-        panovggt_pixel_values = None
-        if panovggt_enabled:
-            panovggt_pixel_values = preprocess_panovggt_current_image(raw_images[-1]).unsqueeze(0)
-        return processed_images, panovggt_pixel_values
+        unik3d_enabled = bool(getattr(self.model.config, "unik3d_enabled", False))
+        unik3d_pixel_values = None
+        if unik3d_enabled:
+            unik3d_pixel_values = preprocess_unik3d_current_image(raw_images[-1]).unsqueeze(0)
+        return processed_images, unik3d_pixel_values
 
     def _move_batch_to_device(self, batch: dict[str, Any]) -> dict[str, Any]:
         device = self._input_device()
@@ -405,11 +414,11 @@ class PanoVLNPredictor:
             memory_pool_window_frames=self.config.memory_pool_window_frames,
         )
         _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
-        processed_images, panovggt_pixel_values = self._prepare_images(selected_images)
+        processed_images, unik3d_pixel_values = self._prepare_images(selected_images)
         _log_stage(
             "images preprocessed "
             f"prompt_images={len(processed_images)} "
-            f"panovggt_enabled={panovggt_pixel_values is not None}"
+            f"unik3d_enabled={unik3d_pixel_values is not None}"
         )
 
         messages = [
@@ -449,8 +458,8 @@ class PanoVLNPredictor:
             [resolve_current_image_index(image_count)],
             dtype=torch.long,
         )
-        if panovggt_pixel_values is not None:
-            encoded["panovggt_pixel_values"] = panovggt_pixel_values
+        if unik3d_pixel_values is not None:
+            encoded["unik3d_pixel_values"] = unik3d_pixel_values
 
         batch = self._move_batch_to_device(dict(encoded))
         input_len = int(batch["input_ids"].shape[-1])
