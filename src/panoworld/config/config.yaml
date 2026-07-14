@@ -11,20 +11,20 @@ model:
     visual_merger: true
     language_model: true
     erp_fourier_linear_adapter: true
-    dap_mlp: false
+    da2_mlp: false
   erp_top_crop_degrees: 0.0
   erp_bottom_crop_degrees: 0.0
   erp_fourier_linear_enabled: true
   erp_fourier_linear_alpha_value: 0.01
   erp_fourier_linear_apply_to_current_only: true
-  dap_enabled: false
-  dap_source_path: "bundled"
-  dap_model_path: "/workspace/data1/model/DAP"
-  dap_alpha_value: 0.05
-  dap_feature_source: "path_4"
-  dap_injection_stage: "post_merger"
-  dap_sampling_mode: "grouping"
-  dap_force_fp32: false
+  da2_enabled: false
+  da2_source_path: "bundled"
+  da2_model_path: "/workspace/data1/model/DA-2"
+  da2_alpha_value: 0.05
+  da2_feature_source: "decoder_multiscale"
+  da2_injection_stage: "post_merger"
+  da2_sampling_mode: "grouping"
+  da2_force_fp32: false
 
 data:
   train_jsonl: "/workspace/data1/dataset/Panoworld/train_outdoor.jsonl"
@@ -57,7 +57,7 @@ training:
   visual_lr: 1.0e-6
   visual_merger_lr: 1.0e-6
   erp_fourier_linear_lr: 1.0e-6
-  dap_mlp_lr: 1.0e-6
+  da2_mlp_lr: 1.0e-6
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5

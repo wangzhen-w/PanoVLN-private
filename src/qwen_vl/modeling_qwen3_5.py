@@ -2,7 +2,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -10,15 +10,18 @@ import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 
-DAP_CONTEXT_DIM = 256
-DAP_FEATURE_SOURCES = {"path_4"}
-DAP_INJECTION_STAGES = {"post_merger", "pre_merger"}
-DAP_MLP_HIDDEN_SIZE = 4096
-BUNDLED_DAP_SOURCE = "bundled"
-DEFAULT_DAP_SOURCE_PATH = Path(__file__).resolve().parents[1] / "dap"
-DEFAULT_DAP_MODEL_PATH = Path("/workspace/data1/model/DAP")
-DAP_IMAGE_MEAN = (0.485, 0.456, 0.406)
-DAP_IMAGE_STD = (0.229, 0.224, 0.225)
+DA2_FEATURE_SPECS = {
+    "decoder_stage0": ((0, 512),),
+    "decoder_stage1": ((1, 256),),
+    "decoder_stage2": ((2, 128),),
+    "decoder_multiscale": ((0, 512), (1, 256), (2, 128)),
+}
+DA2_FEATURE_SOURCES = set(DA2_FEATURE_SPECS)
+DA2_INJECTION_STAGES = {"post_merger", "pre_merger"}
+DA2_MLP_HIDDEN_SIZE = 4096
+BUNDLED_DA2_SOURCE = "bundled"
+DEFAULT_DA2_SOURCE_PATH = Path(__file__).resolve().parents[1]
+DEFAULT_DA2_MODEL_PATH = Path("/workspace/data1/model/DA-2")
 ERP_ANGLE_EPS = 1e-6
 ERP_FOURIER_NUM_HARMONICS = 16
 ERP_FOURIER_ENCODING_DIM = ERP_FOURIER_NUM_HARMONICS * 4
@@ -240,187 +243,165 @@ class ERPFourierLinearAdapter(nn.Module):
         return torch.cat(token_splits, dim=0)
 
 
-def ensure_dap_config(config) -> None:
+def ensure_da2_config(config) -> None:
     vision_config = config.vision_config
     text_config = getattr(config, "text_config", None)
     text_hidden_size = getattr(text_config, "hidden_size", getattr(vision_config, "out_hidden_size", 3584))
     defaults = {
-        "dap_enabled": False,
-        "dap_source_path": BUNDLED_DAP_SOURCE,
-        "dap_model_path": str(DEFAULT_DAP_MODEL_PATH),
-        "dap_alpha_value": 0.1,
-        "dap_feature_source": "path_4",
-        "dap_injection_stage": "post_merger",
-        "dap_sampling_mode": "grouping",
-        "dap_force_fp32": False,
-        "dap_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
+        "da2_enabled": False,
+        "da2_source_path": BUNDLED_DA2_SOURCE,
+        "da2_model_path": str(DEFAULT_DA2_MODEL_PATH),
+        "da2_alpha_value": 0.1,
+        "da2_feature_source": "decoder_multiscale",
+        "da2_injection_stage": "post_merger",
+        "da2_sampling_mode": "grouping",
+        "da2_force_fp32": False,
+        "da2_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
     for field_name, default_value in defaults.items():
         if not hasattr(config, field_name):
             setattr(config, field_name, default_value)
 
 
-def _is_dap_source_tree(source_dir: Path) -> bool:
-    package_file = source_dir / "networks" / "dap.py"
-    dinov3_repo_dir = (
-        source_dir
-        / "depth_anything_v2_metric"
-        / "depth_anything_v2"
-        / "dinov3"
+def _is_da2_source_tree(source_dir: Path) -> bool:
+    package_dir = source_dir / "da2"
+    return (
+        source_dir.is_dir()
+        and (package_dir / "model" / "spherevit.py").is_file()
+        and (package_dir / "configs" / "infer.json").is_file()
     )
-    return source_dir.is_dir() and package_file.is_file() and (
-        dinov3_repo_dir / "dinov3" / "hub" / "backbones.py"
-    ).is_file()
 
 
-def resolve_dap_source_path(source_path: str | Path | None = None) -> Path:
+def _resolve_da2_source_candidate(path: Path) -> Path | None:
+    path = path.expanduser().resolve()
+    for candidate in (path, path / "src"):
+        if _is_da2_source_tree(candidate):
+            return candidate
+    return None
+
+
+def resolve_da2_source_path(source_path: str | Path | None = None) -> Path:
     raw_source_path = "" if source_path is None else str(source_path).strip()
     use_bundled_source = raw_source_path.lower() in {
         "",
         "none",
         "null",
-        BUNDLED_DAP_SOURCE,
+        BUNDLED_DA2_SOURCE,
     }
-    requested_source = (
-        DEFAULT_DAP_SOURCE_PATH
+    requested_path = (
+        DEFAULT_DA2_SOURCE_PATH
         if use_bundled_source
         else Path(raw_source_path).expanduser()
-    ).resolve()
-    if _is_dap_source_tree(requested_source):
+    )
+    requested_source = _resolve_da2_source_candidate(requested_path)
+    if requested_source is not None:
         return requested_source
 
-    bundled_source = DEFAULT_DAP_SOURCE_PATH.resolve()
-    if not use_bundled_source and _is_dap_source_tree(bundled_source):
+    bundled_source = _resolve_da2_source_candidate(DEFAULT_DA2_SOURCE_PATH)
+    if not use_bundled_source and bundled_source is not None:
         return bundled_source
 
     raise FileNotFoundError(
-        "DAP is enabled but no valid source tree was found. "
-        f"requested={requested_source}, bundled={bundled_source}"
+        "DA2 is enabled but no valid source tree was found. "
+        f"requested={requested_path.resolve()}, bundled={DEFAULT_DA2_SOURCE_PATH.resolve()}"
     )
 
 
-def _ensure_dap_source_available(source_path: str | Path | None) -> Path:
-    source_dir = resolve_dap_source_path(source_path)
-    dinov3_repo_dir = (
-        source_dir
-        / "depth_anything_v2_metric"
-        / "depth_anything_v2"
-        / "dinov3"
-    )
+def _ensure_da2_source_available(source_path: str | Path | None) -> Path:
+    source_dir = resolve_da2_source_path(source_path)
 
-    for import_root in (source_dir, dinov3_repo_dir):
-        import_root_str = str(import_root)
-        if import_root_str not in sys.path:
-            sys.path.insert(0, import_root_str)
+    source_str = str(source_dir)
+    while source_str in sys.path:
+        sys.path.remove(source_str)
+    sys.path.insert(0, source_str)
+
+    package_dir = (source_dir / "da2").resolve()
+    loaded_package = sys.modules.get("da2")
+    if loaded_package is not None:
+        loaded_file = getattr(loaded_package, "__file__", None)
+        loaded_paths = getattr(loaded_package, "__path__", ())
+        loaded_from_expected_source = (
+            loaded_file is not None
+            and package_dir in Path(loaded_file).resolve().parents
+        ) or any(Path(path).resolve() == package_dir for path in loaded_paths)
+        if not loaded_from_expected_source:
+            for module_name in tuple(sys.modules):
+                if module_name == "da2" or module_name.startswith("da2."):
+                    del sys.modules[module_name]
     return source_dir
 
 
-def normalize_dap_feature_source(feature_source: str) -> str:
+def normalize_da2_feature_source(feature_source: str) -> str:
     feature_source = str(feature_source).lower()
-    if feature_source not in DAP_FEATURE_SOURCES:
+    if feature_source not in DA2_FEATURE_SOURCES:
         raise ValueError(
-            "dap_feature_source must be 'path_4', "
+            "da2_feature_source must be one of "
+            f"{sorted(DA2_FEATURE_SOURCES)}, "
             f"got {feature_source!r}"
         )
     return feature_source
 
 
-def normalize_dap_injection_stage(injection_stage: str) -> str:
+def normalize_da2_injection_stage(injection_stage: str) -> str:
     injection_stage = str(injection_stage).lower()
-    if injection_stage not in DAP_INJECTION_STAGES:
+    if injection_stage not in DA2_INJECTION_STAGES:
         raise ValueError(
-            "dap_injection_stage must be 'post_merger' or 'pre_merger', "
+            "da2_injection_stage must be 'post_merger' or 'pre_merger', "
             f"got {injection_stage!r}"
         )
     return injection_stage
 
 
-def build_dap_model(
+def build_da2_model(
     source_path: str,
     model_path: str | None,
     *,
     load_pretrained_weights: bool = True,
 ):
-    source_dir = _ensure_dap_source_available(source_path)
+    source_dir = _ensure_da2_source_available(source_path)
     try:
-        from dinov3.hub.backbones import dinov3_vitl16
-        from networks.dap import DAP
+        from da2.model import SphereViT
     except Exception as exc:
         raise ImportError(
-            "DAP is enabled but could not be imported from "
-            f"{source_dir}"
+            "DA2 is enabled but could not be imported from "
+            f"{source_dir}: {type(exc).__name__}: {exc}"
         ) from exc
 
-    original_hub_load = torch.hub.load
-
-    def load_vendored_dinov3(repo_or_dir, model_name, *args, **kwargs):
-        del repo_or_dir, args
-        if model_name != "dinov3_vitl16" or kwargs.get("pretrained", False):
-            raise ValueError(
-                "DAP requested an unsupported vendored DINOv3 backbone: "
-                f"model={model_name!r}, pretrained={kwargs.get('pretrained')!r}"
-            )
-        return dinov3_vitl16(pretrained=False)
-
-    torch.hub.load = load_vendored_dinov3
-    try:
-        model = DAP(
-            SimpleNamespace(
-                midas_model_type="vitl",
-                fine_tune_type="none",
-                min_depth=0.01,
-                max_depth=1.0,
-                train_decoder=True,
-            )
-        )
-    finally:
-        torch.hub.load = original_hub_load
+    architecture_path = source_dir / "da2" / "configs" / "infer.json"
+    architecture_config = json.loads(architecture_path.read_text(encoding="utf-8"))
+    model = SphereViT(architecture_config)
 
     if not load_pretrained_weights:
-        freeze_dap_model(model)
+        freeze_da2_model(model)
         return model
 
     if not model_path:
         raise FileNotFoundError(
-            "DAP pretrained weights are required when the VLN checkpoint does not "
-            "contain dap.* tensors"
+            "DA2 pretrained weights are required when the VLN checkpoint does not "
+            "contain da2.* tensors"
         )
     model_dir = Path(model_path).expanduser().resolve()
     if not model_dir.is_dir():
         raise FileNotFoundError(
-            "DAP is enabled but its pretrained model directory is missing: "
+            "DA2 is enabled but its pretrained model directory is missing: "
             f"{model_dir}"
         )
-    model_file = model_dir / "model.pth"
+    model_file = model_dir / "model.safetensors"
     if not model_file.is_file():
-        raise FileNotFoundError(f"DAP model.pth is missing from {model_dir}")
+        raise FileNotFoundError(f"DA2 model.safetensors is missing from {model_dir}")
 
+    from safetensors.torch import load_file
+
+    state_dict = load_file(str(model_file), device="cpu")
     try:
-        checkpoint = torch.load(
-            str(model_file),
-            map_location="cpu",
-            weights_only=True,
-            mmap=True,
-        )
-    except (TypeError, RuntimeError):
-        checkpoint = torch.load(str(model_file), map_location="cpu", weights_only=True)
-    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("state_dict"), dict):
-        checkpoint = checkpoint["state_dict"]
-    if not isinstance(checkpoint, dict):
-        raise TypeError(f"DAP checkpoint must contain a state dict, got {type(checkpoint)!r}")
-
-    state_dict = {}
-    for key, tensor in checkpoint.items():
-        if key == "epoch":
-            continue
-        normalized_key = key[len("module.") :] if key.startswith("module.") else key
-        state_dict[normalized_key] = tensor
-    model.load_state_dict(state_dict, strict=True)
-    freeze_dap_model(model)
+        model.load_state_dict(state_dict, strict=True, assign=True)
+    except TypeError:
+        model.load_state_dict(state_dict, strict=True)
+    freeze_da2_model(model)
     return model
 
 
-def freeze_dap_model(model: nn.Module | None) -> None:
+def freeze_da2_model(model: nn.Module | None) -> None:
     if model is None:
         return
     model.eval()
@@ -428,31 +409,32 @@ def freeze_dap_model(model: nn.Module | None) -> None:
         param.requires_grad = False
 
 
-class DAPGeometryMLP(nn.Module):
+class DA2GeometryMLP(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        ensure_dap_config(config)
+        ensure_da2_config(config)
 
-        self.enabled = bool(getattr(config, "dap_enabled", False))
-        self.feature_source = normalize_dap_feature_source(
-            getattr(config, "dap_feature_source", "path_4")
+        self.enabled = bool(getattr(config, "da2_enabled", False))
+        self.feature_source = normalize_da2_feature_source(
+            getattr(config, "da2_feature_source", "decoder_multiscale")
         )
-        self.injection_stage = normalize_dap_injection_stage(
-            getattr(config, "dap_injection_stage", "post_merger")
+        self.injection_stage = normalize_da2_injection_stage(
+            getattr(config, "da2_injection_stage", "post_merger")
         )
-        self.context_dim = DAP_CONTEXT_DIM
+        self.feature_spec = DA2_FEATURE_SPECS[self.feature_source]
+        self.context_dim = sum(channels for _, channels in self.feature_spec)
         if self.injection_stage == "pre_merger":
             self.output_dim = int(getattr(config.vision_config, "hidden_size"))
         else:
-            self.output_dim = int(getattr(config, "dap_output_dim", config.text_config.hidden_size))
-        self.hidden_dim = DAP_MLP_HIDDEN_SIZE
-        self.sampling_mode = str(getattr(config, "dap_sampling_mode", "grouping")).lower()
+            self.output_dim = int(getattr(config, "da2_output_dim", config.text_config.hidden_size))
+        self.hidden_dim = DA2_MLP_HIDDEN_SIZE
+        self.sampling_mode = str(getattr(config, "da2_sampling_mode", "grouping")).lower()
         if self.sampling_mode not in {"singlepoint", "grouping"}:
             raise ValueError(
-                "dap_sampling_mode must be 'singlepoint' or 'grouping', "
+                "da2_sampling_mode must be 'singlepoint' or 'grouping', "
                 f"got {self.sampling_mode!r}"
             )
-        self.alpha_init = float(getattr(config, "dap_alpha_value", 0.1))
+        self.alpha_init = float(getattr(config, "da2_alpha_value", 0.1))
         self.register_buffer(
             "alpha_value",
             torch.tensor(self.alpha_init, dtype=torch.float32),
@@ -528,39 +510,34 @@ class DAPGeometryMLP(nn.Module):
         )
         return sampled[0].permute(1, 2, 0).reshape(target_h * target_w, source_grid.shape[1])
 
-    def _sample_token_geometry_singlepoint(
+    def _sample_feature_pyramid(
         self,
-        source_grid: torch.Tensor,
+        source_grids: list[torch.Tensor],
         target_h: int,
         target_w: int,
         geometry: torch.Tensor | None,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        sampled = self._sample_geometry_grid(
-            source_grid,
-            target_h=target_h,
-            target_w=target_w,
-            geometry=geometry,
-        )
-        return self.input_norm(sampled.to(dtype=dtype))
+        sample_h = target_h
+        sample_w = target_w
+        if self.sampling_mode == "grouping":
+            sample_h *= self.spatial_merge_size
+            sample_w *= self.spatial_merge_size
 
-    def _sample_token_geometry_grouping(
-        self,
-        source_grid: torch.Tensor,
-        target_h: int,
-        target_w: int,
-        geometry: torch.Tensor | None,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        group_h = target_h * self.spatial_merge_size
-        group_w = target_w * self.spatial_merge_size
-        sampled = self._sample_geometry_grid(
-            source_grid,
-            target_h=group_h,
-            target_w=group_w,
-            geometry=geometry,
-        )
+        sampled_levels = [
+            self._sample_geometry_grid(
+                source_grid,
+                target_h=sample_h,
+                target_w=sample_w,
+                geometry=geometry,
+            )
+            for source_grid in source_grids
+        ]
+        sampled = torch.cat(sampled_levels, dim=-1)
         sampled = self.input_norm(sampled.to(dtype=dtype))
+        if self.sampling_mode == "singlepoint":
+            return sampled
+
         sampled = sampled.reshape(
             target_h,
             self.spatial_merge_size,
@@ -571,30 +548,6 @@ class DAPGeometryMLP(nn.Module):
         sampled = sampled.permute(0, 2, 1, 3, 4).contiguous()
         return sampled.reshape(target_h * target_w, self.mlp_input_dim)
 
-    def _sample_token_geometry(
-        self,
-        source_grid: torch.Tensor,
-        target_h: int,
-        target_w: int,
-        geometry: torch.Tensor | None,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if self.sampling_mode == "grouping":
-            return self._sample_token_geometry_grouping(
-                source_grid,
-                target_h=target_h,
-                target_w=target_w,
-                geometry=geometry,
-                dtype=dtype,
-            )
-        return self._sample_token_geometry_singlepoint(
-            source_grid,
-            target_h=target_h,
-            target_w=target_w,
-            geometry=geometry,
-            dtype=dtype,
-        )
-
     def _to_qwen_pre_merger_order(
         self,
         tokens: torch.Tensor,
@@ -603,12 +556,12 @@ class DAPGeometryMLP(nn.Module):
     ) -> torch.Tensor:
         if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
             raise AssertionError(
-                "DAP pre-merger target grid is not divisible by Qwen spatial_merge_size: "
+                "DA2 pre-merger target grid is not divisible by Qwen spatial_merge_size: "
                 f"grid=({grid_h}, {grid_w}), spatial_merge_size={self.spatial_merge_size}"
             )
         if int(tokens.shape[0]) != int(grid_h * grid_w):
             raise AssertionError(
-                "DAP pre-merger token length mismatch before Qwen order conversion: "
+                "DA2 pre-merger token length mismatch before Qwen order conversion: "
                 f"tokens={int(tokens.shape[0])}, grid=({grid_h}, {grid_w})"
             )
         tokens = tokens.reshape(
@@ -621,89 +574,10 @@ class DAPGeometryMLP(nn.Module):
         tokens = tokens.permute(0, 2, 1, 3, 4).contiguous()
         return tokens.reshape(grid_h * grid_w, -1)
 
-    @staticmethod
-    def _project_dap_dpt_feature(
-        depth_head: nn.Module,
-        feature,
-        head_index: int,
-        patch_h: int,
-        patch_w: int,
-    ) -> torch.Tensor:
-        if depth_head.use_clstoken:
-            x, cls_token = feature
-            if x.ndim == 3:
-                readout = cls_token.unsqueeze(1).expand_as(x)
-                x = depth_head.readout_projects[head_index](torch.cat((x, readout), dim=-1))
-        else:
-            x = feature[0] if isinstance(feature, (tuple, list)) else feature
-
-        if x.ndim == 3:
-            x = x.permute(0, 2, 1).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
-        elif x.ndim == 4:
-            if tuple(x.shape[-2:]) != (patch_h, patch_w):
-                x = F.interpolate(
-                    x,
-                    size=(patch_h, patch_w),
-                    mode="bilinear",
-                    align_corners=True,
-                )
-        else:
-            raise RuntimeError(f"Unexpected DAP DPT feature shape: {tuple(x.shape)}")
-
-        x = depth_head.projects[head_index](x)
-        return depth_head.resize_layers[head_index](x)
-
-    @classmethod
-    def _extract_dap_path_4(
-        cls,
-        dap_model: nn.Module,
-        images: torch.Tensor,
-    ) -> torch.Tensor:
-        core = dap_model.core
-        patch_size = int(getattr(core, "patch_size", 16))
-        image_h, image_w = [int(value) for value in images.shape[-2:]]
-        if image_h % patch_size != 0 or image_w % patch_size != 0:
-            raise AssertionError(
-                "DAP input must be divisible by its patch size: "
-                f"shape=({image_h}, {image_w}), patch_size={patch_size}"
-            )
-        patch_h, patch_w = image_h // patch_size, image_w // patch_size
-
-        feature_indices = core.intermediate_layer_idx[core.encoder][-2:]
-        features = core.pretrained.get_intermediate_layers(
-            images,
-            feature_indices,
-            return_class_token=True,
-        )
-        if len(features) != 2:
-            raise AssertionError(f"DAP expected two deep DINOv3 features, got {len(features)}")
-
-        depth_head = core.depth_head
-        layer_3 = cls._project_dap_dpt_feature(
-            depth_head,
-            features[0],
-            head_index=2,
-            patch_h=patch_h,
-            patch_w=patch_w,
-        )
-        layer_4 = cls._project_dap_dpt_feature(
-            depth_head,
-            features[1],
-            head_index=3,
-            patch_h=patch_h,
-            patch_w=patch_w,
-        )
-        layer_3_rn = depth_head.scratch.layer3_rn(layer_3)
-        layer_4_rn = depth_head.scratch.layer4_rn(layer_4)
-        return depth_head.scratch.refinenet4(
-            layer_4_rn,
-            size=layer_3_rn.shape[2:],
-        )
-
     def forward(
         self,
-        dap_pixel_values: torch.Tensor,
-        dap_model: nn.Module,
+        da2_pixel_values: torch.Tensor,
+        da2_model: nn.Module,
         target_grid_thw: torch.Tensor,
         target_lengths: list[int],
         image_erp_geometry: torch.Tensor | None,
@@ -712,32 +586,29 @@ class DAPGeometryMLP(nn.Module):
     ) -> list[torch.Tensor]:
         if (
             not self.enabled
-            or dap_model is None
-            or dap_pixel_values is None
-            or dap_pixel_values.numel() == 0
+            or da2_model is None
+            or da2_pixel_values is None
+            or da2_pixel_values.numel() == 0
         ):
             return []
 
-        if dap_pixel_values.ndim != 4:
+        if da2_pixel_values.ndim != 4:
             raise AssertionError(
-                "Expected dap_pixel_values shape [B, 3, H, W], "
-                f"got {tuple(dap_pixel_values.shape)}"
+                "Expected da2_pixel_values shape [B, 3, H, W], "
+                f"got {tuple(da2_pixel_values.shape)}"
             )
 
-        encoder = dap_model
+        encoder = da2_model
         encoder_param = next(encoder.parameters())
         param = next(self.mlp.parameters())
-        images = dap_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
+        images = da2_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
         if int(images.shape[1]) != 3:
-            raise AssertionError(f"DAP expects RGB inputs, got {tuple(images.shape)}")
+            raise AssertionError(f"DA2 expects RGB inputs, got {tuple(images.shape)}")
 
-        mean = images.new_tensor(DAP_IMAGE_MEAN).view(1, 3, 1, 1)
-        std = images.new_tensor(DAP_IMAGE_STD).view(1, 3, 1, 1)
-        normalized_images = (images - mean) / std
         batch_size, _, image_h, image_w = [int(value) for value in images.shape]
         if image_w != 2 * image_h:
             raise AssertionError(
-                "DAP expects a full 2:1 ERP panorama: "
+                "DA2 expects a full 2:1 ERP panorama: "
                 f"shape=({image_h}, {image_w})"
             )
 
@@ -750,46 +621,60 @@ class DAPGeometryMLP(nn.Module):
             dtype=encoder_param.dtype,
             enabled=autocast_enabled,
         ):
-            source_grid = self._extract_dap_path_4(encoder, normalized_images)
+            feature_pyramid = encoder.extract_decoder_features(images)
 
-        if source_grid.ndim != 4:
+        if not isinstance(feature_pyramid, (tuple, list)) or len(feature_pyramid) != 3:
             raise AssertionError(
-                f"Expected DAP path_4 features [B, C, H, W], got {tuple(source_grid.shape)}"
+                "DA2 must return its three-stage spherical decoder pyramid, "
+                f"got {type(feature_pyramid)!r} with length "
+                f"{len(feature_pyramid) if isinstance(feature_pyramid, (tuple, list)) else 'n/a'}"
             )
-        if int(source_grid.shape[0]) != batch_size:
-            raise AssertionError(
-                f"DAP feature batch mismatch: expected {batch_size}, got {int(source_grid.shape[0])}"
-            )
-        if int(source_grid.shape[1]) != self.context_dim:
-            raise AssertionError(
-                f"DAP context dim mismatch: expected {self.context_dim}, got {int(source_grid.shape[1])}"
-            )
+        source_grids = []
+        for stage_index, expected_channels in self.feature_spec:
+            source_grid = feature_pyramid[stage_index]
+            if source_grid.ndim != 4:
+                raise AssertionError(
+                    f"Expected DA2 decoder stage {stage_index} as [B, C, H, W], "
+                    f"got {tuple(source_grid.shape)}"
+                )
+            if int(source_grid.shape[0]) != batch_size:
+                raise AssertionError(
+                    "DA2 feature batch mismatch: "
+                    f"expected {batch_size}, got {int(source_grid.shape[0])} at stage {stage_index}"
+                )
+            if int(source_grid.shape[1]) != expected_channels:
+                raise AssertionError(
+                    "DA2 decoder channel mismatch: "
+                    f"stage={stage_index}, expected={expected_channels}, "
+                    f"got={int(source_grid.shape[1])}"
+                )
+            source_grids.append(source_grid)
 
         deltas = []
         geometry = image_erp_geometry
         if geometry is not None:
             geometry = geometry.to(device=param.device, dtype=torch.float32)
-        if int(source_grid.shape[0]) != len(target_lengths) or len(target_lengths) != int(target_grid_thw.shape[0]):
+        if batch_size != len(target_lengths) or len(target_lengths) != int(target_grid_thw.shape[0]):
             raise AssertionError(
-                "DAP batch size mismatch: "
-                f"source={int(source_grid.shape[0])}, target_lengths={len(target_lengths)}, "
+                "DA2 batch size mismatch: "
+                f"source={batch_size}, target_lengths={len(target_lengths)}, "
                 f"target_grid_thw={int(target_grid_thw.shape[0])}"
             )
         if geometry is not None and int(geometry.shape[0]) != len(target_lengths):
             raise AssertionError(
-                "DAP geometry batch size mismatch: "
+                "DA2 geometry batch size mismatch: "
                 f"geometry={int(geometry.shape[0])}, target_lengths={len(target_lengths)}"
             )
         for sample_index, (grid_thw, target_len) in enumerate(zip(target_grid_thw.tolist(), target_lengths)):
             num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
             if num_frames != 1:
                 raise AssertionError(
-                    "DAP geometry fusion expects a single current panorama per Qwen image, "
+                    "DA2 geometry fusion expects a single current panorama per Qwen image, "
                     f"got image_grid_thw={grid_thw}"
                 )
             if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
                 raise AssertionError(
-                    "DAP target grid is not divisible by Qwen spatial_merge_size: "
+                    "DA2 target grid is not divisible by Qwen spatial_merge_size: "
                     f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}"
                 )
             if self.injection_stage == "pre_merger":
@@ -801,14 +686,17 @@ class DAPGeometryMLP(nn.Module):
             expected_len = target_h * target_w
             if expected_len != int(target_len):
                 raise AssertionError(
-                    "Cannot map DAP geometry to the Qwen 2D visual-token grid: "
+                    "Cannot map DA2 geometry to the Qwen 2D visual-token grid: "
                     f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}, "
                     f"expected_len={expected_len}, qwen_len={int(target_len)}"
                 )
 
             sample_geometry = None if geometry is None else geometry[sample_index]
-            geo = self._sample_token_geometry(
-                source_grid[sample_index:sample_index + 1],
+            geo = self._sample_feature_pyramid(
+                [
+                    source_grid[sample_index:sample_index + 1]
+                    for source_grid in source_grids
+                ],
                 target_h=target_h,
                 target_w=target_w,
                 geometry=sample_geometry,
@@ -816,7 +704,7 @@ class DAPGeometryMLP(nn.Module):
             )
             if geo.shape[0] != int(target_len):
                 raise AssertionError(
-                    "DAP sampled geometry length mismatch: "
+                    "DA2 sampled geometry length mismatch: "
                     f"sampled_len={geo.shape[0]}, qwen_len={int(target_len)}"
                 )
             projected = self.output_norm(self.mlp(geo))
@@ -831,16 +719,16 @@ class DAPGeometryMLP(nn.Module):
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
     _keys_to_ignore_on_load_unexpected = list(
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
-    ) + [r"dap\..*"]
+    ) + [r"da2\..*"]
 
-    DAP_STATE_KEYS = (
-        "dap_mlp.alpha_value",
-        "dap_mlp.input_norm.weight",
-        "dap_mlp.mlp.0.weight",
-        "dap_mlp.mlp.0.bias",
-        "dap_mlp.mlp.2.weight",
-        "dap_mlp.mlp.2.bias",
-        "dap_mlp.output_norm.weight",
+    DA2_STATE_KEYS = (
+        "da2_mlp.alpha_value",
+        "da2_mlp.input_norm.weight",
+        "da2_mlp.mlp.0.weight",
+        "da2_mlp.mlp.0.bias",
+        "da2_mlp.mlp.2.weight",
+        "da2_mlp.mlp.2.bias",
+        "da2_mlp.output_norm.weight",
     )
     def __init__(self, config):
         vision_config = getattr(config, "vision_config", None)
@@ -851,40 +739,40 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 getattr(config, "erp_fourier_linear_enabled", False),
             )
         )
-        dap_enabled = bool(getattr(config, "dap_enabled", False))
+        da2_enabled = bool(getattr(config, "da2_enabled", False))
         if erp_fourier_linear_enabled:
             ensure_erp_fourier_linear_config(config.vision_config)
-        if dap_enabled:
-            ensure_dap_config(config)
+        if da2_enabled:
+            ensure_da2_config(config)
         super().__init__(config)
 
         if erp_fourier_linear_enabled:
             ensure_erp_fourier_linear_config(self.model.visual.config)
-        if dap_enabled:
-            ensure_dap_config(config)
+        if da2_enabled:
+            ensure_da2_config(config)
 
         self.erp_fourier_linear_adapter = (
             ERPFourierLinearAdapter(self.model.visual.config)
             if erp_fourier_linear_enabled
             else None
         )
-        self.dap_mlp = DAPGeometryMLP(config) if dap_enabled else None
-        self.dap = None
-        self._dap_weights_ready = False
-        self._dap_dtype = None
-        self._dap_device = None
-        self._dap_mlp_load_was_incompatible = False
+        self.da2_mlp = DA2GeometryMLP(config) if da2_enabled else None
+        self.da2 = None
+        self._da2_weights_ready = False
+        self._da2_dtype = None
+        self._da2_device = None
+        self._da2_mlp_load_was_incompatible = False
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
-        self._pano_runtime_dap_pixel_values = None
+        self._pano_runtime_da2_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
         self._install_pano_patch_embed_hook()
         self._install_pano_merger_hook()
         self._install_image_feature_hook()
-        self.register_load_state_dict_pre_hook(self._drop_incompatible_dap_mlp_pre_hook)
+        self.register_load_state_dict_pre_hook(self._drop_incompatible_da2_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
     def _erp_fourier_linear_enabled(self) -> bool:
@@ -893,13 +781,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             and bool(getattr(self.erp_fourier_linear_adapter, "enabled", False))
         )
 
-    def _dap_enabled(self) -> bool:
-        return self.dap_mlp is not None and bool(getattr(self.dap_mlp, "enabled", False))
+    def _da2_enabled(self) -> bool:
+        return self.da2_mlp is not None and bool(getattr(self.da2_mlp, "enabled", False))
 
-    def _dap_injection_stage(self) -> str:
-        if self.dap_mlp is not None:
-            return self.dap_mlp.injection_stage
-        return normalize_dap_injection_stage(getattr(self.config, "dap_injection_stage", "post_merger"))
+    def _da2_injection_stage(self) -> str:
+        if self.da2_mlp is not None:
+            return self.da2_mlp.injection_stage
+        return normalize_da2_injection_stage(getattr(self.config, "da2_injection_stage", "post_merger"))
 
     def _runtime_grid_matches_image_grid(self, grid_thw: torch.Tensor | None) -> bool:
         runtime_grid = self._pano_runtime_grid_thw
@@ -953,7 +841,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         visual.patch_embed.forward = MethodType(patch_embed_with_pano_adapters, visual.patch_embed)
 
-    def _select_dap_current_items(
+    def _select_da2_current_items(
         self,
         image_grid_thw: torch.Tensor,
         num_image_outputs: int | None = None,
@@ -968,26 +856,26 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             and (num_image_outputs is None or image_index < num_image_outputs)
         ]
 
-    def _dap_current_batch_inputs(
+    def _da2_current_batch_inputs(
         self,
         *,
-        dap_pixel_values: torch.Tensor,
+        da2_pixel_values: torch.Tensor,
         current_items: list[tuple[int, int]],
     ) -> torch.Tensor:
-        if dap_pixel_values is None or dap_pixel_values.numel() == 0:
-            raise AssertionError("DAP is enabled but dap_pixel_values is missing")
-        if int(dap_pixel_values.shape[0]) != len(current_items):
+        if da2_pixel_values is None or da2_pixel_values.numel() == 0:
+            raise AssertionError("DA2 is enabled but da2_pixel_values is missing")
+        if int(da2_pixel_values.shape[0]) != len(current_items):
             raise AssertionError(
-                "DAP current-image batch size mismatch: "
-                f"dap_batch={int(dap_pixel_values.shape[0])}, "
+                "DA2 current-image batch size mismatch: "
+                f"da2_batch={int(da2_pixel_values.shape[0])}, "
                 f"current_items={len(current_items)}"
             )
         batch_indices = torch.tensor(
             [item[0] for item in current_items],
-            device=dap_pixel_values.device,
+            device=da2_pixel_values.device,
             dtype=torch.long,
         )
-        return dap_pixel_values.index_select(0, batch_indices)
+        return da2_pixel_values.index_select(0, batch_indices)
 
     def _target_geometry_for_indices(
         self,
@@ -998,18 +886,18 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return None
         return geometry[target_indices].detach().to(device="cpu", dtype=torch.float32)
 
-    def _apply_post_merger_dap_residual(self, vision_output, image_grid_thw: torch.Tensor):
+    def _apply_post_merger_da2_residual(self, vision_output, image_grid_thw: torch.Tensor):
         if image_grid_thw is None or vision_output.pooler_output is None:
             return vision_output
 
         image_embeds = list(vision_output.pooler_output)
-        current_items = self._select_dap_current_items(image_grid_thw, num_image_outputs=len(image_embeds))
+        current_items = self._select_da2_current_items(image_grid_thw, num_image_outputs=len(image_embeds))
         if not current_items:
             return vision_output
 
-        dap_pixel_values = self._pano_runtime_dap_pixel_values
-        dap_inputs = self._dap_current_batch_inputs(
-            dap_pixel_values=dap_pixel_values,
+        da2_pixel_values = self._pano_runtime_da2_pixel_values
+        da2_inputs = self._da2_current_batch_inputs(
+            da2_pixel_values=da2_pixel_values,
             current_items=current_items,
         )
         target_indices = [item[1] for item in current_items]
@@ -1017,15 +905,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         target_lengths = [int(image_embeds[index].shape[0]) for index in target_indices]
         geometry = self._target_geometry_for_indices(target_indices)
 
-        dap_model = self._ensure_dap_model(
+        da2_model = self._ensure_da2_model(
             device=image_embeds[target_indices[0]].device,
             dtype=image_embeds[target_indices[0]].dtype,
         )
-        if dap_model is None or self.dap_mlp is None:
+        if da2_model is None or self.da2_mlp is None:
             return vision_output
-        deltas = self.dap_mlp(
-            dap_inputs,
-            dap_model=dap_model,
+        deltas = self.da2_mlp(
+            da2_inputs,
+            da2_model=da2_model,
             target_grid_thw=target_grid_thw,
             target_lengths=target_lengths,
             image_erp_geometry=geometry,
@@ -1035,7 +923,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         for image_index, delta in zip(target_indices, deltas):
             if delta.shape != image_embeds[image_index].shape:
                 raise AssertionError(
-                    "DAP delta shape mismatch: "
+                    "DA2 delta shape mismatch: "
                     f"delta={tuple(delta.shape)}, qwen={tuple(image_embeds[image_index].shape)}"
                 )
             image_embeds[image_index] = image_embeds[image_index] + delta
@@ -1043,7 +931,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         vision_output.pooler_output = tuple(image_embeds)
         return vision_output
 
-    def _apply_pre_merger_dap_residual(
+    def _apply_pre_merger_da2_residual(
         self,
         hidden_states: torch.Tensor,
         image_grid_thw: torch.Tensor | None,
@@ -1051,13 +939,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if image_grid_thw is None or hidden_states.numel() == 0:
             return hidden_states
 
-        current_items = self._select_dap_current_items(image_grid_thw)
+        current_items = self._select_da2_current_items(image_grid_thw)
         if not current_items:
             return hidden_states
 
-        dap_pixel_values = self._pano_runtime_dap_pixel_values
-        dap_inputs = self._dap_current_batch_inputs(
-            dap_pixel_values=dap_pixel_values,
+        da2_pixel_values = self._pano_runtime_da2_pixel_values
+        da2_inputs = self._da2_current_batch_inputs(
+            da2_pixel_values=da2_pixel_values,
             current_items=current_items,
         )
         target_indices = [item[1] for item in current_items]
@@ -1068,15 +956,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ]
         geometry = self._target_geometry_for_indices(target_indices)
 
-        dap_model = self._ensure_dap_model(
+        da2_model = self._ensure_da2_model(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        if dap_model is None or self.dap_mlp is None:
+        if da2_model is None or self.da2_mlp is None:
             return hidden_states
-        deltas = self.dap_mlp(
-            dap_inputs,
-            dap_model=dap_model,
+        deltas = self.da2_mlp(
+            da2_inputs,
+            da2_model=da2_model,
             target_grid_thw=target_grid_thw,
             target_lengths=target_lengths,
             image_erp_geometry=geometry,
@@ -1105,14 +993,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             length = split_lengths[image_index]
             if tuple(delta.shape) != (length, int(hidden_states.shape[-1])):
                 raise AssertionError(
-                    "DAP pre-merger delta shape mismatch: "
+                    "DA2 pre-merger delta shape mismatch: "
                     f"delta={tuple(delta.shape)}, qwen=({length}, {int(hidden_states.shape[-1])})"
                 )
             hidden_states[start:start + length] = hidden_states[start:start + length] + delta
         return hidden_states
 
     def _install_pano_merger_hook(self) -> None:
-        if not self._dap_enabled() or self._dap_injection_stage() != "pre_merger":
+        if not self._da2_enabled() or self._da2_injection_stage() != "pre_merger":
             return
         visual = self.model.visual
         if hasattr(visual.merger, "_pano_origin_forward"):
@@ -1123,11 +1011,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         def merger_with_pano_pre_merger_residual(this, hidden_states):
             if (
-                owner._dap_enabled()
-                and owner._dap_injection_stage() == "pre_merger"
+                owner._da2_enabled()
+                and owner._da2_injection_stage() == "pre_merger"
                 and owner._pano_runtime_in_image_features
             ):
-                hidden_states = owner._apply_pre_merger_dap_residual(
+                hidden_states = owner._apply_pre_merger_da2_residual(
                     hidden_states=hidden_states,
                     image_grid_thw=owner._pano_runtime_visual_grid_thw,
                 )
@@ -1136,7 +1024,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         visual.merger.forward = MethodType(merger_with_pano_pre_merger_residual, visual.merger)
 
     def _install_image_feature_hook(self) -> None:
-        if not self._dap_enabled():
+        if not self._da2_enabled():
             return
         if hasattr(self.model, "_pano_origin_get_image_features"):
             return
@@ -1161,9 +1049,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 owner._pano_runtime_visual_grid_thw = previous_visual_grid
             if not is_image_visual_call:
                 return vision_output
-            if owner._dap_injection_stage() == "pre_merger":
+            if owner._da2_injection_stage() == "pre_merger":
                 return vision_output
-            vision_output = owner._apply_post_merger_dap_residual(vision_output, image_grid_thw)
+            vision_output = owner._apply_post_merger_da2_residual(vision_output, image_grid_thw)
             return vision_output
 
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
@@ -1175,24 +1063,24 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images: torch.Tensor | None,
         image_current_index: torch.Tensor | None,
         image_erp_geometry: torch.Tensor | None,
-        dap_pixel_values: torch.Tensor | None,
+        da2_pixel_values: torch.Tensor | None,
     ) -> None:
         self._pano_runtime_grid_thw = image_grid_thw
         self._pano_runtime_image_num_images = image_num_images
         self._pano_runtime_image_current_index = image_current_index
         self._pano_runtime_image_geometry = image_erp_geometry
-        self._pano_runtime_dap_pixel_values = dap_pixel_values
+        self._pano_runtime_da2_pixel_values = da2_pixel_values
 
     def _clear_runtime_pano_context(self) -> None:
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
-        self._pano_runtime_dap_pixel_values = None
+        self._pano_runtime_da2_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
 
-    def _drop_incompatible_dap_mlp_pre_hook(
+    def _drop_incompatible_da2_mlp_pre_hook(
         self,
         module,
         state_dict,
@@ -1204,13 +1092,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         error_msgs,
     ) -> None:
         del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        if self.dap_mlp is None:
+        if self.da2_mlp is None:
             return
-        key_prefix = f"{prefix}dap_mlp."
+        key_prefix = f"{prefix}da2_mlp."
         checkpoint_keys = [key for key in state_dict.keys() if key.startswith(key_prefix)]
         if not checkpoint_keys:
             return
-        target_state = self.dap_mlp.state_dict()
+        target_state = self.da2_mlp.state_dict()
         incompatible = False
         unknown_keys = []
         for key in checkpoint_keys:
@@ -1229,20 +1117,20 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return
         for key in checkpoint_keys:
             del state_dict[key]
-        self._dap_mlp_load_was_incompatible = True
+        self._da2_mlp_load_was_incompatible = True
 
-    def _load_external_dap_weights(self) -> None:
-        if not self._dap_enabled():
+    def _load_external_da2_weights(self) -> None:
+        if not self._da2_enabled():
             return
-        if self.dap is None:
-            self.dap = build_dap_model(
-                source_path=str(getattr(self.config, "dap_source_path")),
-                model_path=str(getattr(self.config, "dap_model_path")),
+        if self.da2 is None:
+            self.da2 = build_da2_model(
+                source_path=str(getattr(self.config, "da2_source_path")),
+                model_path=str(getattr(self.config, "da2_model_path")),
             )
-        freeze_dap_model(self.dap)
-        self._dap_weights_ready = True
-        self._dap_device = None
-        self._dap_dtype = None
+        freeze_da2_model(self.da2)
+        self._da2_weights_ready = True
+        self._da2_device = None
+        self._da2_dtype = None
 
     @staticmethod
     def _load_prefixed_checkpoint_tensors(checkpoint_dir: Path, prefix: str) -> dict[str, torch.Tensor]:
@@ -1307,69 +1195,69 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         return state_dict
 
-    def _load_saved_dap_weights(self, pretrained_model_name_or_path) -> bool:
-        if not self._dap_enabled():
+    def _load_saved_da2_weights(self, pretrained_model_name_or_path) -> bool:
+        if not self._da2_enabled():
             return False
 
         checkpoint_dir = Path(str(pretrained_model_name_or_path))
-        state_dict = self._load_prefixed_checkpoint_tensors(checkpoint_dir, "dap.")
+        state_dict = self._load_prefixed_checkpoint_tensors(checkpoint_dir, "da2.")
         if not state_dict:
             return False
 
-        if self.dap is None:
-            self.dap = build_dap_model(
-                source_path=str(getattr(self.config, "dap_source_path")),
+        if self.da2 is None:
+            self.da2 = build_da2_model(
+                source_path=str(getattr(self.config, "da2_source_path")),
                 model_path=None,
                 load_pretrained_weights=False,
             )
 
         try:
             try:
-                self.dap.load_state_dict(state_dict, strict=True, assign=True)
+                self.da2.load_state_dict(state_dict, strict=True, assign=True)
             except TypeError:
-                self.dap.load_state_dict(state_dict, strict=True)
+                self.da2.load_state_dict(state_dict, strict=True)
         except RuntimeError as exc:
-            self.dap = None
-            self._dap_weights_ready = False
+            self.da2 = None
+            self._da2_weights_ready = False
             raise RuntimeError(
-                "The VLN checkpoint contains dap.* tensors that do not match the "
-                "bundled DAP architecture"
+                "The VLN checkpoint contains da2.* tensors that do not match the "
+                "bundled DA2 architecture"
             ) from exc
-        freeze_dap_model(self.dap)
-        self._dap_weights_ready = True
-        self._dap_device = None
-        self._dap_dtype = None
+        freeze_da2_model(self.da2)
+        self._da2_weights_ready = True
+        self._da2_device = None
+        self._da2_dtype = None
         return True
 
-    def _mark_dap_weights_ready(self) -> None:
-        if self.dap is None:
+    def _mark_da2_weights_ready(self) -> None:
+        if self.da2 is None:
             return
-        freeze_dap_model(self.dap)
-        self._dap_weights_ready = True
-        self._dap_device = None
-        self._dap_dtype = None
+        freeze_da2_model(self.da2)
+        self._da2_weights_ready = True
+        self._da2_device = None
+        self._da2_dtype = None
 
-    def _ensure_dap_model(self, device: torch.device, dtype: torch.dtype):
-        if not self._dap_enabled():
+    def _ensure_da2_model(self, device: torch.device, dtype: torch.dtype):
+        if not self._da2_enabled():
             return None
-        if self.dap is None:
-            self.dap = build_dap_model(
-                source_path=str(getattr(self.config, "dap_source_path")),
-                model_path=str(getattr(self.config, "dap_model_path")),
+        if self.da2 is None:
+            self.da2 = build_da2_model(
+                source_path=str(getattr(self.config, "da2_source_path")),
+                model_path=str(getattr(self.config, "da2_model_path")),
             )
-        if not self._dap_weights_ready:
-            self._load_external_dap_weights()
-        if bool(getattr(self.config, "dap_force_fp32", False)):
+        if not self._da2_weights_ready:
+            self._load_external_da2_weights()
+        if device.type != "cuda" or bool(getattr(self.config, "da2_force_fp32", False)):
             target_dtype = torch.float32
         else:
             # Keep the frozen encoder in Qwen's low-precision vision dtype when possible.
             target_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.float32
-        if self._dap_device != device or self._dap_dtype != target_dtype:
-            self.dap.to(device=device, dtype=target_dtype)
-            self._dap_device = device
-            self._dap_dtype = target_dtype
-        freeze_dap_model(self.dap)
-        return self.dap
+        if self._da2_device != device or self._da2_dtype != target_dtype:
+            self.da2.to(device=device, dtype=target_dtype)
+            self._da2_device = device
+            self._da2_dtype = target_dtype
+        freeze_da2_model(self.da2)
+        return self.da2
 
     def _current_image_flat_indices(self, image_grid_thw: torch.Tensor | None) -> list[tuple[int, int]]:
         if image_grid_thw is None or image_grid_thw.numel() == 0:
@@ -1429,19 +1317,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_erp_geometry: torch.FloatTensor | None = None,
         image_num_images: torch.LongTensor | None = None,
         image_current_index: torch.LongTensor | None = None,
-        dap_pixel_values: torch.Tensor | None = None,
+        da2_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
         if (
             self._erp_fourier_linear_enabled()
-            or self._dap_enabled()
+            or self._da2_enabled()
         ):
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
                 image_current_index=image_current_index,
                 image_erp_geometry=image_erp_geometry,
-                dap_pixel_values=dap_pixel_values,
+                da2_pixel_values=da2_pixel_values,
             )
         try:
             return super().forward(
@@ -1474,34 +1362,34 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ):
             erp_fourier_linear_module.reset_parameters()
 
-        dap_module = self.dap_mlp
+        da2_module = self.da2_mlp
         if (
-            dap_module is not None
-            and dap_module.enabled
+            da2_module is not None
+            and da2_module.enabled
             and (
-                self._dap_mlp_load_was_incompatible
-                or any(key.startswith("dap_mlp.") for key in missing_keys)
+                self._da2_mlp_load_was_incompatible
+                or any(key.startswith("da2_mlp.") for key in missing_keys)
             )
         ):
-            dap_module.reset_parameters()
-            self._dap_mlp_load_was_incompatible = False
-        if dap_module is not None and dap_module.enabled:
-            if any(key.startswith("dap.") for key in missing_keys):
-                self._load_external_dap_weights()
+            da2_module.reset_parameters()
+            self._da2_mlp_load_was_incompatible = False
+        if da2_module is not None and da2_module.enabled:
+            if any(key.startswith("da2.") for key in missing_keys):
+                self._load_external_da2_weights()
             else:
-                self._mark_dap_weights_ready()
+                self._mark_da2_weights_ready()
 
     def _reset_erp_fourier_linear_parameters_after_pretrained_load(self) -> None:
         if self._erp_fourier_linear_enabled() and self.erp_fourier_linear_adapter is not None:
             self.erp_fourier_linear_adapter.reset_parameters()
 
-    def _reset_dap_parameters_after_pretrained_load(self) -> None:
-        if self._dap_enabled() and self.dap_mlp is not None:
-            self.dap_mlp.reset_parameters()
+    def _reset_da2_parameters_after_pretrained_load(self) -> None:
+        if self._da2_enabled() and self.da2_mlp is not None:
+            self.da2_mlp.reset_parameters()
 
     @classmethod
-    def _checkpoint_has_dap_weights(cls, pretrained_model_name_or_path) -> bool | None:
-        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.DAP_STATE_KEYS)
+    def _checkpoint_has_da2_weights(cls, pretrained_model_name_or_path) -> bool | None:
+        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.DA2_STATE_KEYS)
 
     def _checkpoint_has_erp_fourier_linear_weights(self, pretrained_model_name_or_path) -> bool | None:
         if self.erp_fourier_linear_adapter is None:
@@ -1564,26 +1452,26 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         )
         if has_erp_fourier_linear_weights is False:
             model._reset_erp_fourier_linear_parameters_after_pretrained_load()
-        has_dap_adapter_weights = cls._checkpoint_has_dap_weights(pretrained_model_name_or_path)
-        if has_dap_adapter_weights is False:
-            model._reset_dap_parameters_after_pretrained_load()
-        if model._dap_enabled():
-            resolved_source = resolve_dap_source_path(
-                getattr(model.config, "dap_source_path", None)
+        has_da2_adapter_weights = cls._checkpoint_has_da2_weights(pretrained_model_name_or_path)
+        if has_da2_adapter_weights is False:
+            model._reset_da2_parameters_after_pretrained_load()
+        if model._da2_enabled():
+            resolved_source = resolve_da2_source_path(
+                getattr(model.config, "da2_source_path", None)
             )
-            model.config.dap_source_path = (
-                BUNDLED_DAP_SOURCE
-                if resolved_source == DEFAULT_DAP_SOURCE_PATH.resolve()
+            model.config.da2_source_path = (
+                BUNDLED_DA2_SOURCE
+                if resolved_source == DEFAULT_DA2_SOURCE_PATH.resolve()
                 else str(resolved_source)
             )
-            loaded_saved_dap = model._load_saved_dap_weights(pretrained_model_name_or_path)
-            if not loaded_saved_dap and model.dap is None:
-                if has_dap_adapter_weights is True:
+            loaded_saved_da2 = model._load_saved_da2_weights(pretrained_model_name_or_path)
+            if not loaded_saved_da2 and model.da2 is None:
+                if has_da2_adapter_weights is True:
                     raise RuntimeError(
-                        "The VLN checkpoint contains dap_mlp.* adapter weights but "
-                        "does not contain the required dap.* encoder weights"
+                        "The VLN checkpoint contains da2_mlp.* adapter weights but "
+                        "does not contain the required da2.* encoder weights"
                     )
-                model._load_external_dap_weights()
+                model._load_external_da2_weights()
         return model
 
     def prepare_inputs_for_generation(
@@ -1602,7 +1490,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_erp_geometry=None,
         image_num_images=None,
         image_current_index=None,
-        dap_pixel_values=None,
+        da2_pixel_values=None,
         **kwargs,
     ):
         model_inputs = super().prepare_inputs_for_generation(
@@ -1620,12 +1508,12 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             image_erp_geometry=image_erp_geometry,
             image_num_images=image_num_images,
             image_current_index=image_current_index,
-            dap_pixel_values=dap_pixel_values,
+            da2_pixel_values=da2_pixel_values,
             **kwargs,
         )
         if not is_first_iteration and use_cache:
             model_inputs["image_erp_geometry"] = None
             model_inputs["image_num_images"] = None
             model_inputs["image_current_index"] = None
-            model_inputs["dap_pixel_values"] = None
+            model_inputs["da2_pixel_values"] = None
         return model_inputs

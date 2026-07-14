@@ -27,7 +27,7 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "erp_fourier_linear_adapter": True,
-    "dap_mlp": True,
+    "da2_mlp": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,7 +74,7 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "erp_fourier_linear_adapter": getattr(model, "erp_fourier_linear_adapter", None),
-        "dap_mlp": getattr(model, "dap_mlp", None),
+        "da2_mlp": getattr(model, "da2_mlp", None),
         "language_model": language_model,
     }
 
@@ -111,15 +111,15 @@ def _load_model_config(cfg):
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
     )
-    dap_fields = (
-        "dap_enabled",
-        "dap_source_path",
-        "dap_model_path",
-        "dap_alpha_value",
-        "dap_feature_source",
-        "dap_injection_stage",
-        "dap_sampling_mode",
-        "dap_force_fp32",
+    da2_fields = (
+        "da2_enabled",
+        "da2_source_path",
+        "da2_model_path",
+        "da2_alpha_value",
+        "da2_feature_source",
+        "da2_injection_stage",
+        "da2_sampling_mode",
+        "da2_force_fp32",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -160,7 +160,7 @@ def _load_model_config(cfg):
     apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
-    apply_module_fields_preserve_checkpoint(bool(cfg.model.dap_enabled), dap_fields)
+    apply_module_fields_preserve_checkpoint(bool(cfg.model.da2_enabled), da2_fields)
     return config
 
 
@@ -187,6 +187,15 @@ def load_model(cfg):
         model.config.text_config.use_cache = False
     model.accepts_loss_kwargs = False
     return model
+
+
+def checkpoint_has_da2_encoder_weights(pretrained_model_name_or_path: str) -> bool:
+    return bool(
+        Qwen3_5ForConditionalGenerationForPanoVLN._checkpoint_has_any_weights(
+            pretrained_model_name_or_path,
+            ("da2.dino.cls_token",),
+        )
+    )
 
 
 def sync_model_special_tokens(model, tokenizer):
