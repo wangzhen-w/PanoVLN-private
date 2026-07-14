@@ -11,20 +11,20 @@ model:
     visual_merger: true
     language_model: true
     erp_fourier_linear_adapter: false
-    da2_mlp: true
+    unik3d_mlp: true
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
   erp_fourier_linear_enabled: false
   erp_fourier_linear_alpha_value: 0.01
   erp_fourier_linear_apply_to_current_only: true
-  da2_enabled: true
-  da2_source_path: "bundled"
-  da2_model_path: "/workspace/data1/model/DA-2"
-  da2_alpha_value: 0.20
-  da2_feature_source: "decoder_multiscale" # 拼接三层球面条件化decoder特征，共896维
-  da2_injection_stage: "pre_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
-  da2_sampling_mode: "singlepoint"   # 每层按Qwen patch位置采样，再拼接为一个token
-  da2_force_fp32: false
+  unik3d_enabled: true
+  unik3d_source_path: "bundled"
+  unik3d_model_path: "/workspace/data1/model/UniK3D-Large"
+  unik3d_alpha_value: 0.20
+  unik3d_feature_source: "decoder_multiscale" # 拼接三层ray-conditioned decoder特征，共896维
+  unik3d_injection_stage: "pre_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
+  unik3d_sampling_mode: "singlepoint"    #"singlepoint"每个 Qwen token 采一个 UniK3D token / "grouping"每个 Qwen token 聚合局部2x2 UniK3D latent
+  unik3d_force_fp32: false
 
 data:
   train_jsonl: "/workspace/data1/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
@@ -45,7 +45,7 @@ data:
     mixing_strategy: "sample"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data1/model/ablation_new/spatial_encoder/DA-2"
+  output_dir: "/workspace/data1/model/ablation_new/spatial_encoder/Unik3D-multiscale"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -55,7 +55,7 @@ training:
   visual_lr: 2e-6
   visual_merger_lr: 1.0e-5
   erp_fourier_linear_lr: null
-  da2_mlp_lr: 2.0e-5
+  unik3d_mlp_lr: 2.0e-5
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5

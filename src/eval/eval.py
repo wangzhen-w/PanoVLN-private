@@ -33,7 +33,7 @@ from src.train.data.data import (
     build_erp_image_geometry_batch,
     build_vln_image_selection,
     build_vln_user_content,
-    preprocess_da2_current_image,
+    preprocess_unik3d_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
@@ -508,8 +508,8 @@ class PanoVLN_Agent(Agent):
             [resolve_current_image_index(image_count)],
             dtype=torch.long,
         )
-        if bool(getattr(self.model.config, "da2_enabled", False)) and self.rgb_history:
-            prompt_inputs["da2_pixel_values"] = preprocess_da2_current_image(
+        if bool(getattr(self.model.config, "unik3d_enabled", False)) and self.rgb_history:
+            prompt_inputs["unik3d_pixel_values"] = preprocess_unik3d_current_image(
                 self.rgb_history[-1]
             ).unsqueeze(0)
 

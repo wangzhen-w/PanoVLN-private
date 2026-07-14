@@ -20,14 +20,14 @@ class ModelConfig:
     erp_fourier_linear_enabled: bool = False
     erp_fourier_linear_alpha_value: float = 0.01
     erp_fourier_linear_apply_to_current_only: bool = True
-    da2_enabled: bool = True
-    da2_source_path: str = "bundled"
-    da2_model_path: str = "/workspace/data1/model/DA-2"
-    da2_alpha_value: float = 0.05
-    da2_feature_source: str = "decoder_multiscale"
-    da2_injection_stage: str = "post_merger"
-    da2_sampling_mode: str = "grouping"
-    da2_force_fp32: bool = False
+    unik3d_enabled: bool = True
+    unik3d_source_path: str = "bundled"
+    unik3d_model_path: str = "/workspace/data1/model/UniK3D-Large"
+    unik3d_alpha_value: float = 0.05
+    unik3d_feature_source: str = "decoder_multiscale"
+    unik3d_injection_stage: str = "post_merger"
+    unik3d_sampling_mode: str = "grouping"
+    unik3d_force_fp32: bool = False
 
 
 @dataclass
@@ -49,7 +49,7 @@ class DataConfig:
 
 @dataclass
 class TrainingConfig:
-    output_dir: str = "/workspace/data1/model/panoworld/panovln_da2_1e-6"
+    output_dir: str = "/workspace/data1/model/panoworld/panovln_unik3d_1e-6"
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 4
@@ -58,7 +58,7 @@ class TrainingConfig:
     visual_lr: Optional[float] = 1.0e-6
     visual_merger_lr: Optional[float] = 1.0e-6
     erp_fourier_linear_lr: Optional[float] = 1.0e-6
-    da2_mlp_lr: Optional[float] = 1.0e-6
+    unik3d_mlp_lr: Optional[float] = 1.0e-6
     weight_decay: float = 0.01
     num_train_epochs: float = 1.0
     logging_steps: int = 5
@@ -141,9 +141,9 @@ def _resolve_config_paths(cfg: TrainConfig) -> TrainConfig:
     config_dir = cfg.config_dir
     cfg.model.name_or_path = _resolve_path(cfg.model.name_or_path, config_dir)
     cfg.model.cache_dir = _resolve_path(cfg.model.cache_dir, config_dir)
-    if str(cfg.model.da2_source_path).strip().lower() != "bundled":
-        cfg.model.da2_source_path = _resolve_path(cfg.model.da2_source_path, config_dir)
-    cfg.model.da2_model_path = _resolve_path(cfg.model.da2_model_path, config_dir)
+    if str(cfg.model.unik3d_source_path).strip().lower() != "bundled":
+        cfg.model.unik3d_source_path = _resolve_path(cfg.model.unik3d_source_path, config_dir)
+    cfg.model.unik3d_model_path = _resolve_path(cfg.model.unik3d_model_path, config_dir)
 
     cfg.data.train_jsonl = _resolve_path(cfg.data.train_jsonl, config_dir)
     cfg.data.eval_jsonl = _resolve_path(cfg.data.eval_jsonl, config_dir)

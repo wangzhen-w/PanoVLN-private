@@ -11,9 +11,9 @@ export HABITAT_SIM_LOG=quiet
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/DA-2"
+MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/Unik3D-multiscale"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/code/vln_result/ablation_new/DA-2"
+SAVE_PATH="/workspace/code/vln_result/ablation_new/Unik3D-multiscale"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100

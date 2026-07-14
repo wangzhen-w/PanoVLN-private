@@ -27,7 +27,7 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "erp_fourier_linear_adapter": True,
-    "da2_mlp": True,
+    "unik3d_mlp": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,7 +74,7 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "erp_fourier_linear_adapter": getattr(model, "erp_fourier_linear_adapter", None),
-        "da2_mlp": getattr(model, "da2_mlp", None),
+        "unik3d_mlp": getattr(model, "unik3d_mlp", None),
         "language_model": language_model,
     }
 
@@ -111,15 +111,15 @@ def _load_model_config(cfg):
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
     )
-    da2_fields = (
-        "da2_enabled",
-        "da2_source_path",
-        "da2_model_path",
-        "da2_alpha_value",
-        "da2_feature_source",
-        "da2_injection_stage",
-        "da2_sampling_mode",
-        "da2_force_fp32",
+    unik3d_fields = (
+        "unik3d_enabled",
+        "unik3d_source_path",
+        "unik3d_model_path",
+        "unik3d_alpha_value",
+        "unik3d_feature_source",
+        "unik3d_injection_stage",
+        "unik3d_sampling_mode",
+        "unik3d_force_fp32",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -160,7 +160,7 @@ def _load_model_config(cfg):
     apply_vision_module_fields(bool(cfg.model.erp_fourier_linear_enabled), erp_fourier_linear_fields)
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
-    apply_module_fields_preserve_checkpoint(bool(cfg.model.da2_enabled), da2_fields)
+    apply_module_fields_preserve_checkpoint(bool(cfg.model.unik3d_enabled), unik3d_fields)
     return config
 
 
@@ -189,11 +189,11 @@ def load_model(cfg):
     return model
 
 
-def checkpoint_has_da2_encoder_weights(pretrained_model_name_or_path: str) -> bool:
+def checkpoint_has_unik3d_encoder_weights(pretrained_model_name_or_path: str) -> bool:
     return bool(
         Qwen3_5ForConditionalGenerationForPanoVLN._checkpoint_has_any_weights(
             pretrained_model_name_or_path,
-            ("da2.dino.cls_token",),
+            ("unik3d.pixel_encoder.cls_token",),
         )
     )
 

@@ -10,18 +10,20 @@ import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 
-DA2_FEATURE_SPECS = {
+UNIK3D_FEATURE_SPECS = {
     "decoder_stage0": ((0, 512),),
     "decoder_stage1": ((1, 256),),
     "decoder_stage2": ((2, 128),),
     "decoder_multiscale": ((0, 512), (1, 256), (2, 128)),
 }
-DA2_FEATURE_SOURCES = set(DA2_FEATURE_SPECS)
-DA2_INJECTION_STAGES = {"post_merger", "pre_merger"}
-DA2_MLP_HIDDEN_SIZE = 4096
-BUNDLED_DA2_SOURCE = "bundled"
-DEFAULT_DA2_SOURCE_PATH = Path(__file__).resolve().parents[1]
-DEFAULT_DA2_MODEL_PATH = Path("/workspace/data1/model/DA-2")
+UNIK3D_FEATURE_SOURCES = set(UNIK3D_FEATURE_SPECS)
+UNIK3D_INJECTION_STAGES = {"post_merger", "pre_merger"}
+UNIK3D_MLP_HIDDEN_SIZE = 4096
+BUNDLED_UNIK3D_SOURCE = "bundled"
+DEFAULT_UNIK3D_SOURCE_PATH = Path(__file__).resolve().parents[1]
+DEFAULT_UNIK3D_MODEL_PATH = Path("/workspace/data1/model/UniK3D-Large")
+UNIK3D_IMAGE_MEAN = (0.485, 0.456, 0.406)
+UNIK3D_IMAGE_STD = (0.229, 0.224, 0.225)
 ERP_ANGLE_EPS = 1e-6
 ERP_FOURIER_NUM_HARMONICS = 16
 ERP_FOURIER_ENCODING_DIM = ERP_FOURIER_NUM_HARMONICS * 4
@@ -243,80 +245,81 @@ class ERPFourierLinearAdapter(nn.Module):
         return torch.cat(token_splits, dim=0)
 
 
-def ensure_da2_config(config) -> None:
+def ensure_unik3d_config(config) -> None:
     vision_config = config.vision_config
     text_config = getattr(config, "text_config", None)
     text_hidden_size = getattr(text_config, "hidden_size", getattr(vision_config, "out_hidden_size", 3584))
     defaults = {
-        "da2_enabled": False,
-        "da2_source_path": BUNDLED_DA2_SOURCE,
-        "da2_model_path": str(DEFAULT_DA2_MODEL_PATH),
-        "da2_alpha_value": 0.1,
-        "da2_feature_source": "decoder_multiscale",
-        "da2_injection_stage": "post_merger",
-        "da2_sampling_mode": "grouping",
-        "da2_force_fp32": False,
-        "da2_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
+        "unik3d_enabled": False,
+        "unik3d_source_path": BUNDLED_UNIK3D_SOURCE,
+        "unik3d_model_path": str(DEFAULT_UNIK3D_MODEL_PATH),
+        "unik3d_alpha_value": 0.1,
+        "unik3d_feature_source": "decoder_multiscale",
+        "unik3d_injection_stage": "post_merger",
+        "unik3d_sampling_mode": "grouping",
+        "unik3d_force_fp32": False,
+        "unik3d_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
     for field_name, default_value in defaults.items():
         if not hasattr(config, field_name):
             setattr(config, field_name, default_value)
 
 
-def _is_da2_source_tree(source_dir: Path) -> bool:
-    package_dir = source_dir / "da2"
+def _is_unik3d_source_tree(source_dir: Path) -> bool:
+    package_dir = source_dir / "unik3d"
     return (
         source_dir.is_dir()
-        and (package_dir / "model" / "spherevit.py").is_file()
-        and (package_dir / "configs" / "infer.json").is_file()
+        and (package_dir / "models" / "unik3d.py").is_file()
+        and (package_dir / "configs" / "large.json").is_file()
     )
 
 
-def _resolve_da2_source_candidate(path: Path) -> Path | None:
+def _resolve_unik3d_source_candidate(path: Path) -> Path | None:
     path = path.expanduser().resolve()
     for candidate in (path, path / "src"):
-        if _is_da2_source_tree(candidate):
+        if _is_unik3d_source_tree(candidate):
             return candidate
     return None
 
 
-def resolve_da2_source_path(source_path: str | Path | None = None) -> Path:
+def resolve_unik3d_source_path(source_path: str | Path | None = None) -> Path:
     raw_source_path = "" if source_path is None else str(source_path).strip()
     use_bundled_source = raw_source_path.lower() in {
         "",
         "none",
         "null",
-        BUNDLED_DA2_SOURCE,
+        BUNDLED_UNIK3D_SOURCE,
     }
     requested_path = (
-        DEFAULT_DA2_SOURCE_PATH
+        DEFAULT_UNIK3D_SOURCE_PATH
         if use_bundled_source
         else Path(raw_source_path).expanduser()
     )
-    requested_source = _resolve_da2_source_candidate(requested_path)
+    requested_source = _resolve_unik3d_source_candidate(requested_path)
     if requested_source is not None:
         return requested_source
 
-    bundled_source = _resolve_da2_source_candidate(DEFAULT_DA2_SOURCE_PATH)
+    bundled_source = _resolve_unik3d_source_candidate(DEFAULT_UNIK3D_SOURCE_PATH)
     if not use_bundled_source and bundled_source is not None:
         return bundled_source
 
     raise FileNotFoundError(
-        "DA2 is enabled but no valid source tree was found. "
-        f"requested={requested_path.resolve()}, bundled={DEFAULT_DA2_SOURCE_PATH.resolve()}"
+        "UniK3D is enabled but no valid source tree was found. "
+        f"requested={requested_path.expanduser().resolve()}, "
+        f"bundled={DEFAULT_UNIK3D_SOURCE_PATH.resolve()}"
     )
 
 
-def _ensure_da2_source_available(source_path: str | Path | None) -> Path:
-    source_dir = resolve_da2_source_path(source_path)
+def _ensure_unik3d_source_available(source_path: str | Path | None) -> Path:
+    source_dir = resolve_unik3d_source_path(source_path)
 
     source_str = str(source_dir)
     while source_str in sys.path:
         sys.path.remove(source_str)
     sys.path.insert(0, source_str)
 
-    package_dir = (source_dir / "da2").resolve()
-    loaded_package = sys.modules.get("da2")
+    package_dir = (source_dir / "unik3d").resolve()
+    loaded_package = sys.modules.get("unik3d")
     if loaded_package is not None:
         loaded_file = getattr(loaded_package, "__file__", None)
         loaded_paths = getattr(loaded_package, "__path__", ())
@@ -326,82 +329,98 @@ def _ensure_da2_source_available(source_path: str | Path | None) -> Path:
         ) or any(Path(path).resolve() == package_dir for path in loaded_paths)
         if not loaded_from_expected_source:
             for module_name in tuple(sys.modules):
-                if module_name == "da2" or module_name.startswith("da2."):
+                if module_name == "unik3d" or module_name.startswith("unik3d."):
                     del sys.modules[module_name]
     return source_dir
 
 
-def normalize_da2_feature_source(feature_source: str) -> str:
+def normalize_unik3d_feature_source(feature_source: str) -> str:
     feature_source = str(feature_source).lower()
-    if feature_source not in DA2_FEATURE_SOURCES:
+    if feature_source not in UNIK3D_FEATURE_SOURCES:
         raise ValueError(
-            "da2_feature_source must be one of "
-            f"{sorted(DA2_FEATURE_SOURCES)}, "
+            "unik3d_feature_source must be one of "
+            f"{sorted(UNIK3D_FEATURE_SOURCES)}, "
             f"got {feature_source!r}"
         )
     return feature_source
 
 
-def normalize_da2_injection_stage(injection_stage: str) -> str:
+def normalize_unik3d_injection_stage(injection_stage: str) -> str:
     injection_stage = str(injection_stage).lower()
-    if injection_stage not in DA2_INJECTION_STAGES:
+    if injection_stage not in UNIK3D_INJECTION_STAGES:
         raise ValueError(
-            "da2_injection_stage must be 'post_merger' or 'pre_merger', "
+            "unik3d_injection_stage must be 'post_merger' or 'pre_merger', "
             f"got {injection_stage!r}"
         )
     return injection_stage
 
 
-def build_da2_model(
+def build_unik3d_model(
     source_path: str,
     model_path: str | None,
     *,
     load_pretrained_weights: bool = True,
 ):
-    source_dir = _ensure_da2_source_available(source_path)
+    source_dir = _ensure_unik3d_source_available(source_path)
     try:
-        from da2.model import SphereViT
+        from unik3d.models import UniK3D
     except Exception as exc:
         raise ImportError(
-            "DA2 is enabled but could not be imported from "
+            "UniK3D is enabled but could not be imported from "
             f"{source_dir}: {type(exc).__name__}: {exc}"
         ) from exc
 
-    architecture_path = source_dir / "da2" / "configs" / "infer.json"
+    architecture_path = source_dir / "unik3d" / "configs" / "large.json"
     architecture_config = json.loads(architecture_path.read_text(encoding="utf-8"))
-    model = SphereViT(architecture_config)
+    architecture_config["training"]["losses"] = {}
+    model = UniK3D(architecture_config)
 
-    if not load_pretrained_weights:
-        freeze_da2_model(model)
-        return model
+    if load_pretrained_weights:
+        if not model_path:
+            raise FileNotFoundError(
+                "UniK3D pretrained weights are required when the VLN checkpoint "
+                "does not contain unik3d.* tensors"
+            )
+        model_dir = Path(model_path).expanduser().resolve()
+        if not model_dir.is_dir():
+            raise FileNotFoundError(
+                "UniK3D is enabled but its pretrained model directory is missing: "
+                f"{model_dir}"
+            )
+        safetensors_path = model_dir / "model.safetensors"
+        torch_path = model_dir / "pytorch_model.bin"
+        if safetensors_path.is_file():
+            from safetensors.torch import load_file
 
-    if not model_path:
-        raise FileNotFoundError(
-            "DA2 pretrained weights are required when the VLN checkpoint does not "
-            "contain da2.* tensors"
-        )
-    model_dir = Path(model_path).expanduser().resolve()
-    if not model_dir.is_dir():
-        raise FileNotFoundError(
-            "DA2 is enabled but its pretrained model directory is missing: "
-            f"{model_dir}"
-        )
-    model_file = model_dir / "model.safetensors"
-    if not model_file.is_file():
-        raise FileNotFoundError(f"DA2 model.safetensors is missing from {model_dir}")
+            state_dict = load_file(str(safetensors_path), device="cpu")
+        elif torch_path.is_file():
+            state_dict = torch.load(
+                str(torch_path),
+                map_location="cpu",
+                weights_only=True,
+            )
+            if not isinstance(state_dict, dict):
+                raise RuntimeError(
+                    f"UniK3D checkpoint does not contain a state dict: {torch_path}"
+                )
+            if "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+                state_dict = state_dict["state_dict"]
+            elif "model" in state_dict and isinstance(state_dict["model"], dict):
+                state_dict = state_dict["model"]
+        else:
+            raise FileNotFoundError(f"UniK3D weights are missing from {model_dir}")
+        if not isinstance(state_dict, dict):
+            raise RuntimeError(f"UniK3D checkpoint does not contain a state dict: {model_dir}")
+        try:
+            model.load_state_dict(state_dict, strict=True, assign=True)
+        except TypeError:
+            model.load_state_dict(state_dict, strict=True)
 
-    from safetensors.torch import load_file
-
-    state_dict = load_file(str(model_file), device="cpu")
-    try:
-        model.load_state_dict(state_dict, strict=True, assign=True)
-    except TypeError:
-        model.load_state_dict(state_dict, strict=True)
-    freeze_da2_model(model)
+    freeze_unik3d_model(model)
     return model
 
 
-def freeze_da2_model(model: nn.Module | None) -> None:
+def freeze_unik3d_model(model: nn.Module | None) -> None:
     if model is None:
         return
     model.eval()
@@ -409,32 +428,32 @@ def freeze_da2_model(model: nn.Module | None) -> None:
         param.requires_grad = False
 
 
-class DA2GeometryMLP(nn.Module):
+class UniK3DGeometryMLP(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        ensure_da2_config(config)
+        ensure_unik3d_config(config)
 
-        self.enabled = bool(getattr(config, "da2_enabled", False))
-        self.feature_source = normalize_da2_feature_source(
-            getattr(config, "da2_feature_source", "decoder_multiscale")
+        self.enabled = bool(getattr(config, "unik3d_enabled", False))
+        self.feature_source = normalize_unik3d_feature_source(
+            getattr(config, "unik3d_feature_source", "decoder_multiscale")
         )
-        self.injection_stage = normalize_da2_injection_stage(
-            getattr(config, "da2_injection_stage", "post_merger")
+        self.injection_stage = normalize_unik3d_injection_stage(
+            getattr(config, "unik3d_injection_stage", "post_merger")
         )
-        self.feature_spec = DA2_FEATURE_SPECS[self.feature_source]
+        self.feature_spec = UNIK3D_FEATURE_SPECS[self.feature_source]
         self.context_dim = sum(channels for _, channels in self.feature_spec)
         if self.injection_stage == "pre_merger":
             self.output_dim = int(getattr(config.vision_config, "hidden_size"))
         else:
-            self.output_dim = int(getattr(config, "da2_output_dim", config.text_config.hidden_size))
-        self.hidden_dim = DA2_MLP_HIDDEN_SIZE
-        self.sampling_mode = str(getattr(config, "da2_sampling_mode", "grouping")).lower()
+            self.output_dim = int(getattr(config, "unik3d_output_dim", config.text_config.hidden_size))
+        self.hidden_dim = UNIK3D_MLP_HIDDEN_SIZE
+        self.sampling_mode = str(getattr(config, "unik3d_sampling_mode", "grouping")).lower()
         if self.sampling_mode not in {"singlepoint", "grouping"}:
             raise ValueError(
-                "da2_sampling_mode must be 'singlepoint' or 'grouping', "
+                "unik3d_sampling_mode must be 'singlepoint' or 'grouping', "
                 f"got {self.sampling_mode!r}"
             )
-        self.alpha_init = float(getattr(config, "da2_alpha_value", 0.1))
+        self.alpha_init = float(getattr(config, "unik3d_alpha_value", 0.1))
         self.register_buffer(
             "alpha_value",
             torch.tensor(self.alpha_init, dtype=torch.float32),
@@ -533,8 +552,15 @@ class DA2GeometryMLP(nn.Module):
             )
             for source_grid in source_grids
         ]
-        sampled = torch.cat(sampled_levels, dim=-1)
-        sampled = self.input_norm(sampled.to(dtype=dtype))
+        sampled_levels = [
+            F.rms_norm(
+                sampled_level,
+                (int(sampled_level.shape[-1]),),
+                eps=1e-6,
+            ).to(dtype=dtype)
+            for sampled_level in sampled_levels
+        ]
+        sampled = self.input_norm(torch.cat(sampled_levels, dim=-1))
         if self.sampling_mode == "singlepoint":
             return sampled
 
@@ -556,12 +582,12 @@ class DA2GeometryMLP(nn.Module):
     ) -> torch.Tensor:
         if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
             raise AssertionError(
-                "DA2 pre-merger target grid is not divisible by Qwen spatial_merge_size: "
+                "UniK3D pre-merger target grid is not divisible by Qwen spatial_merge_size: "
                 f"grid=({grid_h}, {grid_w}), spatial_merge_size={self.spatial_merge_size}"
             )
         if int(tokens.shape[0]) != int(grid_h * grid_w):
             raise AssertionError(
-                "DA2 pre-merger token length mismatch before Qwen order conversion: "
+                "UniK3D pre-merger token length mismatch before Qwen order conversion: "
                 f"tokens={int(tokens.shape[0])}, grid=({grid_h}, {grid_w})"
             )
         tokens = tokens.reshape(
@@ -576,8 +602,8 @@ class DA2GeometryMLP(nn.Module):
 
     def forward(
         self,
-        da2_pixel_values: torch.Tensor,
-        da2_model: nn.Module,
+        unik3d_pixel_values: torch.Tensor,
+        unik3d_model: nn.Module,
         target_grid_thw: torch.Tensor,
         target_lengths: list[int],
         image_erp_geometry: torch.Tensor | None,
@@ -586,31 +612,52 @@ class DA2GeometryMLP(nn.Module):
     ) -> list[torch.Tensor]:
         if (
             not self.enabled
-            or da2_model is None
-            or da2_pixel_values is None
-            or da2_pixel_values.numel() == 0
+            or unik3d_model is None
+            or unik3d_pixel_values is None
+            or unik3d_pixel_values.numel() == 0
         ):
             return []
 
-        if da2_pixel_values.ndim != 4:
+        if unik3d_pixel_values.ndim != 4:
             raise AssertionError(
-                "Expected da2_pixel_values shape [B, 3, H, W], "
-                f"got {tuple(da2_pixel_values.shape)}"
+                "Expected unik3d_pixel_values shape [B, 3, H, W], "
+                f"got {tuple(unik3d_pixel_values.shape)}"
             )
 
-        encoder = da2_model
+        encoder = unik3d_model
         encoder_param = next(encoder.parameters())
         param = next(self.mlp.parameters())
-        images = da2_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
+        images = unik3d_pixel_values.to(device=encoder_param.device, dtype=encoder_param.dtype)
         if int(images.shape[1]) != 3:
-            raise AssertionError(f"DA2 expects RGB inputs, got {tuple(images.shape)}")
+            raise AssertionError(f"UniK3D expects RGB inputs, got {tuple(images.shape)}")
 
+        mean = images.new_tensor(UNIK3D_IMAGE_MEAN).view(1, 3, 1, 1)
+        std = images.new_tensor(UNIK3D_IMAGE_STD).view(1, 3, 1, 1)
+        normalized_images = (images - mean) / std
         batch_size, _, image_h, image_w = [int(value) for value in images.shape]
-        if image_w != 2 * image_h:
+        vertical_half_fov = math.pi * float(image_h) / float(image_w)
+        if vertical_half_fov > 0.5 * math.pi + ERP_ANGLE_EPS:
             raise AssertionError(
-                "DA2 expects a full 2:1 ERP panorama: "
+                "UniK3D spherical input must cover at most 180 vertical degrees: "
                 f"shape=({image_h}, {image_w})"
             )
+
+        from unik3d.utils.camera import Spherical
+
+        camera_params = torch.ones(
+            batch_size,
+            8,
+            device=images.device,
+            dtype=torch.float32,
+        )
+        camera_params[:, 4] = float(image_w)
+        camera_params[:, 5] = float(image_h)
+        camera_params[:, 6] = math.pi
+        camera_params[:, 7] = vertical_half_fov
+        camera = torch.cat(
+            [Spherical(params=camera_params[index]) for index in range(batch_size)],
+            dim=0,
+        )
 
         autocast_enabled = (
             images.device.type == "cuda"
@@ -621,11 +668,13 @@ class DA2GeometryMLP(nn.Module):
             dtype=encoder_param.dtype,
             enabled=autocast_enabled,
         ):
-            feature_pyramid = encoder.extract_decoder_features(images)
+            feature_pyramid = encoder.extract_decoder_features(
+                {"image": normalized_images, "camera": camera}
+            )
 
         if not isinstance(feature_pyramid, (tuple, list)) or len(feature_pyramid) != 3:
             raise AssertionError(
-                "DA2 must return its three-stage spherical decoder pyramid, "
+                "UniK3D must return its three-stage ray-conditioned decoder pyramid, "
                 f"got {type(feature_pyramid)!r} with length "
                 f"{len(feature_pyramid) if isinstance(feature_pyramid, (tuple, list)) else 'n/a'}"
             )
@@ -634,17 +683,17 @@ class DA2GeometryMLP(nn.Module):
             source_grid = feature_pyramid[stage_index]
             if source_grid.ndim != 4:
                 raise AssertionError(
-                    f"Expected DA2 decoder stage {stage_index} as [B, C, H, W], "
+                    f"Expected UniK3D decoder stage {stage_index} as [B, C, H, W], "
                     f"got {tuple(source_grid.shape)}"
                 )
             if int(source_grid.shape[0]) != batch_size:
                 raise AssertionError(
-                    "DA2 feature batch mismatch: "
+                    "UniK3D feature batch mismatch: "
                     f"expected {batch_size}, got {int(source_grid.shape[0])} at stage {stage_index}"
                 )
             if int(source_grid.shape[1]) != expected_channels:
                 raise AssertionError(
-                    "DA2 decoder channel mismatch: "
+                    "UniK3D decoder channel mismatch: "
                     f"stage={stage_index}, expected={expected_channels}, "
                     f"got={int(source_grid.shape[1])}"
                 )
@@ -656,25 +705,25 @@ class DA2GeometryMLP(nn.Module):
             geometry = geometry.to(device=param.device, dtype=torch.float32)
         if batch_size != len(target_lengths) or len(target_lengths) != int(target_grid_thw.shape[0]):
             raise AssertionError(
-                "DA2 batch size mismatch: "
+                "UniK3D batch size mismatch: "
                 f"source={batch_size}, target_lengths={len(target_lengths)}, "
                 f"target_grid_thw={int(target_grid_thw.shape[0])}"
             )
         if geometry is not None and int(geometry.shape[0]) != len(target_lengths):
             raise AssertionError(
-                "DA2 geometry batch size mismatch: "
+                "UniK3D geometry batch size mismatch: "
                 f"geometry={int(geometry.shape[0])}, target_lengths={len(target_lengths)}"
             )
         for sample_index, (grid_thw, target_len) in enumerate(zip(target_grid_thw.tolist(), target_lengths)):
             num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
             if num_frames != 1:
                 raise AssertionError(
-                    "DA2 geometry fusion expects a single current panorama per Qwen image, "
+                    "UniK3D geometry fusion expects a single current panorama per Qwen image, "
                     f"got image_grid_thw={grid_thw}"
                 )
             if grid_h % self.spatial_merge_size != 0 or grid_w % self.spatial_merge_size != 0:
                 raise AssertionError(
-                    "DA2 target grid is not divisible by Qwen spatial_merge_size: "
+                    "UniK3D target grid is not divisible by Qwen spatial_merge_size: "
                     f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}"
                 )
             if self.injection_stage == "pre_merger":
@@ -686,7 +735,7 @@ class DA2GeometryMLP(nn.Module):
             expected_len = target_h * target_w
             if expected_len != int(target_len):
                 raise AssertionError(
-                    "Cannot map DA2 geometry to the Qwen 2D visual-token grid: "
+                    "Cannot map UniK3D geometry to the Qwen 2D visual-token grid: "
                     f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}, "
                     f"expected_len={expected_len}, qwen_len={int(target_len)}"
                 )
@@ -704,7 +753,7 @@ class DA2GeometryMLP(nn.Module):
             )
             if geo.shape[0] != int(target_len):
                 raise AssertionError(
-                    "DA2 sampled geometry length mismatch: "
+                    "UniK3D sampled geometry length mismatch: "
                     f"sampled_len={geo.shape[0]}, qwen_len={int(target_len)}"
                 )
             projected = self.output_norm(self.mlp(geo))
@@ -719,16 +768,16 @@ class DA2GeometryMLP(nn.Module):
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
     _keys_to_ignore_on_load_unexpected = list(
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
-    ) + [r"da2\..*"]
+    ) + [r"unik3d\..*"]
 
-    DA2_STATE_KEYS = (
-        "da2_mlp.alpha_value",
-        "da2_mlp.input_norm.weight",
-        "da2_mlp.mlp.0.weight",
-        "da2_mlp.mlp.0.bias",
-        "da2_mlp.mlp.2.weight",
-        "da2_mlp.mlp.2.bias",
-        "da2_mlp.output_norm.weight",
+    UNIK3D_STATE_KEYS = (
+        "unik3d_mlp.alpha_value",
+        "unik3d_mlp.input_norm.weight",
+        "unik3d_mlp.mlp.0.weight",
+        "unik3d_mlp.mlp.0.bias",
+        "unik3d_mlp.mlp.2.weight",
+        "unik3d_mlp.mlp.2.bias",
+        "unik3d_mlp.output_norm.weight",
     )
     def __init__(self, config):
         vision_config = getattr(config, "vision_config", None)
@@ -739,40 +788,40 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 getattr(config, "erp_fourier_linear_enabled", False),
             )
         )
-        da2_enabled = bool(getattr(config, "da2_enabled", False))
+        unik3d_enabled = bool(getattr(config, "unik3d_enabled", False))
         if erp_fourier_linear_enabled:
             ensure_erp_fourier_linear_config(config.vision_config)
-        if da2_enabled:
-            ensure_da2_config(config)
+        if unik3d_enabled:
+            ensure_unik3d_config(config)
         super().__init__(config)
 
         if erp_fourier_linear_enabled:
             ensure_erp_fourier_linear_config(self.model.visual.config)
-        if da2_enabled:
-            ensure_da2_config(config)
+        if unik3d_enabled:
+            ensure_unik3d_config(config)
 
         self.erp_fourier_linear_adapter = (
             ERPFourierLinearAdapter(self.model.visual.config)
             if erp_fourier_linear_enabled
             else None
         )
-        self.da2_mlp = DA2GeometryMLP(config) if da2_enabled else None
-        self.da2 = None
-        self._da2_weights_ready = False
-        self._da2_dtype = None
-        self._da2_device = None
-        self._da2_mlp_load_was_incompatible = False
+        self.unik3d_mlp = UniK3DGeometryMLP(config) if unik3d_enabled else None
+        self.unik3d = None
+        self._unik3d_weights_ready = False
+        self._unik3d_dtype = None
+        self._unik3d_device = None
+        self._unik3d_mlp_load_was_incompatible = False
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
-        self._pano_runtime_da2_pixel_values = None
+        self._pano_runtime_unik3d_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
         self._install_pano_patch_embed_hook()
         self._install_pano_merger_hook()
         self._install_image_feature_hook()
-        self.register_load_state_dict_pre_hook(self._drop_incompatible_da2_mlp_pre_hook)
+        self.register_load_state_dict_pre_hook(self._drop_incompatible_unik3d_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
     def _erp_fourier_linear_enabled(self) -> bool:
@@ -781,13 +830,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             and bool(getattr(self.erp_fourier_linear_adapter, "enabled", False))
         )
 
-    def _da2_enabled(self) -> bool:
-        return self.da2_mlp is not None and bool(getattr(self.da2_mlp, "enabled", False))
+    def _unik3d_enabled(self) -> bool:
+        return self.unik3d_mlp is not None and bool(getattr(self.unik3d_mlp, "enabled", False))
 
-    def _da2_injection_stage(self) -> str:
-        if self.da2_mlp is not None:
-            return self.da2_mlp.injection_stage
-        return normalize_da2_injection_stage(getattr(self.config, "da2_injection_stage", "post_merger"))
+    def _unik3d_injection_stage(self) -> str:
+        if self.unik3d_mlp is not None:
+            return self.unik3d_mlp.injection_stage
+        return normalize_unik3d_injection_stage(getattr(self.config, "unik3d_injection_stage", "post_merger"))
 
     def _runtime_grid_matches_image_grid(self, grid_thw: torch.Tensor | None) -> bool:
         runtime_grid = self._pano_runtime_grid_thw
@@ -841,7 +890,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         visual.patch_embed.forward = MethodType(patch_embed_with_pano_adapters, visual.patch_embed)
 
-    def _select_da2_current_items(
+    def _select_unik3d_current_items(
         self,
         image_grid_thw: torch.Tensor,
         num_image_outputs: int | None = None,
@@ -856,26 +905,26 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             and (num_image_outputs is None or image_index < num_image_outputs)
         ]
 
-    def _da2_current_batch_inputs(
+    def _unik3d_current_batch_inputs(
         self,
         *,
-        da2_pixel_values: torch.Tensor,
+        unik3d_pixel_values: torch.Tensor,
         current_items: list[tuple[int, int]],
     ) -> torch.Tensor:
-        if da2_pixel_values is None or da2_pixel_values.numel() == 0:
-            raise AssertionError("DA2 is enabled but da2_pixel_values is missing")
-        if int(da2_pixel_values.shape[0]) != len(current_items):
+        if unik3d_pixel_values is None or unik3d_pixel_values.numel() == 0:
+            raise AssertionError("UniK3D is enabled but unik3d_pixel_values is missing")
+        if int(unik3d_pixel_values.shape[0]) != len(current_items):
             raise AssertionError(
-                "DA2 current-image batch size mismatch: "
-                f"da2_batch={int(da2_pixel_values.shape[0])}, "
+                "UniK3D current-image batch size mismatch: "
+                f"unik3d_batch={int(unik3d_pixel_values.shape[0])}, "
                 f"current_items={len(current_items)}"
             )
         batch_indices = torch.tensor(
             [item[0] for item in current_items],
-            device=da2_pixel_values.device,
+            device=unik3d_pixel_values.device,
             dtype=torch.long,
         )
-        return da2_pixel_values.index_select(0, batch_indices)
+        return unik3d_pixel_values.index_select(0, batch_indices)
 
     def _target_geometry_for_indices(
         self,
@@ -886,18 +935,18 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return None
         return geometry[target_indices].detach().to(device="cpu", dtype=torch.float32)
 
-    def _apply_post_merger_da2_residual(self, vision_output, image_grid_thw: torch.Tensor):
+    def _apply_post_merger_unik3d_residual(self, vision_output, image_grid_thw: torch.Tensor):
         if image_grid_thw is None or vision_output.pooler_output is None:
             return vision_output
 
         image_embeds = list(vision_output.pooler_output)
-        current_items = self._select_da2_current_items(image_grid_thw, num_image_outputs=len(image_embeds))
+        current_items = self._select_unik3d_current_items(image_grid_thw, num_image_outputs=len(image_embeds))
         if not current_items:
             return vision_output
 
-        da2_pixel_values = self._pano_runtime_da2_pixel_values
-        da2_inputs = self._da2_current_batch_inputs(
-            da2_pixel_values=da2_pixel_values,
+        unik3d_pixel_values = self._pano_runtime_unik3d_pixel_values
+        unik3d_inputs = self._unik3d_current_batch_inputs(
+            unik3d_pixel_values=unik3d_pixel_values,
             current_items=current_items,
         )
         target_indices = [item[1] for item in current_items]
@@ -905,15 +954,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         target_lengths = [int(image_embeds[index].shape[0]) for index in target_indices]
         geometry = self._target_geometry_for_indices(target_indices)
 
-        da2_model = self._ensure_da2_model(
+        unik3d_model = self._ensure_unik3d_model(
             device=image_embeds[target_indices[0]].device,
             dtype=image_embeds[target_indices[0]].dtype,
         )
-        if da2_model is None or self.da2_mlp is None:
+        if unik3d_model is None or self.unik3d_mlp is None:
             return vision_output
-        deltas = self.da2_mlp(
-            da2_inputs,
-            da2_model=da2_model,
+        deltas = self.unik3d_mlp(
+            unik3d_inputs,
+            unik3d_model=unik3d_model,
             target_grid_thw=target_grid_thw,
             target_lengths=target_lengths,
             image_erp_geometry=geometry,
@@ -923,7 +972,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         for image_index, delta in zip(target_indices, deltas):
             if delta.shape != image_embeds[image_index].shape:
                 raise AssertionError(
-                    "DA2 delta shape mismatch: "
+                    "UniK3D delta shape mismatch: "
                     f"delta={tuple(delta.shape)}, qwen={tuple(image_embeds[image_index].shape)}"
                 )
             image_embeds[image_index] = image_embeds[image_index] + delta
@@ -931,7 +980,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         vision_output.pooler_output = tuple(image_embeds)
         return vision_output
 
-    def _apply_pre_merger_da2_residual(
+    def _apply_pre_merger_unik3d_residual(
         self,
         hidden_states: torch.Tensor,
         image_grid_thw: torch.Tensor | None,
@@ -939,13 +988,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if image_grid_thw is None or hidden_states.numel() == 0:
             return hidden_states
 
-        current_items = self._select_da2_current_items(image_grid_thw)
+        current_items = self._select_unik3d_current_items(image_grid_thw)
         if not current_items:
             return hidden_states
 
-        da2_pixel_values = self._pano_runtime_da2_pixel_values
-        da2_inputs = self._da2_current_batch_inputs(
-            da2_pixel_values=da2_pixel_values,
+        unik3d_pixel_values = self._pano_runtime_unik3d_pixel_values
+        unik3d_inputs = self._unik3d_current_batch_inputs(
+            unik3d_pixel_values=unik3d_pixel_values,
             current_items=current_items,
         )
         target_indices = [item[1] for item in current_items]
@@ -956,15 +1005,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ]
         geometry = self._target_geometry_for_indices(target_indices)
 
-        da2_model = self._ensure_da2_model(
+        unik3d_model = self._ensure_unik3d_model(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        if da2_model is None or self.da2_mlp is None:
+        if unik3d_model is None or self.unik3d_mlp is None:
             return hidden_states
-        deltas = self.da2_mlp(
-            da2_inputs,
-            da2_model=da2_model,
+        deltas = self.unik3d_mlp(
+            unik3d_inputs,
+            unik3d_model=unik3d_model,
             target_grid_thw=target_grid_thw,
             target_lengths=target_lengths,
             image_erp_geometry=geometry,
@@ -993,14 +1042,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             length = split_lengths[image_index]
             if tuple(delta.shape) != (length, int(hidden_states.shape[-1])):
                 raise AssertionError(
-                    "DA2 pre-merger delta shape mismatch: "
+                    "UniK3D pre-merger delta shape mismatch: "
                     f"delta={tuple(delta.shape)}, qwen=({length}, {int(hidden_states.shape[-1])})"
                 )
             hidden_states[start:start + length] = hidden_states[start:start + length] + delta
         return hidden_states
 
     def _install_pano_merger_hook(self) -> None:
-        if not self._da2_enabled() or self._da2_injection_stage() != "pre_merger":
+        if not self._unik3d_enabled() or self._unik3d_injection_stage() != "pre_merger":
             return
         visual = self.model.visual
         if hasattr(visual.merger, "_pano_origin_forward"):
@@ -1011,11 +1060,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         def merger_with_pano_pre_merger_residual(this, hidden_states):
             if (
-                owner._da2_enabled()
-                and owner._da2_injection_stage() == "pre_merger"
+                owner._unik3d_enabled()
+                and owner._unik3d_injection_stage() == "pre_merger"
                 and owner._pano_runtime_in_image_features
             ):
-                hidden_states = owner._apply_pre_merger_da2_residual(
+                hidden_states = owner._apply_pre_merger_unik3d_residual(
                     hidden_states=hidden_states,
                     image_grid_thw=owner._pano_runtime_visual_grid_thw,
                 )
@@ -1024,7 +1073,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         visual.merger.forward = MethodType(merger_with_pano_pre_merger_residual, visual.merger)
 
     def _install_image_feature_hook(self) -> None:
-        if not self._da2_enabled():
+        if not self._unik3d_enabled():
             return
         if hasattr(self.model, "_pano_origin_get_image_features"):
             return
@@ -1049,9 +1098,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 owner._pano_runtime_visual_grid_thw = previous_visual_grid
             if not is_image_visual_call:
                 return vision_output
-            if owner._da2_injection_stage() == "pre_merger":
+            if owner._unik3d_injection_stage() == "pre_merger":
                 return vision_output
-            vision_output = owner._apply_post_merger_da2_residual(vision_output, image_grid_thw)
+            vision_output = owner._apply_post_merger_unik3d_residual(vision_output, image_grid_thw)
             return vision_output
 
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
@@ -1063,24 +1112,24 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images: torch.Tensor | None,
         image_current_index: torch.Tensor | None,
         image_erp_geometry: torch.Tensor | None,
-        da2_pixel_values: torch.Tensor | None,
+        unik3d_pixel_values: torch.Tensor | None,
     ) -> None:
         self._pano_runtime_grid_thw = image_grid_thw
         self._pano_runtime_image_num_images = image_num_images
         self._pano_runtime_image_current_index = image_current_index
         self._pano_runtime_image_geometry = image_erp_geometry
-        self._pano_runtime_da2_pixel_values = da2_pixel_values
+        self._pano_runtime_unik3d_pixel_values = unik3d_pixel_values
 
     def _clear_runtime_pano_context(self) -> None:
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
         self._pano_runtime_image_geometry = None
-        self._pano_runtime_da2_pixel_values = None
+        self._pano_runtime_unik3d_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
 
-    def _drop_incompatible_da2_mlp_pre_hook(
+    def _drop_incompatible_unik3d_mlp_pre_hook(
         self,
         module,
         state_dict,
@@ -1092,13 +1141,13 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         error_msgs,
     ) -> None:
         del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        if self.da2_mlp is None:
+        if self.unik3d_mlp is None:
             return
-        key_prefix = f"{prefix}da2_mlp."
+        key_prefix = f"{prefix}unik3d_mlp."
         checkpoint_keys = [key for key in state_dict.keys() if key.startswith(key_prefix)]
         if not checkpoint_keys:
             return
-        target_state = self.da2_mlp.state_dict()
+        target_state = self.unik3d_mlp.state_dict()
         incompatible = False
         unknown_keys = []
         for key in checkpoint_keys:
@@ -1117,20 +1166,20 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return
         for key in checkpoint_keys:
             del state_dict[key]
-        self._da2_mlp_load_was_incompatible = True
+        self._unik3d_mlp_load_was_incompatible = True
 
-    def _load_external_da2_weights(self) -> None:
-        if not self._da2_enabled():
+    def _load_external_unik3d_weights(self) -> None:
+        if not self._unik3d_enabled():
             return
-        if self.da2 is None:
-            self.da2 = build_da2_model(
-                source_path=str(getattr(self.config, "da2_source_path")),
-                model_path=str(getattr(self.config, "da2_model_path")),
+        if self.unik3d is None:
+            self.unik3d = build_unik3d_model(
+                source_path=str(getattr(self.config, "unik3d_source_path")),
+                model_path=str(getattr(self.config, "unik3d_model_path")),
             )
-        freeze_da2_model(self.da2)
-        self._da2_weights_ready = True
-        self._da2_device = None
-        self._da2_dtype = None
+        freeze_unik3d_model(self.unik3d)
+        self._unik3d_weights_ready = True
+        self._unik3d_device = None
+        self._unik3d_dtype = None
 
     @staticmethod
     def _load_prefixed_checkpoint_tensors(checkpoint_dir: Path, prefix: str) -> dict[str, torch.Tensor]:
@@ -1195,69 +1244,69 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         return state_dict
 
-    def _load_saved_da2_weights(self, pretrained_model_name_or_path) -> bool:
-        if not self._da2_enabled():
+    def _load_saved_unik3d_weights(self, pretrained_model_name_or_path) -> bool:
+        if not self._unik3d_enabled():
             return False
 
         checkpoint_dir = Path(str(pretrained_model_name_or_path))
-        state_dict = self._load_prefixed_checkpoint_tensors(checkpoint_dir, "da2.")
+        state_dict = self._load_prefixed_checkpoint_tensors(checkpoint_dir, "unik3d.")
         if not state_dict:
             return False
 
-        if self.da2 is None:
-            self.da2 = build_da2_model(
-                source_path=str(getattr(self.config, "da2_source_path")),
+        if self.unik3d is None:
+            self.unik3d = build_unik3d_model(
+                source_path=str(getattr(self.config, "unik3d_source_path")),
                 model_path=None,
                 load_pretrained_weights=False,
             )
 
         try:
             try:
-                self.da2.load_state_dict(state_dict, strict=True, assign=True)
+                self.unik3d.load_state_dict(state_dict, strict=True, assign=True)
             except TypeError:
-                self.da2.load_state_dict(state_dict, strict=True)
+                self.unik3d.load_state_dict(state_dict, strict=True)
         except RuntimeError as exc:
-            self.da2 = None
-            self._da2_weights_ready = False
+            self.unik3d = None
+            self._unik3d_weights_ready = False
             raise RuntimeError(
-                "The VLN checkpoint contains da2.* tensors that do not match the "
-                "bundled DA2 architecture"
+                "The VLN checkpoint contains unik3d.* tensors that do not match "
+                "the bundled UniK3D-Large architecture"
             ) from exc
-        freeze_da2_model(self.da2)
-        self._da2_weights_ready = True
-        self._da2_device = None
-        self._da2_dtype = None
+        freeze_unik3d_model(self.unik3d)
+        self._unik3d_weights_ready = True
+        self._unik3d_device = None
+        self._unik3d_dtype = None
         return True
 
-    def _mark_da2_weights_ready(self) -> None:
-        if self.da2 is None:
+    def _mark_unik3d_weights_ready(self) -> None:
+        if self.unik3d is None:
             return
-        freeze_da2_model(self.da2)
-        self._da2_weights_ready = True
-        self._da2_device = None
-        self._da2_dtype = None
+        freeze_unik3d_model(self.unik3d)
+        self._unik3d_weights_ready = True
+        self._unik3d_device = None
+        self._unik3d_dtype = None
 
-    def _ensure_da2_model(self, device: torch.device, dtype: torch.dtype):
-        if not self._da2_enabled():
+    def _ensure_unik3d_model(self, device: torch.device, dtype: torch.dtype):
+        if not self._unik3d_enabled():
             return None
-        if self.da2 is None:
-            self.da2 = build_da2_model(
-                source_path=str(getattr(self.config, "da2_source_path")),
-                model_path=str(getattr(self.config, "da2_model_path")),
+        if self.unik3d is None:
+            self.unik3d = build_unik3d_model(
+                source_path=str(getattr(self.config, "unik3d_source_path")),
+                model_path=str(getattr(self.config, "unik3d_model_path")),
             )
-        if not self._da2_weights_ready:
-            self._load_external_da2_weights()
-        if device.type != "cuda" or bool(getattr(self.config, "da2_force_fp32", False)):
+        if not self._unik3d_weights_ready:
+            self._load_external_unik3d_weights()
+        if device.type != "cuda" or bool(getattr(self.config, "unik3d_force_fp32", False)):
             target_dtype = torch.float32
         else:
             # Keep the frozen encoder in Qwen's low-precision vision dtype when possible.
             target_dtype = dtype if dtype in (torch.bfloat16, torch.float16) else torch.float32
-        if self._da2_device != device or self._da2_dtype != target_dtype:
-            self.da2.to(device=device, dtype=target_dtype)
-            self._da2_device = device
-            self._da2_dtype = target_dtype
-        freeze_da2_model(self.da2)
-        return self.da2
+        if self._unik3d_device != device or self._unik3d_dtype != target_dtype:
+            self.unik3d.to(device=device, dtype=target_dtype)
+            self._unik3d_device = device
+            self._unik3d_dtype = target_dtype
+        freeze_unik3d_model(self.unik3d)
+        return self.unik3d
 
     def _current_image_flat_indices(self, image_grid_thw: torch.Tensor | None) -> list[tuple[int, int]]:
         if image_grid_thw is None or image_grid_thw.numel() == 0:
@@ -1317,19 +1366,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_erp_geometry: torch.FloatTensor | None = None,
         image_num_images: torch.LongTensor | None = None,
         image_current_index: torch.LongTensor | None = None,
-        da2_pixel_values: torch.Tensor | None = None,
+        unik3d_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
         if (
             self._erp_fourier_linear_enabled()
-            or self._da2_enabled()
+            or self._unik3d_enabled()
         ):
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
                 image_current_index=image_current_index,
                 image_erp_geometry=image_erp_geometry,
-                da2_pixel_values=da2_pixel_values,
+                unik3d_pixel_values=unik3d_pixel_values,
             )
         try:
             return super().forward(
@@ -1362,34 +1411,127 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         ):
             erp_fourier_linear_module.reset_parameters()
 
-        da2_module = self.da2_mlp
+        unik3d_module = self.unik3d_mlp
         if (
-            da2_module is not None
-            and da2_module.enabled
+            unik3d_module is not None
+            and unik3d_module.enabled
             and (
-                self._da2_mlp_load_was_incompatible
-                or any(key.startswith("da2_mlp.") for key in missing_keys)
+                self._unik3d_mlp_load_was_incompatible
+                or any(key.startswith("unik3d_mlp.") for key in missing_keys)
             )
         ):
-            da2_module.reset_parameters()
-            self._da2_mlp_load_was_incompatible = False
-        if da2_module is not None and da2_module.enabled:
-            if any(key.startswith("da2.") for key in missing_keys):
-                self._load_external_da2_weights()
+            unik3d_module.reset_parameters()
+            self._unik3d_mlp_load_was_incompatible = False
+        if unik3d_module is not None and unik3d_module.enabled:
+            if any(key.startswith("unik3d.") for key in missing_keys):
+                self._load_external_unik3d_weights()
             else:
-                self._mark_da2_weights_ready()
+                self._mark_unik3d_weights_ready()
 
     def _reset_erp_fourier_linear_parameters_after_pretrained_load(self) -> None:
         if self._erp_fourier_linear_enabled() and self.erp_fourier_linear_adapter is not None:
             self.erp_fourier_linear_adapter.reset_parameters()
 
-    def _reset_da2_parameters_after_pretrained_load(self) -> None:
-        if self._da2_enabled() and self.da2_mlp is not None:
-            self.da2_mlp.reset_parameters()
+    def _reset_unik3d_parameters_after_pretrained_load(self) -> None:
+        if self._unik3d_enabled() and self.unik3d_mlp is not None:
+            self.unik3d_mlp.reset_parameters()
 
     @classmethod
-    def _checkpoint_has_da2_weights(cls, pretrained_model_name_or_path) -> bool | None:
-        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.DA2_STATE_KEYS)
+    def _checkpoint_has_unik3d_weights(cls, pretrained_model_name_or_path) -> bool | None:
+        return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.UNIK3D_STATE_KEYS)
+
+    @staticmethod
+    def _expected_unik3d_adapter_shapes(config) -> dict[str, tuple[int, ...]]:
+        if config is None or not bool(getattr(config, "unik3d_enabled", False)):
+            return {}
+
+        ensure_unik3d_config(config)
+        feature_source = normalize_unik3d_feature_source(config.unik3d_feature_source)
+        context_dim = sum(channels for _, channels in UNIK3D_FEATURE_SPECS[feature_source])
+        sampling_mode = str(config.unik3d_sampling_mode).lower()
+        if sampling_mode not in {"singlepoint", "grouping"}:
+            return {}
+        spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
+        mlp_input_dim = (
+            context_dim * spatial_merge_size**2
+            if sampling_mode == "grouping"
+            else context_dim
+        )
+        injection_stage = normalize_unik3d_injection_stage(config.unik3d_injection_stage)
+        output_dim = (
+            int(config.vision_config.hidden_size)
+            if injection_stage == "pre_merger"
+            else int(getattr(config, "unik3d_output_dim", config.text_config.hidden_size))
+        )
+        return {
+            "unik3d_mlp.alpha_value": (),
+            "unik3d_mlp.input_norm.weight": (context_dim,),
+            "unik3d_mlp.mlp.0.weight": (UNIK3D_MLP_HIDDEN_SIZE, mlp_input_dim),
+            "unik3d_mlp.mlp.0.bias": (UNIK3D_MLP_HIDDEN_SIZE,),
+            "unik3d_mlp.mlp.2.weight": (output_dim, UNIK3D_MLP_HIDDEN_SIZE),
+            "unik3d_mlp.mlp.2.bias": (output_dim,),
+            "unik3d_mlp.output_norm.weight": (output_dim,),
+        }
+
+    @staticmethod
+    def _checkpoint_safetensor_shapes(
+        pretrained_model_name_or_path,
+        state_keys: set[str],
+    ) -> dict[str, tuple[int, ...]]:
+        checkpoint_dir = Path(str(pretrained_model_name_or_path))
+        if not checkpoint_dir.is_dir() or not state_keys:
+            return {}
+
+        try:
+            from safetensors import safe_open
+
+            index_path = checkpoint_dir / "model.safetensors.index.json"
+            if index_path.is_file():
+                weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+                files_to_keys: dict[str, list[str]] = {}
+                for key in state_keys:
+                    filename = weight_map.get(key)
+                    if filename is not None:
+                        files_to_keys.setdefault(filename, []).append(key)
+                shapes = {}
+                for filename, keys in files_to_keys.items():
+                    with safe_open(
+                        str(checkpoint_dir / filename),
+                        framework="pt",
+                        device="cpu",
+                    ) as handle:
+                        for key in keys:
+                            shapes[key] = tuple(handle.get_slice(key).get_shape())
+                return shapes
+
+            model_path = checkpoint_dir / "model.safetensors"
+            if not model_path.is_file():
+                return {}
+            with safe_open(str(model_path), framework="pt", device="cpu") as handle:
+                available_keys = set(handle.keys())
+                return {
+                    key: tuple(handle.get_slice(key).get_shape())
+                    for key in state_keys & available_keys
+                }
+        except Exception:
+            return {}
+
+    @classmethod
+    def _checkpoint_unik3d_adapter_shape_mismatches(
+        cls,
+        pretrained_model_name_or_path,
+        config,
+    ) -> set[str]:
+        expected_shapes = cls._expected_unik3d_adapter_shapes(config)
+        checkpoint_shapes = cls._checkpoint_safetensor_shapes(
+            pretrained_model_name_or_path,
+            set(expected_shapes),
+        )
+        return {
+            key
+            for key, checkpoint_shape in checkpoint_shapes.items()
+            if checkpoint_shape != expected_shapes[key]
+        }
 
     def _checkpoint_has_erp_fourier_linear_weights(self, pretrained_model_name_or_path) -> bool | None:
         if self.erp_fourier_linear_adapter is None:
@@ -1446,32 +1588,70 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        requested_loading_info = bool(kwargs.get("output_loading_info", False))
+        adapter_shape_mismatches = cls._checkpoint_unik3d_adapter_shape_mismatches(
+            pretrained_model_name_or_path,
+            kwargs.get("config"),
+        )
+        if adapter_shape_mismatches:
+            kwargs["ignore_mismatched_sizes"] = True
+            kwargs["output_loading_info"] = True
+
+        loaded = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        if bool(kwargs.get("output_loading_info", False)):
+            model, loading_info = loaded
+        else:
+            model = loaded
+            loading_info = None
+
+        if adapter_shape_mismatches:
+            reported_mismatches = {
+                item[0]
+                for item in loading_info.get("mismatched_keys", set())
+            }
+            unrelated_mismatches = {
+                key
+                for key in reported_mismatches
+                if not key.startswith("unik3d_mlp.")
+            }
+            if unrelated_mismatches:
+                raise RuntimeError(
+                    "Checkpoint contains non-UniK3D parameter shape mismatches: "
+                    f"{sorted(unrelated_mismatches)}"
+                )
+            model._reset_unik3d_parameters_after_pretrained_load()
+
         has_erp_fourier_linear_weights = model._checkpoint_has_erp_fourier_linear_weights(
             pretrained_model_name_or_path
         )
         if has_erp_fourier_linear_weights is False:
             model._reset_erp_fourier_linear_parameters_after_pretrained_load()
-        has_da2_adapter_weights = cls._checkpoint_has_da2_weights(pretrained_model_name_or_path)
-        if has_da2_adapter_weights is False:
-            model._reset_da2_parameters_after_pretrained_load()
-        if model._da2_enabled():
-            resolved_source = resolve_da2_source_path(
-                getattr(model.config, "da2_source_path", None)
+        has_unik3d_adapter_weights = cls._checkpoint_has_unik3d_weights(
+            pretrained_model_name_or_path
+        )
+        if has_unik3d_adapter_weights is False:
+            model._reset_unik3d_parameters_after_pretrained_load()
+        if model._unik3d_enabled():
+            resolved_source = resolve_unik3d_source_path(
+                getattr(model.config, "unik3d_source_path", None)
             )
-            model.config.da2_source_path = (
-                BUNDLED_DA2_SOURCE
-                if resolved_source == DEFAULT_DA2_SOURCE_PATH.resolve()
+            model.config.unik3d_source_path = (
+                BUNDLED_UNIK3D_SOURCE
+                if resolved_source == DEFAULT_UNIK3D_SOURCE_PATH.resolve()
                 else str(resolved_source)
             )
-            loaded_saved_da2 = model._load_saved_da2_weights(pretrained_model_name_or_path)
-            if not loaded_saved_da2 and model.da2 is None:
-                if has_da2_adapter_weights is True:
+            loaded_saved_unik3d = model._load_saved_unik3d_weights(
+                pretrained_model_name_or_path
+            )
+            if not loaded_saved_unik3d and model.unik3d is None:
+                if has_unik3d_adapter_weights is True:
                     raise RuntimeError(
-                        "The VLN checkpoint contains da2_mlp.* adapter weights but "
-                        "does not contain the required da2.* encoder weights"
+                        "The VLN checkpoint contains unik3d_mlp.* adapter weights but "
+                        "does not contain the required unik3d.* encoder weights"
                     )
-                model._load_external_da2_weights()
+                model._load_external_unik3d_weights()
+        if requested_loading_info:
+            return model, loading_info
         return model
 
     def prepare_inputs_for_generation(
@@ -1490,7 +1670,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_erp_geometry=None,
         image_num_images=None,
         image_current_index=None,
-        da2_pixel_values=None,
+        unik3d_pixel_values=None,
         **kwargs,
     ):
         model_inputs = super().prepare_inputs_for_generation(
@@ -1508,12 +1688,12 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             image_erp_geometry=image_erp_geometry,
             image_num_images=image_num_images,
             image_current_index=image_current_index,
-            da2_pixel_values=da2_pixel_values,
+            unik3d_pixel_values=unik3d_pixel_values,
             **kwargs,
         )
         if not is_first_iteration and use_cache:
             model_inputs["image_erp_geometry"] = None
             model_inputs["image_num_images"] = None
             model_inputs["image_current_index"] = None
-            model_inputs["da2_pixel_values"] = None
+            model_inputs["unik3d_pixel_values"] = None
         return model_inputs

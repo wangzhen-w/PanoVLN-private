@@ -13,7 +13,7 @@ from data import PanoworldSupervisedDataset
 try:
     from src.train.data.collator import MultiModalDataCollator
     from src.train.utils import (
-        checkpoint_has_da2_encoder_weights,
+        checkpoint_has_unik3d_encoder_weights,
         init_wandb,
         load_model,
         load_processor_and_tokenizer,
@@ -27,7 +27,7 @@ try:
 except ModuleNotFoundError:
     from train.data.collator import MultiModalDataCollator
     from train.utils import (
-        checkpoint_has_da2_encoder_weights,
+        checkpoint_has_unik3d_encoder_weights,
         init_wandb,
         load_model,
         load_processor_and_tokenizer,
@@ -61,8 +61,8 @@ class PanoWorldSFTTrainer(Trainer):
             return "erp_fourier_linear_adapter"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
-        if self._name_has_module(name, "da2_mlp"):
-            return "da2_mlp"
+        if self._name_has_module(name, "unik3d_mlp"):
+            return "unik3d_mlp"
         if self._name_has_module(name, "visual"):
             return "visual"
         if (
@@ -162,10 +162,10 @@ def _validate_required_paths(cfg) -> None:
         if not cfg.data.eval_jsonl:
             raise ValueError("data.eval_jsonl is required when run.do_eval=true")
         required_paths["data.eval_jsonl"] = cfg.data.eval_jsonl
-    if cfg.model.da2_enabled and not checkpoint_has_da2_encoder_weights(
+    if cfg.model.unik3d_enabled and not checkpoint_has_unik3d_encoder_weights(
         cfg.model.name_or_path
     ):
-        required_paths["model.da2_model_path"] = cfg.model.da2_model_path
+        required_paths["model.unik3d_model_path"] = cfg.model.unik3d_model_path
     if cfg.training.deepspeed:
         required_paths["training.deepspeed"] = cfg.training.deepspeed
 
@@ -197,10 +197,10 @@ def print_training_config(cfg) -> None:
         "erp_fourier_linear_apply_to_current_only: "
         f"{_config_value(cfg.model.erp_fourier_linear_apply_to_current_only)}",
     )
-    rank0_print(RANK, f"da2_enabled: {_config_value(cfg.model.da2_enabled)}")
-    rank0_print(RANK, f"da2_alpha_value: {_config_value(cfg.model.da2_alpha_value)}")
-    rank0_print(RANK, f"da2_feature_source: {_config_value(cfg.model.da2_feature_source)}")
-    rank0_print(RANK, f"da2_sampling_mode: {_config_value(cfg.model.da2_sampling_mode)}")
+    rank0_print(RANK, f"unik3d_enabled: {_config_value(cfg.model.unik3d_enabled)}")
+    rank0_print(RANK, f"unik3d_alpha_value: {_config_value(cfg.model.unik3d_alpha_value)}")
+    rank0_print(RANK, f"unik3d_feature_source: {_config_value(cfg.model.unik3d_feature_source)}")
+    rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(cfg.model.unik3d_sampling_mode)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -208,7 +208,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"erp_fourier_linear_lr: {_config_value(cfg.training.erp_fourier_linear_lr)}")
-    rank0_print(RANK, f"da2_mlp_lr: {_config_value(cfg.training.da2_mlp_lr)}")
+    rank0_print(RANK, f"unik3d_mlp_lr: {_config_value(cfg.training.unik3d_mlp_lr)}")
     rank0_print(RANK, "============================")
 
 
@@ -244,7 +244,7 @@ def safe_save_model_for_hf_trainer(
     trainer.accelerator.wait_for_everyone()
 
 
-def _build_dataset(cfg, processor, tokenizer, *, split: str, da2_enabled: bool):
+def _build_dataset(cfg, processor, tokenizer, *, split: str, unik3d_enabled: bool):
     is_train = split == "train"
     jsonl_path = cfg.data.train_jsonl if is_train else cfg.data.eval_jsonl
     image_root = cfg.data.train_image_root if is_train else (cfg.data.eval_image_root or cfg.data.train_image_root)
@@ -259,7 +259,7 @@ def _build_dataset(cfg, processor, tokenizer, *, split: str, da2_enabled: bool):
         model_max_length=cfg.model.model_max_length,
         erp_top_crop_degrees=cfg.model.erp_top_crop_degrees,
         erp_bottom_crop_degrees=cfg.model.erp_bottom_crop_degrees,
-        da2_enabled=da2_enabled,
+        unik3d_enabled=unik3d_enabled,
         max_samples=cfg.data.train_max_samples if is_train else cfg.data.eval_max_samples,
         shuffle=cfg.data.shuffle if is_train else cfg.data.eval_shuffle,
         prompt_format=cfg.data.prompt_format,
@@ -296,8 +296,8 @@ def main() -> None:
     sync_model_special_tokens(model, tokenizer)
 
     model_config = model.config
-    effective_da2_enabled = bool(
-        getattr(model_config, "da2_enabled", cfg.model.da2_enabled)
+    effective_unik3d_enabled = bool(
+        getattr(model_config, "unik3d_enabled", cfg.model.unik3d_enabled)
     )
 
     train_dataset = (
@@ -306,7 +306,7 @@ def main() -> None:
             processor,
             tokenizer,
             split="train",
-            da2_enabled=effective_da2_enabled,
+            unik3d_enabled=effective_unik3d_enabled,
         )
         if cfg.run.do_train else None
     )
@@ -319,7 +319,7 @@ def main() -> None:
             processor,
             tokenizer,
             split="eval",
-            da2_enabled=effective_da2_enabled,
+            unik3d_enabled=effective_unik3d_enabled,
         )
         if cfg.run.do_eval else None
     )
@@ -380,10 +380,10 @@ def main() -> None:
 
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
-        rank0_print(RANK, f"da2_enabled: {_config_value(effective_da2_enabled)}")
-        rank0_print(RANK, f"da2_alpha_value: {_config_value(getattr(model_config, 'da2_alpha_value', None))}")
-        rank0_print(RANK, f"da2_feature_source: {_config_value(getattr(model_config, 'da2_feature_source', None))}")
-        rank0_print(RANK, f"da2_sampling_mode: {_config_value(getattr(model_config, 'da2_sampling_mode', None))}")
+        rank0_print(RANK, f"unik3d_enabled: {_config_value(effective_unik3d_enabled)}")
+        rank0_print(RANK, f"unik3d_alpha_value: {_config_value(getattr(model_config, 'unik3d_alpha_value', None))}")
+        rank0_print(RANK, f"unik3d_feature_source: {_config_value(getattr(model_config, 'unik3d_feature_source', None))}")
+        rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(getattr(model_config, 'unik3d_sampling_mode', None))}")
         vision_config = getattr(model_config, "vision_config", None)
         rank0_print(
             RANK,
@@ -417,7 +417,7 @@ def main() -> None:
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "erp_fourier_linear_adapter": cfg.training.erp_fourier_linear_lr,
-            "da2_mlp": cfg.training.da2_mlp_lr,
+            "unik3d_mlp": cfg.training.unik3d_mlp_lr,
         },
     )
 

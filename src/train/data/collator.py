@@ -9,7 +9,7 @@ STACKABLE_KEYS = (
     "image_erp_geometry",
     "image_num_images",
     "image_current_index",
-    "da2_pixel_values",
+    "unik3d_pixel_values",
     "pixel_values_videos",
     "video_grid_thw",
 )

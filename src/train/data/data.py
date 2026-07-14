@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 
 DEFAULT_VLN_MEMORY_IMAGE_SIZE = (448, 224)
 DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE = (960, 480)
-DEFAULT_DA2_IMAGE_SIZE = (1092, 546)
+DEFAULT_UNIK3D_IMAGE_SIZE = (1036, 518)
 DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
@@ -141,10 +141,10 @@ def preprocess_vln_memory_image(
     )
 
 
-def preprocess_da2_current_image(image: Image.Image) -> torch.Tensor:
+def preprocess_unik3d_current_image(image: Image.Image) -> torch.Tensor:
     processed_image = image.convert("RGB").resize(
-        DEFAULT_DA2_IMAGE_SIZE,
-        Image.Resampling.BICUBIC,
+        DEFAULT_UNIK3D_IMAGE_SIZE,
+        Image.Resampling.LANCZOS,
     )
     return TF.to_tensor(processed_image)
 
@@ -417,7 +417,7 @@ class SupervisedDataset(Dataset):
         model_max_length: Optional[int],
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
-        da2_enabled: bool = False,
+        unik3d_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -434,7 +434,7 @@ class SupervisedDataset(Dataset):
         self.model_max_length = model_max_length
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
-        self.da2_enabled = bool(da2_enabled)
+        self.unik3d_enabled = bool(unik3d_enabled)
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -570,9 +570,9 @@ class SupervisedDataset(Dataset):
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
 
-        if self.da2_enabled and vision_paths:
+        if self.unik3d_enabled and vision_paths:
             with Image.open(vision_paths[-1]) as image:
-                item["da2_pixel_values"] = preprocess_da2_current_image(image).unsqueeze(0)
+                item["unik3d_pixel_values"] = preprocess_unik3d_current_image(image).unsqueeze(0)
 
         for key in STACKABLE_KEYS:
             if key in encoded:
@@ -587,7 +587,7 @@ STACKABLE_KEYS = (
     "image_erp_geometry",
     "image_num_images",
     "image_current_index",
-    "da2_pixel_values",
+    "unik3d_pixel_values",
     "pixel_values_videos",
     "video_grid_thw",
 )

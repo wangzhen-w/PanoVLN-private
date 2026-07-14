@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/DA-2"
+MODEL_PATH="/workspace/data1/model/ablation_new/spatial_encoder/Unik3D-multiscale"
 OUTPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 REFERENCE_INPUT_ROOT="/workspace/data1/dataset/PanoVLN"
 DAGGER_DATASET_NAME="dagger"
