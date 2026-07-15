@@ -25,6 +25,7 @@ model:
   unik3d_injection_stage: "post_merger"
   unik3d_sampling_mode: "grouping"
   unik3d_force_fp32: false
+  unik3d_encoder_chunk_size: 2
 
 data:
   train_jsonl: "/workspace/data1/dataset/Panoworld/train_outdoor.jsonl"

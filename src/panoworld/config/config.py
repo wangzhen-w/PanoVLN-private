@@ -28,6 +28,7 @@ class ModelConfig:
     unik3d_injection_stage: str = "post_merger"
     unik3d_sampling_mode: str = "grouping"
     unik3d_force_fp32: bool = False
+    unik3d_encoder_chunk_size: int = 2
 
 
 @dataclass

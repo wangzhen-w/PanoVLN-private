@@ -120,6 +120,7 @@ def _load_model_config(cfg):
         "unik3d_injection_stage",
         "unik3d_sampling_mode",
         "unik3d_force_fp32",
+        "unik3d_encoder_chunk_size",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:

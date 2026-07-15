@@ -201,6 +201,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"unik3d_alpha_value: {_config_value(cfg.model.unik3d_alpha_value)}")
     rank0_print(RANK, f"unik3d_feature_source: {_config_value(cfg.model.unik3d_feature_source)}")
     rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(cfg.model.unik3d_sampling_mode)}")
+    rank0_print(RANK, f"unik3d_encoder_chunk_size: {cfg.model.unik3d_encoder_chunk_size}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -384,6 +385,11 @@ def main() -> None:
         rank0_print(RANK, f"unik3d_alpha_value: {_config_value(getattr(model_config, 'unik3d_alpha_value', None))}")
         rank0_print(RANK, f"unik3d_feature_source: {_config_value(getattr(model_config, 'unik3d_feature_source', None))}")
         rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(getattr(model_config, 'unik3d_sampling_mode', None))}")
+        rank0_print(
+            RANK,
+            "unik3d_encoder_chunk_size: "
+            f"{_config_value(getattr(model_config, 'unik3d_encoder_chunk_size', None))}",
+        )
         vision_config = getattr(model_config, "vision_config", None)
         rank0_print(
             RANK,

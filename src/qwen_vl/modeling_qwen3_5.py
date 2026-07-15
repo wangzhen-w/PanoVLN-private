@@ -258,6 +258,7 @@ def ensure_unik3d_config(config) -> None:
         "unik3d_injection_stage": "post_merger",
         "unik3d_sampling_mode": "grouping",
         "unik3d_force_fp32": False,
+        "unik3d_encoder_chunk_size": 2,
         "unik3d_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
     }
     for field_name, default_value in defaults.items():
@@ -453,6 +454,12 @@ class UniK3DGeometryMLP(nn.Module):
                 "unik3d_sampling_mode must be 'singlepoint' or 'grouping', "
                 f"got {self.sampling_mode!r}"
             )
+        self.encoder_chunk_size = int(getattr(config, "unik3d_encoder_chunk_size", 2))
+        if self.encoder_chunk_size <= 0:
+            raise ValueError(
+                "unik3d_encoder_chunk_size must be positive, "
+                f"got {self.encoder_chunk_size}"
+            )
         self.alpha_init = float(getattr(config, "unik3d_alpha_value", 0.1))
         self.register_buffer(
             "alpha_value",
@@ -642,64 +649,6 @@ class UniK3DGeometryMLP(nn.Module):
                 f"shape=({image_h}, {image_w})"
             )
 
-        from unik3d.utils.camera import Spherical
-
-        camera_params = torch.ones(
-            batch_size,
-            8,
-            device=images.device,
-            dtype=torch.float32,
-        )
-        camera_params[:, 4] = float(image_w)
-        camera_params[:, 5] = float(image_h)
-        camera_params[:, 6] = math.pi
-        camera_params[:, 7] = vertical_half_fov
-        camera = torch.cat(
-            [Spherical(params=camera_params[index]) for index in range(batch_size)],
-            dim=0,
-        )
-
-        autocast_enabled = (
-            images.device.type == "cuda"
-            and encoder_param.dtype in (torch.bfloat16, torch.float16)
-        )
-        with torch.no_grad(), torch.autocast(
-            device_type=images.device.type,
-            dtype=encoder_param.dtype,
-            enabled=autocast_enabled,
-        ):
-            feature_pyramid = encoder.extract_decoder_features(
-                {"image": normalized_images, "camera": camera}
-            )
-
-        if not isinstance(feature_pyramid, (tuple, list)) or len(feature_pyramid) != 3:
-            raise AssertionError(
-                "UniK3D must return its three-stage ray-conditioned decoder pyramid, "
-                f"got {type(feature_pyramid)!r} with length "
-                f"{len(feature_pyramid) if isinstance(feature_pyramid, (tuple, list)) else 'n/a'}"
-            )
-        source_grids = []
-        for stage_index, expected_channels in self.feature_spec:
-            source_grid = feature_pyramid[stage_index]
-            if source_grid.ndim != 4:
-                raise AssertionError(
-                    f"Expected UniK3D decoder stage {stage_index} as [B, C, H, W], "
-                    f"got {tuple(source_grid.shape)}"
-                )
-            if int(source_grid.shape[0]) != batch_size:
-                raise AssertionError(
-                    "UniK3D feature batch mismatch: "
-                    f"expected {batch_size}, got {int(source_grid.shape[0])} at stage {stage_index}"
-                )
-            if int(source_grid.shape[1]) != expected_channels:
-                raise AssertionError(
-                    "UniK3D decoder channel mismatch: "
-                    f"stage={stage_index}, expected={expected_channels}, "
-                    f"got={int(source_grid.shape[1])}"
-                )
-            source_grids.append(source_grid)
-
-        deltas = []
         geometry = image_erp_geometry
         if geometry is not None:
             geometry = geometry.to(device=param.device, dtype=torch.float32)
@@ -714,6 +663,8 @@ class UniK3DGeometryMLP(nn.Module):
                 "UniK3D geometry batch size mismatch: "
                 f"geometry={int(geometry.shape[0])}, target_lengths={len(target_lengths)}"
             )
+
+        sample_targets = []
         for sample_index, (grid_thw, target_len) in enumerate(zip(target_grid_thw.tolist(), target_lengths)):
             num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
             if num_frames != 1:
@@ -739,28 +690,104 @@ class UniK3DGeometryMLP(nn.Module):
                     f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}, "
                     f"expected_len={expected_len}, qwen_len={int(target_len)}"
                 )
+            sample_targets.append((grid_h, grid_w, target_h, target_w, int(target_len)))
 
-            sample_geometry = None if geometry is None else geometry[sample_index]
-            geo = self._sample_feature_pyramid(
-                [
-                    source_grid[sample_index:sample_index + 1]
-                    for source_grid in source_grids
-                ],
-                target_h=target_h,
-                target_w=target_w,
-                geometry=sample_geometry,
-                dtype=param.dtype,
+        from unik3d.utils.camera import Spherical
+
+        camera_params = torch.ones(
+            batch_size,
+            8,
+            device=images.device,
+            dtype=torch.float32,
+        )
+        camera_params[:, 4] = float(image_w)
+        camera_params[:, 5] = float(image_h)
+        camera_params[:, 6] = math.pi
+        camera_params[:, 7] = vertical_half_fov
+
+        autocast_enabled = (
+            images.device.type == "cuda"
+            and encoder_param.dtype in (torch.bfloat16, torch.float16)
+        )
+        deltas = []
+        chunk_size = min(self.encoder_chunk_size, batch_size)
+        for chunk_start in range(0, batch_size, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, batch_size)
+            chunk_camera = torch.cat(
+                [Spherical(params=camera_params[index]) for index in range(chunk_start, chunk_end)],
+                dim=0,
             )
-            if geo.shape[0] != int(target_len):
-                raise AssertionError(
-                    "UniK3D sampled geometry length mismatch: "
-                    f"sampled_len={geo.shape[0]}, qwen_len={int(target_len)}"
+            with torch.no_grad(), torch.autocast(
+                device_type=images.device.type,
+                dtype=encoder_param.dtype,
+                enabled=autocast_enabled,
+            ):
+                feature_pyramid = encoder.extract_decoder_features(
+                    {
+                        "image": normalized_images[chunk_start:chunk_end],
+                        "camera": chunk_camera,
+                    }
                 )
-            projected = self.output_norm(self.mlp(geo))
-            projected = self.alpha.to(dtype=projected.dtype) * projected
-            if self.injection_stage == "pre_merger":
-                projected = self._to_qwen_pre_merger_order(projected, grid_h=grid_h, grid_w=grid_w)
-            deltas.append(projected.to(device=output_device, dtype=output_dtype))
+
+            if not isinstance(feature_pyramid, (tuple, list)) or len(feature_pyramid) != 3:
+                raise AssertionError(
+                    "UniK3D must return its three-stage ray-conditioned decoder pyramid, "
+                    f"got {type(feature_pyramid)!r} with length "
+                    f"{len(feature_pyramid) if isinstance(feature_pyramid, (tuple, list)) else 'n/a'}"
+                )
+            chunk_batch_size = chunk_end - chunk_start
+            source_grids = []
+            for stage_index, expected_channels in self.feature_spec:
+                source_grid = feature_pyramid[stage_index]
+                if source_grid.ndim != 4:
+                    raise AssertionError(
+                        f"Expected UniK3D decoder stage {stage_index} as [B, C, H, W], "
+                        f"got {tuple(source_grid.shape)}"
+                    )
+                if int(source_grid.shape[0]) != chunk_batch_size:
+                    raise AssertionError(
+                        "UniK3D feature batch mismatch: "
+                        f"expected {chunk_batch_size}, got {int(source_grid.shape[0])} "
+                        f"at stage {stage_index}"
+                    )
+                if int(source_grid.shape[1]) != expected_channels:
+                    raise AssertionError(
+                        "UniK3D decoder channel mismatch: "
+                        f"stage={stage_index}, expected={expected_channels}, "
+                        f"got={int(source_grid.shape[1])}"
+                    )
+                source_grids.append(source_grid)
+
+            for local_index in range(chunk_batch_size):
+                sample_index = chunk_start + local_index
+                grid_h, grid_w, target_h, target_w, target_len = sample_targets[sample_index]
+                sample_geometry = None if geometry is None else geometry[sample_index]
+                geo = self._sample_feature_pyramid(
+                    [
+                        source_grid[local_index:local_index + 1]
+                        for source_grid in source_grids
+                    ],
+                    target_h=target_h,
+                    target_w=target_w,
+                    geometry=sample_geometry,
+                    dtype=param.dtype,
+                )
+                if geo.shape[0] != target_len:
+                    raise AssertionError(
+                        "UniK3D sampled geometry length mismatch: "
+                        f"sampled_len={geo.shape[0]}, qwen_len={target_len}"
+                    )
+                projected = self.output_norm(self.mlp(geo))
+                projected = self.alpha.to(dtype=projected.dtype) * projected
+                if self.injection_stage == "pre_merger":
+                    projected = self._to_qwen_pre_merger_order(
+                        projected,
+                        grid_h=grid_h,
+                        grid_w=grid_w,
+                    )
+                deltas.append(projected.to(device=output_device, dtype=output_dtype))
+
+            del source_grid, source_grids, feature_pyramid, chunk_camera
 
         return deltas
 

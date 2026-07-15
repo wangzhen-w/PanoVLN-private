@@ -231,6 +231,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"unik3d_injection_stage: {_config_value(cfg.model.unik3d_injection_stage)}")
     rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(cfg.model.unik3d_sampling_mode)}")
     rank0_print(RANK, f"unik3d_force_fp32: {_config_value(cfg.model.unik3d_force_fp32)}")
+    rank0_print(RANK, f"unik3d_encoder_chunk_size: {cfg.model.unik3d_encoder_chunk_size}")
     rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
     rank0_print(RANK, f"panoworld_enabled: {_config_value(cfg.data.panoworld.enabled)}")
     if cfg.data.panoworld.enabled:
@@ -315,6 +316,11 @@ def main():
         rank0_print(RANK, f"unik3d_feature_source: {_config_value(getattr(model_config, 'unik3d_feature_source', None))}")
         rank0_print(RANK, f"unik3d_injection_stage: {_config_value(getattr(model_config, 'unik3d_injection_stage', None))}")
         rank0_print(RANK, f"unik3d_sampling_mode: {_config_value(getattr(model_config, 'unik3d_sampling_mode', None))}")
+        rank0_print(
+            RANK,
+            "unik3d_encoder_chunk_size: "
+            f"{_config_value(getattr(model_config, 'unik3d_encoder_chunk_size', None))}",
+        )
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(
