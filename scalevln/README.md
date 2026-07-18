@@ -71,7 +71,7 @@ reference path 和统一的 `GOAL_RADIUS=0.3` 调用 Habitat 生成即可。
 ```bash
 SOURCE_JSONL="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl"
 IMAGE_ROOT="/workspace/data1/dataset/PanoVLN/images/scalevln"
-REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl"
+REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen36_27b_panovln.jsonl"
 ```
 
 然后运行：
@@ -82,10 +82,9 @@ bash scalevln/run_rewrite.sh
 ```
 
 这里明确使用 `--mode generate`。`SOURCE_JSONL` 文件物理上仍保留原 instruction，
-但 pipeline 逻辑上只把 episode ID 和 actions 传入生成流：在任何 agent 运行前
-强制清空原 ScaleVLN instruction，writer、
-reviewer 和 blind auditor 都看不到原文。因此它与 `data_create` 自采数据使用的是
-同一套无源文本 instruction 系统。
+但 pipeline 在加载后立即把 `instruction` 置空；传给 Qwen 的只有 episode ID、actions、
+trajectory metadata 和 panorama-derived evidence sheets。因此它与 `data_create`
+自采数据使用的是同一套 source-text-blind instruction 系统。
 
 ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.glb`
 或 `mp3d/...` scene ID；`PanoVLN-HM3D` 新数据则使用
@@ -102,7 +101,7 @@ ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.gl
 
 ```text
 ScaleVLN trajectory/actions + panoramas
-  -> shared source-text-blind multi-agent generation
+  -> shared source-text-blind evidence-plan-write-audit generation
   -> 要求全部 episode 通过质量门
   -> 原子发布 REWRITE_OUTPUT
 ```
@@ -111,11 +110,10 @@ ScaleVLN trajectory/actions + panoramas
 pair manifest。脚本使用 `--drop-failed false --allow-incomplete false`：只要还有一条
 失败，就保留 progress 供恢复并拒绝发布不完整 rewrite。
 
-共享 agent 还包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：planner 的
-passed/near/avoid landmark 关系会先做确定性消歧；一次 critical blind-grounding
-失败不能被下一次随机 bare pass 擦除，修复后必须连续两次通过；仅有 actions 时会
-dead-reckon 非局部复访，复访同时伴随多个大转向的路线不得被压缩成直线描述。
-这些门不会利用原 instruction。
+共享系统包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：终点 stop anchor 必须从
+ENDPOINT evidence 中保留到最终句子；楼梯上/下方向优先使用 trajectory metadata；
+仅有 actions 时会生成 major-turn 和 dead-reckoning 复杂度提示，避免长路线被压缩成
+直线路线。这些门不会利用原 instruction。
 
 ## 158 条失败样本
 
@@ -123,7 +121,7 @@ dead-reckon 非局部复访，复访同时伴随多个大转向的路线不得�
 
 ```text
 scalevln.jsonl:                         104,141
-scalevln_qwen35_27b_r2rstyle.jsonl:     104,141
+scalevln_qwen36_27b_panovln.jsonl:      104,141
 ID/order/action mismatch:                     0
 ```
 
@@ -138,7 +136,7 @@ ID/order/action mismatch:                     0
 
 ```bash
 python scalevln/audit_instruction_quality.py \
-  --candidate /workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl \
+  --candidate /workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen36_27b_panovln.jsonl \
   --source /workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl
 ```
 

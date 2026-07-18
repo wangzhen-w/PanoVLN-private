@@ -9,13 +9,13 @@ PYTHON_BIN="python"
 # 只需要修改这三个数据路径。
 SOURCE_JSONL="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl"
 IMAGE_ROOT="/workspace/data1/dataset/PanoVLN/images/scalevln"
-REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen35_27b_r2rstyle.jsonl"
+REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen36_27b_panovln.jsonl"
 
-BASE_URL="http://127.0.0.1:11426/v1"
-MODEL="Qwen3.5-27B"
+BASE_URL="http://127.0.0.1:10420/v1"
+MODEL="Qwen3.6-27B"
 API_KEY="test"
 
-NUM_WORKERS=16
+NUM_WORKERS=40
 MAX_WAYPOINTS=12
 START_WINDOW_FRAMES=6
 ENDPOINT_WINDOW_FRAMES=6
@@ -23,6 +23,8 @@ TILE_WIDTH=320
 TILE_HEIGHT=240
 SHEET_JPEG_QUALITY=90
 TEMPERATURE=0.40
+PLANNER_TEMPERATURE=0.0
+REVIEW_TEMPERATURE=0.0
 MAX_TOKENS=420
 FACT_MAX_TOKENS=320
 PLANNER_MAX_TOKENS=1200
@@ -56,6 +58,8 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --tile-height "${TILE_HEIGHT}" \
   --jpeg-quality "${SHEET_JPEG_QUALITY}" \
   --temperature "${TEMPERATURE}" \
+  --planner-temperature "${PLANNER_TEMPERATURE}" \
+  --review-temperature "${REVIEW_TEMPERATURE}" \
   --max-tokens "${MAX_TOKENS}" \
   --fact-max-tokens "${FACT_MAX_TOKENS}" \
   --planner-max-tokens "${PLANNER_MAX_TOKENS}" \

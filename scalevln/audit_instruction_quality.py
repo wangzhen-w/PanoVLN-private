@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--candidate",
-        default=f"{root}/scalevln_qwen35_27b_r2rstyle.jsonl",
+        default=f"{root}/scalevln_qwen36_27b_panovln.jsonl",
     )
     parser.add_argument("--source", default=f"{root}/scalevln.jsonl")
     parser.add_argument("--r2r", default=f"{root}/r2r.jsonl")

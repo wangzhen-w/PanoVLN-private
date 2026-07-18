@@ -347,7 +347,7 @@ def validate_source_gt_record(
 
 def validate_image_sequence(
     image_root: Path,
-    trajectory_id: int,
+    trajectory_id: Any,
     actions_without_stop: Sequence[int],
 ) -> int:
     """Require one initial frame plus one frame after every non-STOP action."""
@@ -606,7 +606,10 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
     # Panorama folders are keyed by the source episode ID. Preserve that value
     # as trajectory_id so every exported language variant can resolve the same
     # visual trajectory without an additional mapping sidecar.
-    trajectory_ids = {episode_id: episode_id for episode_id in selected_ids}
+    trajectory_ids = {
+        episode_id: source_episodes[episode_id]["trajectory_id"]
+        for episode_id in selected_ids
+    }
     image_frame_counts = {
         episode_id: validate_image_sequence(
             image_root,

@@ -12,7 +12,7 @@ HM3D basis.glb + basis.navmesh
   -> 高质量 R2R-short / RxR-long trajectory
   -> ShortestPathFollower expert actions
   -> 轨迹回放与 360°视觉证据采集
-  -> 多 agent 编写、纠错和审核 instruction
+  -> 视觉证据抽取、结构化路线计划、写作、独立审核和修复
   -> R2R VLN-CE train.json + train.json.gz + train_gt.json.gz
 ```
 
@@ -28,7 +28,12 @@ data_create/
 │   ├── collect_hm3d.py
 │   └── generate_gt.py
 ├── instruction/
-│   └── pipeline.py
+│   ├── actions.py
+│   ├── evidence.py
+│   ├── prompts.py
+│   ├── qa.py
+│   ├── runner.py
+│   └── pipeline.py              # 兼容入口，实际逻辑拆在上述模块
 └── export_vlnce.py
 ```
 
@@ -53,7 +58,7 @@ data_create/
 正式配置使用 `2048×1024` 全景、JPEG 质量 92，并投影为 `384×288` 透视 tile、
 contact sheet JPEG 质量 90。只提高全景而保留原来的 `256×192` tile 无法明显改善
 VLM 最终看到的 landmark；两级分辨率必须一起提高。`512×384` tile 会让长路线的
-多图请求过于接近 Qwen3.5-27B 的上下文上限，因此没有采用。
+多图请求接近当前 Qwen3.6-27B 的上下文上限，因此没有作为默认值。
 正式图片尺寸由 `run_data_creation.sh` 的 `PANORAMA_WIDTH/HEIGHT` 传给
 `render-panoramas`；`hm3d_vln.yaml` 也保持相同的 2K 默认。GT 阶段使用
 `--minimal-observations` 关闭 RGB sensor，所以不会为求 action 额外渲染高清图。
@@ -90,10 +95,10 @@ TILE_WIDTH=384
 TILE_HEIGHT=288
 SHEET_JPEG_QUALITY=90
 
-BASE_URL="http://127.0.0.1:11426/v1"
-MODEL="Qwen3.5-27B"
+BASE_URL="http://127.0.0.1:10420/v1"
+MODEL="Qwen3.6-27B"
 API_KEY="test"
-NUM_WORKERS=8
+NUM_WORKERS=40
 STAGE="full"
 ```
 
@@ -266,24 +271,24 @@ Trajectory 至少检查：
 高清 `2048×1024` render 会用同一个阈值再查完整 action replay，低清预检负责在
 昂贵 GT、高清渲染和 VLM 调用之前淘汰明显脏路线。
 
-Instruction agent 的正式顺序为：
+Instruction 系统的正式顺序为：
 
 ```text
-RouteEvidence
-  -> StartFact
-  -> EndpointFact
-  -> RoutePlanner
-  -> Writer
-  -> SelfCheck
-  -> RouteCoherenceAudit
-  -> SpatialBoundaryAudit
-  -> BlindGroundingAudit
-  -> FinalQualityGate
+actions + selected panorama frames
+  -> perspective evidence sheets: START / ROUTE / ENDPOINT
+  -> Qwen structured route plan + draft instruction
+  -> deterministic route/endpoint/format gate
+  -> Qwen blind grounding audit
+  -> repair when either gate fails
+  -> atomic clean JSONL publication
 ```
 
 自采数据使用 `generate` 模式，进入 agent 前会清除任何 source instruction。
 `validate-gt` 还会把 simulator GT 的升降统计作为只读 trajectory metadata 交给
-同一套 agent：楼梯上/下方向以真实 elevation 为准，VLM 只负责识别楼梯和地标。
-对仅有 actions 的旧数据，系统用离散动作做保守的 dead-reckoning 复访检查；出现
-非局部复访并夹有多个 90°以上大转向时，不允许 writer 把它压成直线路线。
+同一套系统：楼梯上/下方向以真实 elevation 为硬约束，VLM 只负责识别楼梯和地标。
+对仅有 actions 的旧数据，系统用离散动作做保守的 dead-reckoning 复杂度提示，避免
+长路线被压成直线路线。最终 clean JSONL 只保留 `episode_id`、`instruction`、`actions`、
+`instruction_profile`、`input_fingerprint`、`pipeline_fingerprint` 和可选
+`trajectory_id`；contact sheet、raw response、repair/audit 结果只在 work dir 中用于恢复
+和人工审查。
 任何 trajectory、图片或 instruction 未通过硬检查时，正式 dataset 都不会发布。

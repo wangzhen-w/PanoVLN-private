@@ -1,0 +1,86 @@
+"""Command line interface for the PanoVLN instruction generator."""
+
+from __future__ import annotations
+
+import argparse
+import json
+
+from .io_utils import str2bool
+from .runner import run
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-jsonl", required=True)
+    parser.add_argument("--image-root", required=True)
+    parser.add_argument("--output-jsonl", required=True)
+    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--mode", choices=("generate", "rewrite"), default="generate")
+    parser.add_argument("--instruction-profile", choices=("concise", "dense"), default="concise")
+
+    parser.add_argument("--provider", default="qwen")
+    parser.add_argument("--base-url", default="http://127.0.0.1:10420/v1")
+    parser.add_argument("--model", default="Qwen3.6-27B")
+    parser.add_argument("--api-key", default="test")
+    parser.add_argument("--request-timeout", type=float, default=300)
+    parser.add_argument("--retries", type=int, default=4)
+    parser.add_argument("--stage-retries", type=int, default=2)
+    parser.add_argument("--api-preflight", type=str2bool, default=True)
+    parser.add_argument("--disable-thinking", type=str2bool, default=True)
+
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--resume", type=str2bool, default=True)
+    parser.add_argument("--max-episodes", type=int, default=0)
+    parser.add_argument("--episode-ids", default=None)
+    parser.add_argument("--sample-mode", choices=("first", "random", "stratified"), default="first")
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--max-waypoints", type=int, default=14)
+    parser.add_argument("--start-window-frames", type=int, default=5)
+    parser.add_argument("--endpoint-window-frames", type=int, default=5)
+    parser.add_argument("--tile-width", type=int, default=384)
+    parser.add_argument("--tile-height", type=int, default=288)
+    parser.add_argument("--jpeg-quality", type=int, default=90)
+    parser.add_argument("--evidence-fingerprint-mode", choices=("content", "metadata"), default="content")
+    parser.add_argument("--use-action-heading", type=str2bool, default=False)
+    parser.add_argument("--save-contact-sheets", action="store_true")
+    parser.add_argument("--write-gallery", action="store_true")
+    parser.add_argument("--gallery-path", default=None)
+    parser.add_argument("--keep-raw-responses", type=str2bool, default=False)
+
+    parser.add_argument("--temperature", type=float, default=0.25)
+    parser.add_argument("--max-tokens", type=int, default=360)
+    parser.add_argument("--planner-temperature", type=float, default=0.0)
+    parser.add_argument("--planner-max-tokens", type=int, default=1000)
+    parser.add_argument("--review-temperature", type=float, default=0.0)
+    parser.add_argument("--review-max-tokens", type=int, default=700)
+
+    # Backwards-compatible flags retained so existing scripts do not break.
+    parser.add_argument("--fact-max-tokens", type=int, default=320)
+    parser.add_argument("--start-fact-pass", type=str2bool, default=True)
+    parser.add_argument("--endpoint-fact-pass", type=str2bool, default=True)
+    parser.add_argument("--route-plan-pass", type=str2bool, default=True)
+    parser.add_argument("--require-start-facts", type=str2bool, default=True)
+    parser.add_argument("--require-endpoint-facts", type=str2bool, default=True)
+    parser.add_argument("--require-route-plan", type=str2bool, default=True)
+    parser.add_argument("--self-check", type=str2bool, default=True)
+    parser.add_argument("--blind-grounding-audit", type=str2bool, default=True)
+    parser.add_argument("--route-audit", type=str2bool, default=True)
+    parser.add_argument("--spatial-audit", type=str2bool, default=True)
+    parser.add_argument("--drop-failed", type=str2bool, default=False)
+    parser.add_argument("--allow-incomplete", type=str2bool, default=False)
+    parser.add_argument("--save-failed-contact-sheets", type=str2bool, default=True)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.provider != "qwen":
+        raise ValueError("Only the OpenAI-compatible Qwen provider is implemented")
+    summary = run(args)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

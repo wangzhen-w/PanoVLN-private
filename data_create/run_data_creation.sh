@@ -30,10 +30,10 @@ TILE_WIDTH=384  # 从全景投影、交给 VLM 的透视图宽度。
 TILE_HEIGHT=288  # 从全景投影、交给 VLM 的透视图高度。
 SHEET_JPEG_QUALITY=90  # 发送给 VLM 的多视角拼图 JPEG 质量。
 
-BASE_URL="http://127.0.0.1:11426/v1"  # OpenAI-compatible VLM 服务地址。
-MODEL="Qwen3.5-27B"  # 服务中实际加载的模型名称。
+BASE_URL="http://127.0.0.1:10420/v1"  # OpenAI-compatible Qwen API pool 地址。
+MODEL="Qwen3.6-27B"  # 服务中实际加载的模型名称。
 API_KEY="test"  # 本地兼容接口的占位 key；按服务要求修改。
-NUM_WORKERS=8  # instruction agent 的并发轨迹数，也会影响 API 并发。
+NUM_WORKERS=40  # instruction 并发轨迹数；不要超过 Qwen API pool 的 MAX_CONCURRENCY。
 
 # 避免系统 HTTP 代理截获本机 Qwen API 请求。
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
@@ -121,6 +121,7 @@ generate_style() {
     --tile-width "${TILE_WIDTH}" --tile-height "${TILE_HEIGHT}" \
     --jpeg-quality "${SHEET_JPEG_QUALITY}" \
     --temperature 0.4 --max-tokens 420 \
+    --planner-temperature 0.0 --review-temperature 0.0 \
     --fact-max-tokens 320 --planner-max-tokens 1200 --review-max-tokens 1000 \
     --request-timeout 300 --retries 3 --stage-retries 2 \
     --blind-grounding-audit true --drop-failed true --allow-incomplete false
