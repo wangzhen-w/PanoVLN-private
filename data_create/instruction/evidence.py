@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 
 from .actions import (
     build_heading_by_frame,
+    major_turns,
     segment_action_summary,
     select_endpoint_frames,
     select_route_frames,
@@ -256,8 +257,39 @@ def segmented_route_enabled(actions: Sequence[int], args: Any) -> bool:
     if mode == "segmented":
         return True
     if mode == "auto":
-        return len(actions) >= int(getattr(args, "segmented_min_actions", 80))
+        return route_needs_segmented_evidence(
+            actions,
+            action_threshold=int(getattr(args, "segmented_min_actions", 80)),
+            max_waypoints=int(getattr(args, "max_waypoints", 14)),
+        )
     return False
+
+
+def route_needs_segmented_evidence(
+    actions: Sequence[int],
+    *,
+    action_threshold: int,
+    max_waypoints: int,
+) -> bool:
+    """Decide whether one overview sheet would over-compress a route.
+
+    Action count alone is a poor proxy for route difficulty because in-place
+    rotations and translated waypoints have very different visual impact.  In
+    auto mode we therefore segment either conventionally long routes or routes
+    that contain both substantial translation and several major heading
+    changes.  The latter identifies multi-space routes that need local evidence
+    even when their low-level action list happens to fall below the length
+    threshold.
+    """
+
+    normalized_actions = [int(action) for action in actions]
+    non_stop_actions = [action for action in normalized_actions if action != 0]
+    if len(normalized_actions) >= max(1, int(action_threshold)):
+        return True
+    translated_positions = 1 + sum(action == 1 for action in non_stop_actions)
+    route_choices = len(major_turns(non_stop_actions))
+    evidence_capacity = max(2, int(max_waypoints))
+    return translated_positions > 2 * evidence_capacity and route_choices >= 3
 
 
 def evidence_frame_fingerprint(
@@ -283,7 +315,12 @@ def evidence_frame_fingerprint(
     route_selected = select_route_frames(actions, len(frame_paths), max_waypoints)
     extra_segment_frames: List[int] = []
     use_segments = route_evidence_mode == "segmented" or (
-        route_evidence_mode == "auto" and len(actions) >= int(segmented_min_actions)
+        route_evidence_mode == "auto"
+        and route_needs_segmented_evidence(
+            actions,
+            action_threshold=int(segmented_min_actions),
+            max_waypoints=int(max_waypoints),
+        )
     )
     if use_segments:
         if int(segment_max_waypoints) <= 0:

@@ -10,6 +10,7 @@ import random
 import re
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -43,7 +44,7 @@ from .prompts import (
     segment_fact_prompt,
     segmented_merge_prompt,
 )
-from .qa import audit_passed, validate_instruction
+from .qa import audit_contract_complete, audit_passed, validate_instruction
 from .trajectory_metadata import enrich_trajectory_metadata
 
 
@@ -119,22 +120,212 @@ def images_for_llm(evidence: Any) -> List[Tuple[str, bytes]]:
 def images_for_endpoint(evidence: Any) -> List[Tuple[str, bytes]]:
     tiles = list(getattr(evidence, "final_view_tiles", []) or [])
     if tiles:
-        return tiles
+        return [("ENDPOINT approach evidence", evidence.endpoint_sheet), *tiles]
     return [("FINAL STOP evidence", evidence.final_sheet)]
 
 
-def selected_candidate_index(judge: Mapping[str, Any], candidate_options: Sequence[Mapping[str, Any]]) -> int:
+def images_for_independent_review(evidence: Any) -> List[Tuple[str, bytes]]:
+    """Return raw visual evidence without model-derived plans or facts."""
+
+    images: List[Tuple[str, bytes]] = [
+        ("START evidence", evidence.start_sheet),
+        ("ROUTE overview evidence", evidence.route_sheet),
+    ]
+    images.extend(
+        (f"ROUTE segment {segment.segment_id} evidence", segment.sheet)
+        for segment in getattr(evidence, "segment_sheets", []) or []
+    )
+    images.extend(
+        [("ENDPOINT approach evidence", evidence.endpoint_sheet)]
+    )
+    final_tiles = list(getattr(evidence, "final_view_tiles", []) or [])
+    if final_tiles:
+        images.extend(final_tiles)
+    else:
+        images.append(("FINAL STOP evidence", evidence.final_sheet))
+    return images
+
+
+def publishable_candidate_indices(
+    judge: Mapping[str, Any], candidate_options: Sequence[Mapping[str, Any]]
+) -> List[int]:
     valid = {int(option["index"]) for option in candidate_options}
-    raw = judge.get("selected_index")
-    if raw is None:
-        raw = judge.get("index")
-    try:
-        selected = int(raw)
-    except (TypeError, ValueError):
-        selected = min(valid) if valid else 0
-    if selected not in valid:
-        return min(valid) if valid else 0
-    return selected
+    assessments = judge.get("candidate_assessments") or []
+    publishable: List[int] = []
+    if isinstance(assessments, Sequence) and not isinstance(assessments, (str, bytes)):
+        for assessment in assessments:
+            if not isinstance(assessment, Mapping):
+                continue
+            raw_index = assessment.get("index")
+            if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                continue
+            index = raw_index
+            if (
+                index in valid
+                and assessment.get("route_sequence_matches") is True
+                and assessment.get("endpoint_matches") is True
+                and isinstance(assessment.get("critical_problems"), list)
+                and not assessment.get("critical_problems")
+            ):
+                publishable.append(index)
+    return sorted(set(publishable))
+
+
+def judge_contract_complete(
+    judge: Mapping[str, Any], candidate_options: Sequence[Mapping[str, Any]]
+) -> bool:
+    valid = {int(option["index"]) for option in candidate_options}
+    observed_route = judge.get("observed_route_sequence")
+    endpoint = judge.get("observed_endpoint")
+    if not isinstance(observed_route, list) or not observed_route or not all(
+        isinstance(item, str) and item.strip() for item in observed_route
+    ):
+        return False
+    if not isinstance(endpoint, Mapping):
+        return False
+    if not isinstance(endpoint.get("stop_location"), str) or not endpoint["stop_location"].strip():
+        return False
+    if not isinstance(endpoint.get("forward_anchor"), str) or not endpoint["forward_anchor"].strip():
+        return False
+    relation_value = endpoint.get("forward_anchor_relation")
+    if not isinstance(relation_value, str):
+        return False
+    relation = relation_value.strip().lower()
+    if relation not in {
+        "reached_at_final_camera",
+        "remains_ahead_after_final",
+        "uncertain",
+    }:
+        return False
+    assessments = judge.get("candidate_assessments")
+    if not isinstance(assessments, list) or len(assessments) != len(valid):
+        return False
+    assessed: set[int] = set()
+    for item in assessments:
+        if not isinstance(item, Mapping):
+            return False
+        raw_index = item.get("index")
+        if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+            return False
+        index = raw_index
+        if index not in valid or index in assessed:
+            return False
+        instruction_route = item.get("instruction_route_sequence")
+        if not isinstance(instruction_route, list) or not instruction_route or not all(
+            isinstance(route_item, str) and route_item.strip()
+            for route_item in instruction_route
+        ):
+            return False
+        if not isinstance(item.get("route_sequence_matches"), bool):
+            return False
+        if not isinstance(item.get("endpoint_matches"), bool):
+            return False
+        critical_problems = item.get("critical_problems")
+        if not isinstance(critical_problems, list) or not all(
+            isinstance(problem, str) for problem in critical_problems
+        ):
+            return False
+        assessed.add(index)
+    if assessed != valid or not isinstance(judge.get("needs_repair"), bool):
+        return False
+    repair_instruction = judge.get("repair_instruction")
+    if not isinstance(repair_instruction, str):
+        return False
+    publishable = publishable_candidate_indices(judge, candidate_options)
+    if not publishable:
+        return bool(judge.get("needs_repair")) and bool(repair_instruction.strip())
+    if judge.get("needs_repair") or repair_instruction.strip():
+        return False
+    selected = judge.get("selected_index")
+    if not isinstance(selected, int) or isinstance(selected, bool):
+        return False
+    return selected in publishable
+
+
+def selected_candidate_index(judge: Mapping[str, Any], candidate_options: Sequence[Mapping[str, Any]]) -> int:
+    publishable = publishable_candidate_indices(judge, candidate_options)
+    if not publishable:
+        return -1
+    selected = judge.get("selected_index")
+    if not isinstance(selected, int) or isinstance(selected, bool):
+        return -1
+    return selected if selected in publishable else -1
+
+
+def endpoint_relation_disagreement_diagnostic(
+    review: Mapping[str, Any], endpoint_facts: Mapping[str, Any]
+) -> bool:
+    """Flag a high-confidence relation disagreement for later corpus review.
+
+    This signal is deliberately diagnostic rather than a publication gate.
+    Free-language anchor descriptions do not carry simulator entity IDs, so a
+    lexical matcher cannot safely prove that two mentions denote the same
+    physical object. The blind visual audit remains the endpoint authority.
+    """
+
+    fact_relation = str(
+        (endpoint_facts or {}).get("forward_anchor_relation") or ""
+    ).strip().lower()
+    observed_endpoint = (review or {}).get("observed_endpoint") or {}
+    if not isinstance(observed_endpoint, Mapping):
+        return False
+    review_relation = str(
+        observed_endpoint.get("forward_anchor_relation") or ""
+    ).strip().lower()
+    fact_anchor = str((endpoint_facts or {}).get("forward_view_anchor") or "")
+    review_anchor = str(observed_endpoint.get("forward_anchor") or "")
+
+    def anchor_identity_terms(text: str) -> set[str]:
+        tokens = re.findall(r"[a-z]+", text.lower())
+        ignored = {
+            "a", "an", "the", "and", "ahead", "forward", "straight",
+            "visible", "view", "anchor", "area", "space", "object", "is",
+            "located", "leading", "facing", "toward", "towards", "into",
+            "at", "in", "on", "by", "near", "with", "of", "to",
+        }
+        tokens = [token for token in tokens if token not in ignored]
+        synonyms = {
+            "doors": "door",
+            "doorways": "doorway",
+            "entryway": "doorway",
+            "entryways": "doorway",
+            "entrance": "doorway",
+            "entrances": "doorway",
+            "opening": "doorway",
+            "openings": "doorway",
+            "threshold": "doorway",
+            "thresholds": "doorway",
+            "stairs": "stair",
+            "staircase": "stair",
+            "staircases": "stair",
+            "steps": "stair",
+            "windows": "window",
+            "corridor": "hallway",
+            "corridors": "hallway",
+            "hall": "hallway",
+            "halls": "hallway",
+            "sofas": "sofa",
+            "couch": "sofa",
+            "couches": "sofa",
+            "landings": "landing",
+            "railings": "railing",
+            "banister": "railing",
+            "banisters": "railing",
+        }
+        return {synonyms.get(token, token) for token in tokens}
+
+    fact_identity = anchor_identity_terms(fact_anchor)
+    review_identity = anchor_identity_terms(review_anchor)
+    # Exact multi-token identity is useful as a diagnostic. Generic one-word
+    # anchors such as "door" or "stairs" remain intentionally uncertain.
+    same_anchor = len(fact_identity) >= 2 and fact_identity == review_identity
+    definite = {"reached_at_final_camera", "remains_ahead_after_final"}
+    return (
+        same_anchor
+        and fact_relation in definite
+        and review_relation in definite
+        and fact_relation != review_relation
+    )
 
 
 def row_trajectory_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -142,92 +333,77 @@ def row_trajectory_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def normalize_endpoint_facts(facts: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize structure without rewriting model-produced language.
+
+    Endpoint facts are semantic evidence for downstream agents, not canonical
+    phrases. Visual verification decides whether a detail is supported; code
+    must not remove valid colors/materials or replace stair descriptions with a
+    preferred wording.
+    """
+
     normalized = dict(facts or {})
-    location_type = str(normalized.get("final_location_type") or "").lower()
-    phrase = str(normalized.get("safe_stop_phrase") or "").strip()
-    original_phrase = phrase
-    material_object_re = re.compile(
-        r"\b(?:white|black|gray|grey|dark|light|wooden|wood|metal|glass|tall|large|small|long)\s+"
-        r"(?=(?:shelving|shelves|shelf|display|cabinet|cabinets|unit|counter|desk)\b)",
-        flags=re.IGNORECASE,
-    )
-    while True:
-        revised = material_object_re.sub("", phrase)
-        if revised == phrase:
-            break
-        phrase = revised
-    phrase = re.sub(r"\s+", " ", phrase).strip()
-    if phrase and phrase != original_phrase:
-        normalized["safe_stop_phrase"] = phrase
-        avoid = list(normalized.get("avoid_endpoint_claims") or [])
-        if original_phrase not in avoid:
-            avoid.append(original_phrase)
-        normalized["avoid_endpoint_claims"] = avoid
-    primary_endpoint_text = " ".join(
-        [
-            phrase,
-            str(normalized.get("forward_view_anchor") or ""),
-            str(normalized.get("back_view_anchor") or ""),
-            " ".join(str(item) for item in normalized.get("nearby_stop_anchors") or []),
-        ]
-    ).lower()
-    all_endpoint_text = " ".join(
-        [
-            primary_endpoint_text,
-            str(normalized.get("left_view_anchor") or ""),
-            str(normalized.get("right_view_anchor") or ""),
-        ]
-    ).lower()
-    stair_context = bool(
-        re.search(
-            r"\b(?:stair|stairs|staircase|landing|railing|banister)\b",
-            primary_endpoint_text,
-        )
-    )
-    terminal_stair_claim = bool(
-        re.search(
-            r"\b(?:top|bottom|lower\s+level|lower\s+floor|ground\s+floor)\b",
-            all_endpoint_text,
-        )
-    )
-    if (location_type == "stair_landing" or (stair_context and not terminal_stair_claim)) and phrase:
-        phrase = re.sub(
-            r"\bat\s+the\s+(?:top|bottom)\s+of\s+the\s+stairs?\b",
-            "on the staircase landing",
-            phrase,
-            flags=re.IGNORECASE,
-        )
-        phrase = re.sub(
-            r"\bat\s+the\s+(?:top|bottom)\s+of\s+the\s+staircase\b",
-            "on the staircase landing",
-            phrase,
-            flags=re.IGNORECASE,
-        )
-        normalized["safe_stop_phrase"] = phrase
-        avoid = list(normalized.get("avoid_endpoint_claims") or [])
-        for item in (
-            "stopping at the top of the stairs",
-            "stopping at the bottom of the stairs",
-            "stopping at the bottom",
-            "stopping on the lower floor",
-            "stopping on the lower level",
-            "turning at the bottom before stopping",
-        ):
-            if item not in avoid:
-                avoid.append(item)
-        normalized["avoid_endpoint_claims"] = avoid
+    if not normalized.get("stop_location_anchor") and normalized.get("safe_stop_phrase"):
+        # Read old cached responses defensively; current prompts no longer emit
+        # a publishable phrase from the endpoint stage.
+        normalized["stop_location_anchor"] = normalized["safe_stop_phrase"]
+    normalized.pop("safe_stop_phrase", None)
     return normalized
 
 
-def use_segmented_route(evidence: Any, args: argparse.Namespace, actions: Sequence[int]) -> bool:
-    if not getattr(evidence, "segment_sheets", None):
-        return False
-    mode = str(getattr(args, "route_evidence_mode", "auto"))
-    if mode == "segmented":
-        return True
-    if mode == "auto":
-        return len(actions) >= int(getattr(args, "segmented_min_actions", 80))
-    return False
+def endpoint_facts_complete(facts: Mapping[str, Any]) -> bool:
+    """Return whether endpoint facts satisfy the minimum downstream contract."""
+
+    location_type = str((facts or {}).get("final_location_type") or "").strip().lower()
+    stop_location = str((facts or {}).get("stop_location_anchor") or "").strip()
+    forward_anchor = str((facts or {}).get("forward_view_anchor") or "").strip()
+    forward_relation = str((facts or {}).get("forward_anchor_relation") or "").strip().lower()
+    complete = bool(
+        location_type
+        in {
+            "inside_room",
+            "threshold_or_doorway",
+            "stair_landing",
+            "hallway_or_corridor",
+            "near_object",
+            "outdoor_or_balcony",
+            "uncertain",
+        }
+        and stop_location
+        and forward_anchor
+        and forward_relation
+        in {"reached_at_final_camera", "remains_ahead_after_final", "uncertain"}
+    )
+    return complete
+
+
+def normalize_segment_facts(
+    facts: Mapping[str, Any],
+    *,
+    segment_id: int,
+    segment_count: int,
+    endpoint_facts: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Apply simulator-known segment identity instead of trusting model output."""
+
+    normalized = dict(facts or {})
+    is_final = int(segment_id) == int(segment_count)
+    normalized["segment_id"] = int(segment_id)
+    normalized["is_final_segment"] = is_final
+    if is_final:
+        if not str(normalized.get("stop_anchor_if_final") or "").strip():
+            normalized["stop_anchor_if_final"] = str(
+                (endpoint_facts or {}).get("stop_location_anchor") or ""
+            ).strip()
+    else:
+        normalized["stop_anchor_if_final"] = ""
+    return normalized
+
+
+def use_segmented_route(evidence: Any) -> bool:
+    # Evidence construction is the single authority for this decision.  This
+    # prevents the renderer and runner from silently applying different route
+    # complexity criteria.
+    return bool(getattr(evidence, "segment_sheets", None))
 
 
 def call_endpoint_facts(
@@ -281,6 +457,47 @@ def call_endpoint_fact_audit(
     return normalize_endpoint_facts(audited_facts), raw, audit
 
 
+def verify_endpoint_facts(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    evidence: Any,
+    action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
+    args: argparse.Namespace,
+    raw_responses: Dict[str, str],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], bool]:
+    """Audit endpoint facts and verify a correction before propagation.
+
+    A failed audit may propose corrected facts, but those facts are still model
+    output. They receive one fresh verification pass and are never consumed by
+    planning while the latest audit is failed or structurally incomplete. If
+    verification still fails, derived endpoint facts are discarded and later
+    agents must ground the endpoint directly from raw visual evidence.
+    """
+
+    current = normalize_endpoint_facts(endpoint_facts)
+    history: List[Dict[str, Any]] = []
+    for attempt in range(1, 3):
+        current, raw, audit = call_endpoint_fact_audit(
+            client,
+            row=row,
+            evidence=evidence,
+            action_summary=action_summary,
+            endpoint_facts=current,
+            args=args,
+        )
+        raw_responses[f"endpoint_fact_audit_{attempt}"] = raw
+        complete = endpoint_facts_complete(current)
+        record = dict(audit or {})
+        record["facts_complete"] = complete
+        record["verification_attempt"] = attempt
+        history.append(record)
+        if bool(audit.get("passed")) and complete:
+            return current, history, True
+    return {}, history, False
+
+
 def call_plan_write(
     client: QwenClient,
     *,
@@ -328,13 +545,19 @@ def call_segment_facts(
         segment_count=segment_count,
         segment_frames=segment.frames,
     )
-    return client.chat_json(
+    facts, raw = client.chat_json(
         system=SYSTEM_JSON,
         prompt=prompt,
         images=[(f"SEGMENT {segment.segment_id} evidence", segment.sheet)],
         temperature=args.planner_temperature,
         max_tokens=args.segment_fact_max_tokens,
     )
+    return normalize_segment_facts(
+        facts,
+        segment_id=segment.segment_id,
+        segment_count=segment_count,
+        endpoint_facts=endpoint_facts,
+    ), raw
 
 
 def call_segmented_merge(
@@ -371,7 +594,6 @@ def call_candidate_judge(
     row: Mapping[str, Any],
     evidence: Any,
     action_summary: Mapping[str, Any],
-    endpoint_facts: Mapping[str, Any],
     candidates: Sequence[Mapping[str, Any]],
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], str]:
@@ -380,13 +602,12 @@ def call_candidate_judge(
         profile=args.instruction_profile,
         action_summary=action_summary,
         trajectory_metadata=row_trajectory_metadata(row),
-        endpoint_facts=endpoint_facts,
         candidates=candidates,
     )
     return client.chat_json(
         system=SYSTEM_JSON,
         prompt=prompt,
-        images=images_for_llm(evidence),
+        images=images_for_independent_review(evidence),
         temperature=args.review_temperature,
         max_tokens=args.review_max_tokens,
     )
@@ -398,8 +619,6 @@ def call_audit(
     row: Mapping[str, Any],
     evidence: Any,
     action_summary: Mapping[str, Any],
-    endpoint_facts: Mapping[str, Any],
-    route_plan: Mapping[str, Any],
     instruction: str,
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], str]:
@@ -408,14 +627,12 @@ def call_audit(
         profile=args.instruction_profile,
         action_summary=action_summary,
         trajectory_metadata=row_trajectory_metadata(row),
-        endpoint_facts=endpoint_facts,
-        route_plan=route_plan,
         instruction=instruction,
     )
     return client.chat_json(
         system=SYSTEM_JSON,
         prompt=prompt,
-        images=images_for_llm(evidence),
+        images=images_for_independent_review(evidence),
         temperature=args.review_temperature,
         max_tokens=args.review_max_tokens,
     )
@@ -481,15 +698,16 @@ def generate_one(
             action_summary=action_summary,
             args=args,
         )
-        endpoint_fact_audit: Dict[str, Any] = {}
-        endpoint_facts, raw_responses["endpoint_fact_audit"], endpoint_fact_audit = call_endpoint_fact_audit(
+        endpoint_facts, endpoint_fact_audit_history, endpoint_facts_verified = verify_endpoint_facts(
             client,
             row=row,
             evidence=evidence,
             action_summary=action_summary,
             endpoint_facts=endpoint_facts,
             args=args,
+            raw_responses=raw_responses,
         )
+        endpoint_fact_audit = endpoint_fact_audit_history[-1]
         plan: Dict[str, Any] = {}
         segment_facts: List[Dict[str, Any]] = []
         instruction = ""
@@ -497,7 +715,7 @@ def generate_one(
         audit: Dict[str, Any] = {}
         for stage_attempt in range(max(1, args.stage_retries + 1)):
             candidate_options: List[Dict[str, Any]] = []
-            if use_segmented_route(evidence, args, actions):
+            if use_segmented_route(evidence):
                 segment_facts = []
                 for segment in evidence.segment_sheets:
                     facts, raw = call_segment_facts(
@@ -583,34 +801,57 @@ def generate_one(
                         }
                     )
             judge: Dict[str, Any] = {}
+            judge_contract_failed = False
+            judge_has_publishable_candidate = True
             selected_option = candidate_options[0]
             if len(candidate_options) > 1:
                 judge_candidates = [
                     {
                         "index": option["index"],
                         "instruction": option["instruction"],
-                        "stop_condition": (option["plan"] or {}).get("stop_condition"),
-                        "route_steps": (option["plan"] or {}).get("route_steps"),
-                        "segment_facts": (option["plan"] or {}).get("segment_facts"),
-                        "covered_route_events": (option["plan"] or {}).get("covered_route_events"),
-                        "covered_decision_boundaries": (option["plan"] or {}).get("covered_decision_boundaries"),
-                        "omitted_route_events": (option["plan"] or {}).get("omitted_route_events"),
-                        "neutralized_side_claims": (option["plan"] or {}).get("neutralized_side_claims"),
-                        "uncertain_or_avoid": (option["plan"] or {}).get("uncertain_or_avoid"),
-                        "deterministic_qa": option["deterministic_qa"],
                     }
                     for option in candidate_options
                 ]
+                random.Random(
+                    f"{args.seed}:{row['episode_id']}:{stage_attempt}"
+                ).shuffle(judge_candidates)
                 judge, raw_responses["candidate_judge"] = call_candidate_judge(
                     client,
                     row=row,
                     evidence=evidence,
                     action_summary=action_summary,
-                    endpoint_facts=endpoint_facts,
                     candidates=judge_candidates,
                     args=args,
                 )
+                if not judge_contract_complete(judge, candidate_options):
+                    judge, raw_responses["candidate_judge_contract_retry"] = call_candidate_judge(
+                        client,
+                        row=row,
+                        evidence=evidence,
+                        action_summary=action_summary,
+                        candidates=judge_candidates,
+                        args=args,
+                    )
+                if not judge_contract_complete(judge, candidate_options):
+                    # A malformed judge cannot authorize publication or supply
+                    # a trusted repair. Leave a truthy diagnostic; the empty
+                    # instruction below retries the stage and eventually fails
+                    # safely without entering the generic repair path.
+                    judge = {
+                        "contract_complete": False,
+                        "contract_error": "candidate_judge_schema_incomplete_after_retry",
+                    }
+                    judge_contract_failed = True
+                else:
+                    judge["contract_complete"] = True
+                judge_relation_disagreement = endpoint_relation_disagreement_diagnostic(
+                    judge, endpoint_facts
+                )
+                judge["endpoint_relation_disagreement_diagnostic"] = (
+                    judge_relation_disagreement
+                )
                 selected_index = selected_candidate_index(judge, candidate_options)
+                judge_has_publishable_candidate = selected_index >= 0
                 selected_option = next(
                     (option for option in candidate_options if int(option["index"]) == selected_index),
                     candidate_options[0],
@@ -623,6 +864,8 @@ def generate_one(
                 str(
                     judge.get("repair_instruction")
                     if judge.get("needs_repair") and judge.get("repair_instruction")
+                    else ""
+                    if judge and not judge_has_publishable_candidate
                     else selected_option["instruction"]
                 )
             )
@@ -634,7 +877,7 @@ def generate_one(
                 trajectory_metadata=trajectory_metadata,
                 route_plan=plan,
             )
-            if not deterministic["passed"]:
+            if not deterministic["passed"] and not judge_contract_failed:
                 repair, raw_responses[f"repair_gate_{stage_attempt}"] = call_repair(
                     client,
                     row=row,
@@ -665,50 +908,56 @@ def generate_one(
                 row=row,
                 evidence=evidence,
                 action_summary=action_summary,
-                endpoint_facts=endpoint_facts,
-                route_plan=plan,
                 instruction=instruction,
                 args=args,
+            )
+            if not audit_contract_complete(audit):
+                audit, raw_responses["audit_contract_retry"] = call_audit(
+                    client,
+                    row=row,
+                    evidence=evidence,
+                    action_summary=action_summary,
+                    instruction=instruction,
+                    args=args,
+                )
+            audit_relation_disagreement = endpoint_relation_disagreement_diagnostic(
+                audit, endpoint_facts
+            )
+            audit["endpoint_relation_disagreement_diagnostic"] = (
+                audit_relation_disagreement
             )
             if not audit_passed(audit):
                 corrected = normalize_instruction(str(audit.get("corrected_instruction") or ""))
                 if corrected:
-                    repair_issues = {"audit": audit, "deterministic": deterministic}
-                    repair, raw_responses["repair_audit"] = call_repair(
-                        client,
-                        row=row,
-                        evidence=evidence,
-                        action_summary=action_summary,
-                        endpoint_facts=endpoint_facts,
+                    # The blind auditor saw the raw evidence without any
+                    # model-derived endpoint facts or route plan.  Keep that
+                    # independence by validating its correction directly
+                    # instead of passing it through the correlated planner.
+                    instruction = corrected
+                    plan["final_instruction"] = instruction
+                    deterministic = validate_instruction(
+                        instruction,
+                        profile=args.instruction_profile,
+                        actions=actions,
+                        trajectory_metadata=trajectory_metadata,
                         route_plan=plan,
-                        failed_instruction=instruction,
-                        issues=repair_issues,
-                        args=args,
                     )
-                    instruction = normalize_instruction(
-                        str(repair.get("final_instruction") or corrected)
-                    )
-                deterministic = validate_instruction(
-                    instruction,
-                    profile=args.instruction_profile,
-                    actions=actions,
-                    trajectory_metadata=trajectory_metadata,
-                    route_plan=plan,
-                )
-                if deterministic["passed"]:
-                    audit, raw_responses["audit_2"] = call_audit(
-                        client,
-                        row=row,
-                        evidence=evidence,
-                        action_summary=action_summary,
-                        endpoint_facts=endpoint_facts,
-                        route_plan=plan,
-                        instruction=instruction,
-                        args=args,
-                    )
+                    if deterministic["passed"]:
+                        audit, raw_responses["audit_2"] = call_audit(
+                            client,
+                            row=row,
+                            evidence=evidence,
+                            action_summary=action_summary,
+                            instruction=instruction,
+                            args=args,
+                        )
+                        audit["endpoint_relation_disagreement_diagnostic"] = (
+                            endpoint_relation_disagreement_diagnostic(audit, endpoint_facts)
+                        )
 
         passed = deterministic["passed"] and (
-            not args.blind_grounding_audit or audit_passed(audit)
+            not args.blind_grounding_audit
+            or audit_passed(audit)
         )
         candidate = {
             "episode_id": row["episode_id"],
@@ -718,6 +967,7 @@ def generate_one(
             "source_text_blind": args.mode == "generate",
             "old_instruction": "",
             "instruction_profile": args.instruction_profile,
+            "completed_at_unix": time.time(),
             "pipeline_fingerprint": pipeline_fingerprint,
             "input_fingerprint": input_fingerprint,
             "actions": actions,
@@ -744,14 +994,16 @@ def generate_one(
             },
             "route_plan": plan,
             "endpoint_facts": endpoint_facts,
+            "endpoint_facts_verified": endpoint_facts_verified,
             "endpoint_fact_audit": endpoint_fact_audit,
+            "endpoint_fact_audit_history": endpoint_fact_audit_history,
             "segment_facts": segment_facts,
             "candidate_options": [
                 {
                     "index": option["index"],
                     "instruction": option["instruction"],
                     "deterministic_qa": option["deterministic_qa"],
-                    "stop_condition": (option["plan"] or {}).get("stop_condition"),
+                    "endpoint_fact_used": (option["plan"] or {}).get("endpoint_fact_used"),
                 }
                 for option in candidate_options
             ],
@@ -777,11 +1029,16 @@ def generate_one(
             "source_text_blind": args.mode == "generate",
             "old_instruction": "",
             "instruction_profile": args.instruction_profile,
+            "completed_at_unix": time.time(),
             "pipeline_fingerprint": pipeline_fingerprint,
             "input_fingerprint": input_fingerprint,
             "actions": row.get("actions"),
             "instruction": "",
-            "error": {"type": type(error).__name__, "message": str(error)},
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": traceback.format_exc(),
+            },
             "elapsed_seconds": round(time.time() - started, 3),
         }
 

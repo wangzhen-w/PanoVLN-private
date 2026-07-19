@@ -88,12 +88,15 @@ trajectory metadata 和 panorama-derived evidence sheets。因此它与 `data_cr
 
 正式 rewrite 默认使用 `ROUTE_EVIDENCE_MODE="auto"`：短路线仍用 START / ROUTE /
 ENDPOINT 三张 overview evidence sheet，同时额外生成 forward-first FINAL-only
-endpoint evidence。系统会把 FINAL observation 拆成带文本标签的 FORWARD /
-FORWARD-DOWN / LEFT / RIGHT / BACK 单视角图，先抽取 stop 位置类型、正前方 anchor、
-侧向/身后 anchor 和必须避免的终点/朝向说法，再做一次 endpoint fact audit 检查
-forward/side-view 是否串列、safe stop 是否被侧面门窗或物体替代；80 action 及以上的长路线再把 route
-waypoints 拆成多个局部分段，先生成 grounded route facts，再结合 endpoint facts
-合并成一条自然 instruction。每个分段同时传入真实 action span 摘要，标出大转向、
+endpoint evidence。endpoint agent 会读取最后几个平移位置，并把 FINAL observation 拆成带文本标签的 FORWARD /
+FORWARD-DOWN / LEFT / RIGHT / BACK 单视角图，先抽取 stop 位置类型、当前站位 anchor、
+正前方 anchor 是否已到达、侧向/身后 anchor 和必须避免的终点/朝向说法，再做一次 endpoint fact audit 检查
+forward/side-view 是否串列、前方景物是在 FINAL 相机处还是仍位于前方；endpoint agent 只输出语义事实，
+不生成需要 writer 复制的固定 stop phrase。audit 改写的 facts
+必须再验证后才能进入 writer，持续不一致时丢弃派生 facts 并退回原始视觉证据。80 action 及以上的长路线，以及低于阈值但平移多、
+包含多个大转向的复杂路线，会把 route waypoints 拆成多个局部分段，先生成 grounded route facts，再结合 endpoint facts
+交给 writer 自由组织成一条自然 instruction。writer 不规定固定开头、句数、句法、动词或
+`stop/wait` 字面词，只要求路线可执行、视觉事实正确和终点清楚。每个分段同时传入真实 action span 摘要，标出大转向、
 小平移和真实 forward 运动，降低把视角旋转误写成空间移动的概率。ScaleVLN JSONL
 中已有的 `trajectory_metadata.reference_path` 会自动派生 `vertical_motion`，
 用于约束上楼/下楼方向；这仍然不使用原 instruction。
@@ -103,7 +106,11 @@ ScaleVLN 保存的全景已经以 agent 当前朝向为中心，正式脚本不�
 否则 FINAL FORWARD 会被转到侧面视图，终点 anchor 会系统性漂移。
 
 正式脚本还会为每条路线生成两个候选 instruction，再由独立 visual candidate judge
-基于同一视觉证据和审后的 endpoint facts 选择更忠实、可执行、终点更准的一版。
+直接读取原始视觉、actions 和几何约束，选择更忠实、可执行、终点更准的一版。judge
+不会接收 writer 使用的 endpoint facts 或 route plan，避免共享错误事实导致集体误判。
+judge 与最终 audit 都要显式比较原始证据空间序列和 instruction 表达的空间序列，并通过
+五张独立 FINAL 透视图判断正前方 anchor 是否已在相机处到达。路线和 endpoint 都匹配、
+且独立阶段不存在明确的 reached/ahead 冲突时才允许发布。
 这个机制用于降低单次生成偶然回归，避免依赖针对少数 canary episode 的物体级硬规则。
 
 ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.glb`
@@ -122,7 +129,7 @@ ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.gl
 ```text
 ScaleVLN trajectory/actions + panoramas
   -> shared source-text-blind evidence / FINAL endpoint facts / segmented-facts generation
-  -> endpoint-grounded multi-candidate plan-write / visual judge / audit-repair
+  -> endpoint-assisted multi-candidate writing / raw-evidence visual judge / blind audit
   -> 要求全部 episode 通过质量门
   -> 原子发布 REWRITE_OUTPUT
 ```
@@ -131,17 +138,17 @@ ScaleVLN trajectory/actions + panoramas
 pair manifest。脚本使用 `--drop-failed false --allow-incomplete false`：只要还有一条
 失败，就保留 progress 供恢复并拒绝发布不完整 rewrite。
 
-共享系统包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：终点 stop anchor 必须从
-ENDPOINT evidence 中保留到最终句子；楼梯上/下方向优先使用 trajectory metadata；
+共享系统包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：终点站位语义必须从
+ENDPOINT evidence 保留到最终 instruction，但可自由改写；楼梯上/下方向优先使用 trajectory metadata；
 actions 会生成 major-turn、dead-reckoning 复杂度和分段 action-span 提示，避免长路线
 被压缩成直线路线，也避免把原地转向误写成穿过房间。这些门不会利用原 instruction。
 
 每次修改 rewrite 的 prompt、视觉证据或 QA 逻辑后，必须在同一批 episode 上保留
-previous/current 对比，而不是只看当前版本。最小人工验收需要覆盖短路线、80+
-action 长路线、楼梯/landing、跨房间/走廊转换和复杂开放空间；每条都同时展示
+previous/current 对比，而不是只看当前版本。最小人工验收需要覆盖短路线、长路线、
+低于阈值但含多个转向的复杂路线、楼梯/landing、跨房间/走廊转换和复杂开放空间；每条都同时展示
 原始 ScaleVLN、历史 `/workspace/data1/dataset/PanoVLN/sub_dataset/PanoVLN.jsonl`
-rewrite、上一版系统输出和当前输出。评审至少包含 4 个独立视角：路线执行性、
-视觉 grounding、长路线/楼梯/空间转换、回归与数据集质量。只有多数评审确认当前
+rewrite、上一版系统输出和当前输出。评审至少包含路线执行性、视觉 grounding、
+长路线/楼梯/空间转换、语言自然度、回归与数据集质量 5 个独立视角。只有多数评审确认当前
 版本在关键路线信息、grounding 和终点表达上明确提升，且短路线未退化，才将改动
 作为默认 rewrite 流程。
 

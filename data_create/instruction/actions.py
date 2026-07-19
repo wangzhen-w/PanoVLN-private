@@ -356,7 +356,7 @@ def navigation_cues(actions: Sequence[int]) -> List[Dict[str, Any]]:
                         round((left if dominant == "left" else right) * TURN_DEGREES)
                     ),
                     "use": (
-                        "Use endpoint visual evidence for the stop phrase; do not turn "
+                        "Use endpoint visual evidence for the destination semantics; do not turn "
                         "a side/back view into the destination."
                     ),
                 }

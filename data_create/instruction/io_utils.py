@@ -6,6 +6,7 @@ import argparse
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -105,23 +106,63 @@ def atomic_write_jsonl(path: str, rows: Iterable[Mapping[str, Any]]) -> int:
 
 def append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size:
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            needs_newline = handle.read(1) != b"\n"
+        if needs_newline:
+            # Isolate a truncated final journal record before appending. The
+            # reader will ignore that final malformed line and retain all
+            # complete records written afterward.
+            with path.open("ab") as handle:
+                handle.write(b"\n")
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def read_jsonl_mapping(paths: Sequence[Path]) -> Dict[str, Dict[str, Any]]:
     rows: Dict[str, Dict[str, Any]] = {}
-    for path in paths:
+    versions: Dict[str, tuple[int, int, int, int]] = {}
+    for path_order, path in enumerate(paths):
         if not path.exists():
             continue
+        file_version = path.stat().st_mtime_ns
         with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            lines = handle.readlines()
+            for line_number, line in enumerate(lines, start=1):
                 if not line.strip():
                     continue
-                row = json.loads(line)
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    # Journals are resumable progress, not published data. A
+                    # process may be interrupted midway through an append; skip
+                    # only that corrupt record and preserve later valid work.
+                    continue
                 if not isinstance(row, dict) or "episode_id" not in row:
                     continue
-                rows[episode_key(row)] = row
+                key = episode_key(row)
+                try:
+                    explicit_time = float(row["completed_at_unix"])
+                    if not math.isfinite(explicit_time):
+                        raise ValueError("non-finite completion timestamp")
+                    record_version = int(explicit_time * 1_000_000_000)
+                    has_explicit_timestamp = 1
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    record_version = file_version
+                    has_explicit_timestamp = 0
+                # New-format records with their own completion timestamp must
+                # always outrank legacy rows. A journal file's mtime changes on
+                # every append and therefore cannot date an individual old row.
+                version = (
+                    has_explicit_timestamp,
+                    record_version,
+                    path_order,
+                    line_number,
+                )
+                if version >= versions.get(key, (-1, -1, -1, -1)):
+                    rows[key] = row
+                    versions[key] = version
     return rows
 
 
@@ -183,9 +224,17 @@ def build_pipeline_fingerprint(args: argparse.Namespace) -> str:
         "temperature": args.temperature,
         "planner_temperature": args.planner_temperature,
         "review_temperature": args.review_temperature,
+        "max_tokens": args.max_tokens,
+        "fact_max_tokens": getattr(args, "fact_max_tokens", 320),
+        "planner_max_tokens": args.planner_max_tokens,
+        "review_max_tokens": args.review_max_tokens,
+        "stage_retries": args.stage_retries,
+        "disable_thinking": args.disable_thinking,
+        "blind_grounding_audit": args.blind_grounding_audit,
+        "seed": args.seed,
         "candidate_count": getattr(args, "candidate_count", 1),
         "candidate_temperature": getattr(args, "candidate_temperature", 0.4),
-        "prompt_family": "segmented-evidence-labeled-final-views-endpoint-aware-boundaries-side-neutral-final-face-v5",
+        "prompt_family": "semantic-facts-free-language-independent-visual-review-v8",
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

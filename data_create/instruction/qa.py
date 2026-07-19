@@ -9,9 +9,11 @@ from .actions import major_turns
 
 
 DATA_ARTIFACT_RE = re.compile(
-    r"\b(?:image|images|panorama|panoramas|contact sheet|row label|"
-    r"route sheet|endpoint sheet|start sheet|action sequence|action id|dataset)\b|"
-    r"\bframe[_\s-]?\d+\b|\b(?:image|video|panorama|route|endpoint|start)\s+frames?\b",
+    r"\b(?:contact sheet|row label|route sheet|endpoint sheet|start sheet|"
+    r"action sequence|action id|dataset)\b|\bframe[_\s-]?\d+\b|"
+    r"\b(?:shown|visible|seen|labeled|provided)\s+(?:in|on)\s+(?:the\s+)?"
+    r"(?:image|frame|sheet|panorama)\b|"
+    r"\b(?:image|video|panorama|route|endpoint|start)\s+frames?\b",
     re.IGNORECASE,
 )
 STOP_RE = re.compile(
@@ -219,40 +221,12 @@ def final_stop_sentence(text: str) -> str:
     return sentences[-1]
 
 
-def final_endpoint_context(text: str) -> str:
-    """Return the final stop sentence plus its immediate approach sentence.
-
-    Some grounding errors are expressed just before the stop command, e.g.
-    "turn right at the bottom. Stop near the shutters."  The explicit stop
-    clause alone is safe, but the preceding approach clause still changes where
-    a follower would stop.  This helper keeps deterministic checks focused on
-    the endpoint without scanning the whole route.
-    """
-
-    sentences = [part.strip() for part in re.split(r"[.!?]+", str(text or "")) if part.strip()]
-    if not sentences:
-        return ""
-    stop_index = None
-    for index in range(len(sentences) - 1, -1, -1):
-        if STOP_RE.search(sentences[index]):
-            stop_index = index
-            break
-    if stop_index is None:
-        stop_index = len(sentences) - 1
-    start = max(0, stop_index - 1)
-    return ". ".join(sentences[start : stop_index + 1])
-
-
-def safe_stop_key_terms(endpoint_facts: Mapping[str, Any]) -> set[str]:
+def endpoint_key_terms(endpoint_facts: Mapping[str, Any]) -> set[str]:
     text = " ".join(
-        [str((endpoint_facts or {}).get("safe_stop_phrase") or "")]
+        [str((endpoint_facts or {}).get("stop_location_anchor") or "")]
         + [str(item) for item in (endpoint_facts or {}).get("nearby_stop_anchors") or []]
     )
     return normalized_content_terms(text)
-
-
-def safe_stop_phrase_terms(endpoint_facts: Mapping[str, Any]) -> set[str]:
-    return normalized_content_terms(str((endpoint_facts or {}).get("safe_stop_phrase") or ""))
 
 
 def has_final_turn_to_face_nonendpoint(text: str, endpoint_facts: Mapping[str, Any]) -> bool:
@@ -262,9 +236,9 @@ def has_final_turn_to_face_nonendpoint(text: str, endpoint_facts: Mapping[str, A
     matches = list(FINAL_TURN_TO_FACE_RE.finditer(context))
     if not matches:
         return False
-    safe_terms = safe_stop_key_terms(endpoint_facts)
+    safe_terms = endpoint_key_terms(endpoint_facts)
     if not safe_terms:
-        return True
+        return False
     match = matches[-1]
     tail = context[match.end() :]
     stop_match = STOP_RE.search(tail)
@@ -314,10 +288,16 @@ def route_event_coverage_stats(route_plan: Mapping[str, Any] | None) -> Dict[str
 
 
 def has_forbidden_terminal_stair_claim(text: str, endpoint_facts: Mapping[str, Any]) -> bool:
-    """Check only the specific top/bottom/lower-floor claims facts reject."""
+    """Check explicit stop wording, not earlier approach descriptions.
+
+    A route may legitimately pass the bottom of a staircase and continue to a
+    door or another room.  Only text governed by the final stop verb is treated
+    as an endpoint claim here; visual auditing remains responsible for broader
+    semantic grounding.
+    """
 
     avoid_items = [str(item).lower() for item in (endpoint_facts or {}).get("avoid_endpoint_claims") or []]
-    context = final_endpoint_context(text).lower()
+    context = final_stop_clause(text).lower()
     forbidden_patterns: List[str] = []
     for item in avoid_items:
         if re.search(r"\btop\b", item):
@@ -333,33 +313,8 @@ def has_forbidden_terminal_stair_claim(text: str, endpoint_facts: Mapping[str, A
     return any(re.search(pattern, context) for pattern in set(forbidden_patterns))
 
 
-def safe_stop_phrase_preserved(final_clause: str, endpoint_facts: Mapping[str, Any]) -> bool:
-    phrase = str((endpoint_facts or {}).get("safe_stop_phrase") or "")
-    if not phrase.strip():
-        return True
-    final_lower = str(final_clause or "").lower()
-    phrase_lower = phrase.lower()
-    content_terms = normalized_content_terms(phrase)
-    if content_terms and (content_terms & normalized_content_terms(final_clause)):
-        return True
-    anchors = [
-        term
-        for term in STOP_ANCHOR_TERMS
-        if anchor_present(term, phrase_lower)
-    ]
-    if anchors and any(anchor_present(term, final_lower) for term in anchors):
-        return True
-    phrase_tokens = {
-        token
-        for token in re.findall(r"[a-z]+", phrase_lower)
-        if len(token) >= 4 and token not in {"near", "beside", "inside", "front", "with"}
-    }
-    final_tokens = set(re.findall(r"[a-z]+", final_lower))
-    return bool(phrase_tokens & final_tokens)
-
-
 def has_uncertain_endpoint_modifier(text: str, endpoint_facts: Mapping[str, Any]) -> bool:
-    """Detect risky final material/color/size claims that safe_stop avoided."""
+    """Detect endpoint modifiers absent from the verified endpoint facts."""
 
     context = final_stop_sentence(text)
     if not STOP_RE.search(context):
@@ -369,7 +324,7 @@ def has_uncertain_endpoint_modifier(text: str, endpoint_facts: Mapping[str, Any]
         return False
     endpoint_text = " ".join(
         [
-            str((endpoint_facts or {}).get("safe_stop_phrase") or ""),
+            str((endpoint_facts or {}).get("stop_location_anchor") or ""),
             str((endpoint_facts or {}).get("forward_view_anchor") or ""),
             " ".join(str(item) for item in (endpoint_facts or {}).get("nearby_stop_anchors") or []),
         ]
@@ -377,7 +332,7 @@ def has_uncertain_endpoint_modifier(text: str, endpoint_facts: Mapping[str, Any]
     for phrase in matches:
         # If the endpoint extractor itself saw this phrase in the forward or
         # nearby endpoint anchors, it is a grounding risk but not a deterministic
-        # failure.  The prompts still prefer neutral stop phrases when possible.
+        # failure. Visual review remains responsible for the actual grounding.
         if phrase not in endpoint_text:
             return True
     return False
@@ -396,26 +351,26 @@ def validate_instruction(
     text = str(instruction or "").strip()
     lowered = text.lower()
     words = word_count(text)
-    if words < 12:
-        failures.append("instruction_too_short")
+    if not text or not re.search(r"[A-Za-z]", text):
+        failures.append("instruction_empty_or_malformed")
+    elif words < 12:
+        warnings.append("instruction_may_be_too_short")
     if profile == "concise" and words > 115:
-        failures.append("concise_instruction_too_long")
+        warnings.append("concise_instruction_may_be_too_long")
     if profile == "dense" and words > 180:
-        failures.append("dense_instruction_too_long")
+        warnings.append("dense_instruction_may_be_too_long")
     if DATA_ARTIFACT_RE.search(text):
         failures.append("mentions_data_artifacts")
     if DEGREE_RE.search(text):
-        failures.append("mentions_numeric_degrees")
+        warnings.append("mentions_numeric_degrees")
     if ACTION_LIST_RE.search(text):
         failures.append("mentions_action_tokens")
     if CONFLICTING_FINAL_FACING_RE.search(text):
-        failures.append("conflicting_final_facing_chain")
+        warnings.append("possible_conflicting_final_facing_chain")
     if FACE_BACK_TOWARD_RE.search(text):
-        failures.append("unsupported_face_back_toward")
+        warnings.append("possible_face_back_toward")
     if has_conflicting_turn_face_stop_near(text):
-        failures.append("conflicting_final_face_then_stop_anchor")
-    if not STOP_RE.search(text):
-        failures.append("missing_explicit_stop_or_endpoint_cue")
+        warnings.append("possible_conflicting_final_face_then_stop_anchor")
     if re.search(r"\b(go|walk|continue|proceed)\s+there\b", text, re.IGNORECASE):
         warnings.append("uses_there_without_anchor")
 
@@ -423,10 +378,11 @@ def validate_instruction(
     if len(actions) > 80 and words < 28:
         anchors = anchor_count(lowered)
         transitions = transition_count(lowered)
-        if words < 20 or (anchors < 2 and transitions < 3):
-            failures.append("long_route_underdescribed")
-        else:
-            warnings.append("long_route_concise")
+        warnings.append(
+            "long_route_lexically_concise"
+            if words < 20 or (anchors < 2 and transitions < 3)
+            else "long_route_concise"
+        )
     if len(turns) >= 4 and sentence_count(text) < 2 and words < 35:
         warnings.append("complex_route_may_be_overcompressed")
     if len(actions) > 80 and route_plan:
@@ -456,45 +412,77 @@ def validate_instruction(
         failures.append("vertical_motion_conflict_ascending")
     if vertical == "descending" and up_stairs:
         failures.append("vertical_motion_conflict_descending")
-    stop_condition = str((route_plan or {}).get("stop_condition") or "").lower()
-    if stop_condition:
-        anchors = sorted(
-            term
-            for term in STOP_ANCHOR_TERMS
-            if re.search(rf"\b{re.escape(term)}\b", stop_condition)
-        )
-        if anchors:
-            missing = [
-                term
-                for term in anchors
-                if not anchor_present(term, lowered)
-            ]
-            if len(anchors) <= 2 and missing:
-                failures.append(f"endpoint_anchor_missing:{','.join(missing)}")
-            elif len(anchors) > 2 and len(missing) > len(anchors) - 2:
-                failures.append(f"endpoint_anchor_underpreserved:{','.join(missing)}")
     endpoint_facts = (route_plan or {}).get("endpoint_facts") or {}
-    safe_terms = safe_stop_key_terms(endpoint_facts)
-    final_clause = final_stop_clause(text)
-    phrase_terms = safe_stop_phrase_terms(endpoint_facts)
-    if not safe_stop_phrase_preserved(final_clause, endpoint_facts):
-        if phrase_terms:
-            failures.append(f"safe_stop_phrase_underpreserved:{','.join(sorted(phrase_terms))}")
-        elif safe_terms:
-            failures.append(f"safe_stop_phrase_underpreserved:{','.join(sorted(safe_terms))}")
-        else:
-            failures.append("safe_stop_phrase_underpreserved")
     if has_forbidden_terminal_stair_claim(text, endpoint_facts):
-        failures.append("endpoint_terminal_stair_claim_for_landing")
+        warnings.append("possible_endpoint_terminal_stair_claim_for_landing")
     if has_final_turn_to_face_nonendpoint(text, endpoint_facts):
-        failures.append("final_turn_to_face_nonendpoint")
+        warnings.append("final_turn_to_face_nonendpoint")
     if has_uncertain_endpoint_modifier(text, endpoint_facts):
-        failures.append("endpoint_uncertain_material_or_size_claim")
+        warnings.append("endpoint_uncertain_material_or_size_claim")
     return {"passed": not failures, "failures": failures, "warnings": warnings}
 
 
+def audit_contract_complete(audit: Mapping[str, Any]) -> bool:
+    """Return whether a blind audit satisfies its required semantic schema."""
+
+    if not isinstance(audit.get("route_sequence_matches"), bool):
+        return False
+    if not isinstance(audit.get("endpoint_matches"), bool):
+        return False
+    if not isinstance(audit.get("passed"), bool):
+        return False
+    if str(audit.get("severity") or "").strip().lower() not in {
+        "none",
+        "minor",
+        "critical",
+    }:
+        return False
+    if not isinstance(audit.get("problems"), list) or not all(
+        isinstance(problem, str) for problem in audit["problems"]
+    ):
+        return False
+    if not isinstance(audit.get("corrected_instruction"), str):
+        return False
+    endpoint = audit.get("observed_endpoint")
+    if not isinstance(endpoint, Mapping):
+        return False
+    observed_route = audit.get("observed_route_sequence")
+    instruction_route = audit.get("instruction_route_sequence")
+    if not isinstance(observed_route, list) or not observed_route or not all(
+        isinstance(item, str) and item.strip() for item in observed_route
+    ):
+        return False
+    if not isinstance(instruction_route, list) or not instruction_route or not all(
+        isinstance(item, str) and item.strip() for item in instruction_route
+    ):
+        return False
+    if not isinstance(endpoint.get("stop_location"), str) or not endpoint["stop_location"].strip():
+        return False
+    if not isinstance(endpoint.get("forward_anchor"), str) or not endpoint["forward_anchor"].strip():
+        return False
+    relation_value = endpoint.get("forward_anchor_relation")
+    if not isinstance(relation_value, str):
+        return False
+    forward_relation = relation_value.strip().lower()
+    if forward_relation not in {
+        "reached_at_final_camera",
+        "remains_ahead_after_final",
+        "uncertain",
+    }:
+        return False
+    return True
+
+
 def audit_passed(audit: Mapping[str, Any]) -> bool:
+    if not audit_contract_complete(audit):
+        return False
     if not bool(audit.get("passed")):
         return False
+    if audit.get("route_sequence_matches") is not True:
+        return False
+    if audit.get("endpoint_matches") is not True:
+        return False
+    if any(str(item).strip() for item in (audit.get("problems") or [])):
+        return False
     severity = str(audit.get("severity") or "none").lower()
-    return severity in {"none", "minor"}
+    return severity == "none"

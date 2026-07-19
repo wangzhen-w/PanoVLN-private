@@ -17,8 +17,8 @@ API_KEY="test"
 
 NUM_WORKERS=40
 MAX_WAYPOINTS=12
-ROUTE_EVIDENCE_MODE="auto"  # 长路线自动拆成多个局部视觉段，再合并成一条自然 instruction。
-SEGMENTED_MIN_ACTIONS=80
+ROUTE_EVIDENCE_MODE="auto"  # 长路线或多平移、多转向路线自动拆成局部视觉段。
+SEGMENTED_MIN_ACTIONS=80  # 达到该长度必分段；复杂短路线也会由 auto 模式识别。
 SEGMENT_MAX_WAYPOINTS=0  # 0 表示复用 MAX_WAYPOINTS。
 SEGMENT_ROWS=5
 SEGMENT_OVERLAP=1

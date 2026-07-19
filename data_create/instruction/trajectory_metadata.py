@@ -31,8 +31,13 @@ def vertical_motion_from_reference_path(path: Any) -> Dict[str, Any]:
     start_y = y_values[0]
     end_y = y_values[-1]
     delta = end_y - start_y
-    total_abs = sum(abs(right - left) for left, right in zip(y_values, y_values[1:]))
-    if delta > 0.35:
+    deltas = [right - left for left, right in zip(y_values, y_values[1:])]
+    ascent = sum(max(change, 0.0) for change in deltas)
+    descent = sum(max(-change, 0.0) for change in deltas)
+    total_abs = ascent + descent
+    if ascent > 0.35 and descent > 0.35:
+        motion = "mixed"
+    elif delta > 0.35:
         motion = "ascending"
     elif delta < -0.35:
         motion = "descending"
@@ -47,6 +52,8 @@ def vertical_motion_from_reference_path(path: Any) -> Dict[str, Any]:
         "end_y": round(end_y, 3),
         "min_y": round(min(y_values), 3),
         "max_y": round(max(y_values), 3),
+        "total_ascent_m": round(ascent, 3),
+        "total_descent_m": round(descent, 3),
         "total_abs_vertical_change_m": round(total_abs, 3),
     }
 
