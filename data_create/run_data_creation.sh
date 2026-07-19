@@ -29,6 +29,14 @@ PANORAMA_JPEG_QUALITY=92  # 正式全景图片的 JPEG 质量。
 TILE_WIDTH=384  # 从全景投影、交给 VLM 的透视图宽度。
 TILE_HEIGHT=288  # 从全景投影、交给 VLM 的透视图高度。
 SHEET_JPEG_QUALITY=90  # 发送给 VLM 的多视角拼图 JPEG 质量。
+ROUTE_EVIDENCE_MODE="auto"  # 长路线自动拆成局部段理解，再合并成完整 instruction。
+SEGMENTED_MIN_ACTIONS=80  # 达到该 action 数时启用分段视觉证据。
+SEGMENT_MAX_WAYPOINTS=0  # 0 表示分段复用当前 style 的 max-waypoints。
+SEGMENT_ROWS=5  # 每个局部分段 sheet 最多放多少个 waypoint 行。
+SEGMENT_OVERLAP=1  # 相邻分段共享的 waypoint 行数，用于保持上下文连续。
+SEGMENT_FACT_MAX_TOKENS=650  # 单个局部分段 route facts 的最大输出长度。
+CANDIDATE_COUNT=2  # 每条路线生成多个候选后由独立视觉 judge 选择，降低单次采样回归。
+CANDIDATE_TEMPERATURE=0.4  # 非首个候选的采样温度，提供不同自然表述供 judge 比较。
 
 BASE_URL="http://127.0.0.1:10420/v1"  # OpenAI-compatible Qwen API pool 地址。
 MODEL="Qwen3.6-27B"  # 服务中实际加载的模型名称。
@@ -117,12 +125,19 @@ generate_style() {
     --mode generate --instruction-profile "${style}" \
     --provider qwen --base-url "${BASE_URL}" --model "${MODEL}" --api-key "${API_KEY}" \
     --num-workers "${NUM_WORKERS}" --max-waypoints 18 \
+    --route-evidence-mode "${ROUTE_EVIDENCE_MODE}" \
+    --segmented-min-actions "${SEGMENTED_MIN_ACTIONS}" \
+    --segment-max-waypoints "${SEGMENT_MAX_WAYPOINTS}" \
+    --segment-rows "${SEGMENT_ROWS}" \
+    --segment-overlap "${SEGMENT_OVERLAP}" \
     --start-window-frames 6 --endpoint-window-frames 6 \
     --tile-width "${TILE_WIDTH}" --tile-height "${TILE_HEIGHT}" \
     --jpeg-quality "${SHEET_JPEG_QUALITY}" \
     --temperature 0.4 --max-tokens 420 \
     --planner-temperature 0.0 --review-temperature 0.0 \
-    --fact-max-tokens 320 --planner-max-tokens 1200 --review-max-tokens 1000 \
+    --candidate-count "${CANDIDATE_COUNT}" --candidate-temperature "${CANDIDATE_TEMPERATURE}" \
+    --fact-max-tokens 320 --segment-fact-max-tokens "${SEGMENT_FACT_MAX_TOKENS}" \
+    --planner-max-tokens 1600 --review-max-tokens 1200 \
     --request-timeout 300 --retries 3 --stage-retries 2 \
     --blind-grounding-audit true --drop-failed true --allow-incomplete false
 }

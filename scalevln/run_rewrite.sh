@@ -17,8 +17,15 @@ API_KEY="test"
 
 NUM_WORKERS=40
 MAX_WAYPOINTS=12
+ROUTE_EVIDENCE_MODE="auto"  # 长路线自动拆成多个局部视觉段，再合并成一条自然 instruction。
+SEGMENTED_MIN_ACTIONS=80
+SEGMENT_MAX_WAYPOINTS=0  # 0 表示复用 MAX_WAYPOINTS。
+SEGMENT_ROWS=5
+SEGMENT_OVERLAP=1
 START_WINDOW_FRAMES=6
 ENDPOINT_WINDOW_FRAMES=6
+CANDIDATE_COUNT=2  # 每条路线生成多个候选后由独立视觉 judge 选择，降低单次采样回归。
+CANDIDATE_TEMPERATURE=0.4
 TILE_WIDTH=320
 TILE_HEIGHT=240
 SHEET_JPEG_QUALITY=90
@@ -27,8 +34,9 @@ PLANNER_TEMPERATURE=0.0
 REVIEW_TEMPERATURE=0.0
 MAX_TOKENS=420
 FACT_MAX_TOKENS=320
-PLANNER_MAX_TOKENS=1200
-REVIEW_MAX_TOKENS=1000
+SEGMENT_FACT_MAX_TOKENS=650
+PLANNER_MAX_TOKENS=1600
+REVIEW_MAX_TOKENS=1200
 REQUEST_TIMEOUT=300
 RETRIES=4
 STAGE_RETRIES=2
@@ -52,6 +60,11 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --api-key "${API_KEY}" \
   --num-workers "${NUM_WORKERS}" \
   --max-waypoints "${MAX_WAYPOINTS}" \
+  --route-evidence-mode "${ROUTE_EVIDENCE_MODE}" \
+  --segmented-min-actions "${SEGMENTED_MIN_ACTIONS}" \
+  --segment-max-waypoints "${SEGMENT_MAX_WAYPOINTS}" \
+  --segment-rows "${SEGMENT_ROWS}" \
+  --segment-overlap "${SEGMENT_OVERLAP}" \
   --start-window-frames "${START_WINDOW_FRAMES}" \
   --endpoint-window-frames "${ENDPOINT_WINDOW_FRAMES}" \
   --tile-width "${TILE_WIDTH}" \
@@ -60,8 +73,11 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --temperature "${TEMPERATURE}" \
   --planner-temperature "${PLANNER_TEMPERATURE}" \
   --review-temperature "${REVIEW_TEMPERATURE}" \
+  --candidate-count "${CANDIDATE_COUNT}" \
+  --candidate-temperature "${CANDIDATE_TEMPERATURE}" \
   --max-tokens "${MAX_TOKENS}" \
   --fact-max-tokens "${FACT_MAX_TOKENS}" \
+  --segment-fact-max-tokens "${SEGMENT_FACT_MAX_TOKENS}" \
   --planner-max-tokens "${PLANNER_MAX_TOKENS}" \
   --review-max-tokens "${REVIEW_MAX_TOKENS}" \
   --request-timeout "${REQUEST_TIMEOUT}" \

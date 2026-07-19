@@ -7,6 +7,7 @@ import hashlib
 import html
 import json
 import random
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,8 +32,19 @@ from .io_utils import (
     source_row_payload,
 )
 from .llm import QwenClient
-from .prompts import SYSTEM_JSON, audit_prompt, plan_write_prompt, repair_prompt
+from .prompts import (
+    SYSTEM_JSON,
+    audit_prompt,
+    endpoint_fact_audit_prompt,
+    candidate_judge_prompt,
+    endpoint_fact_prompt,
+    plan_write_prompt,
+    repair_prompt,
+    segment_fact_prompt,
+    segmented_merge_prompt,
+)
 from .qa import audit_passed, validate_instruction
+from .trajectory_metadata import enrich_trajectory_metadata
 
 
 def select_rows(rows: Sequence[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -84,6 +96,9 @@ def row_input_fingerprint(row: Mapping[str, Any], args: argparse.Namespace) -> s
         max_waypoints=args.max_waypoints,
         start_window_frames=args.start_window_frames,
         endpoint_window_frames=args.endpoint_window_frames,
+        route_evidence_mode=args.route_evidence_mode,
+        segmented_min_actions=args.segmented_min_actions,
+        segment_max_waypoints=args.segment_max_waypoints,
         mode=args.evidence_fingerprint_mode,
     )
     payload = source_row_payload(row, mode=args.mode)
@@ -97,7 +112,173 @@ def images_for_llm(evidence: Any) -> List[Tuple[str, bytes]]:
         ("START evidence", evidence.start_sheet),
         ("ROUTE evidence", evidence.route_sheet),
         ("ENDPOINT evidence", evidence.endpoint_sheet),
+        ("FINAL STOP evidence", evidence.final_sheet),
     ]
+
+
+def images_for_endpoint(evidence: Any) -> List[Tuple[str, bytes]]:
+    tiles = list(getattr(evidence, "final_view_tiles", []) or [])
+    if tiles:
+        return tiles
+    return [("FINAL STOP evidence", evidence.final_sheet)]
+
+
+def selected_candidate_index(judge: Mapping[str, Any], candidate_options: Sequence[Mapping[str, Any]]) -> int:
+    valid = {int(option["index"]) for option in candidate_options}
+    raw = judge.get("selected_index")
+    if raw is None:
+        raw = judge.get("index")
+    try:
+        selected = int(raw)
+    except (TypeError, ValueError):
+        selected = min(valid) if valid else 0
+    if selected not in valid:
+        return min(valid) if valid else 0
+    return selected
+
+
+def row_trajectory_metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
+    return enrich_trajectory_metadata(row.get("trajectory_metadata") or {})
+
+
+def normalize_endpoint_facts(facts: Mapping[str, Any]) -> Dict[str, Any]:
+    normalized = dict(facts or {})
+    location_type = str(normalized.get("final_location_type") or "").lower()
+    phrase = str(normalized.get("safe_stop_phrase") or "").strip()
+    original_phrase = phrase
+    material_object_re = re.compile(
+        r"\b(?:white|black|gray|grey|dark|light|wooden|wood|metal|glass|tall|large|small|long)\s+"
+        r"(?=(?:shelving|shelves|shelf|display|cabinet|cabinets|unit|counter|desk)\b)",
+        flags=re.IGNORECASE,
+    )
+    while True:
+        revised = material_object_re.sub("", phrase)
+        if revised == phrase:
+            break
+        phrase = revised
+    phrase = re.sub(r"\s+", " ", phrase).strip()
+    if phrase and phrase != original_phrase:
+        normalized["safe_stop_phrase"] = phrase
+        avoid = list(normalized.get("avoid_endpoint_claims") or [])
+        if original_phrase not in avoid:
+            avoid.append(original_phrase)
+        normalized["avoid_endpoint_claims"] = avoid
+    primary_endpoint_text = " ".join(
+        [
+            phrase,
+            str(normalized.get("forward_view_anchor") or ""),
+            str(normalized.get("back_view_anchor") or ""),
+            " ".join(str(item) for item in normalized.get("nearby_stop_anchors") or []),
+        ]
+    ).lower()
+    all_endpoint_text = " ".join(
+        [
+            primary_endpoint_text,
+            str(normalized.get("left_view_anchor") or ""),
+            str(normalized.get("right_view_anchor") or ""),
+        ]
+    ).lower()
+    stair_context = bool(
+        re.search(
+            r"\b(?:stair|stairs|staircase|landing|railing|banister)\b",
+            primary_endpoint_text,
+        )
+    )
+    terminal_stair_claim = bool(
+        re.search(
+            r"\b(?:top|bottom|lower\s+level|lower\s+floor|ground\s+floor)\b",
+            all_endpoint_text,
+        )
+    )
+    if (location_type == "stair_landing" or (stair_context and not terminal_stair_claim)) and phrase:
+        phrase = re.sub(
+            r"\bat\s+the\s+(?:top|bottom)\s+of\s+the\s+stairs?\b",
+            "on the staircase landing",
+            phrase,
+            flags=re.IGNORECASE,
+        )
+        phrase = re.sub(
+            r"\bat\s+the\s+(?:top|bottom)\s+of\s+the\s+staircase\b",
+            "on the staircase landing",
+            phrase,
+            flags=re.IGNORECASE,
+        )
+        normalized["safe_stop_phrase"] = phrase
+        avoid = list(normalized.get("avoid_endpoint_claims") or [])
+        for item in (
+            "stopping at the top of the stairs",
+            "stopping at the bottom of the stairs",
+            "stopping at the bottom",
+            "stopping on the lower floor",
+            "stopping on the lower level",
+            "turning at the bottom before stopping",
+        ):
+            if item not in avoid:
+                avoid.append(item)
+        normalized["avoid_endpoint_claims"] = avoid
+    return normalized
+
+
+def use_segmented_route(evidence: Any, args: argparse.Namespace, actions: Sequence[int]) -> bool:
+    if not getattr(evidence, "segment_sheets", None):
+        return False
+    mode = str(getattr(args, "route_evidence_mode", "auto"))
+    if mode == "segmented":
+        return True
+    if mode == "auto":
+        return len(actions) >= int(getattr(args, "segmented_min_actions", 80))
+    return False
+
+
+def call_endpoint_facts(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    evidence: Any,
+    action_summary: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], str]:
+    prompt = endpoint_fact_prompt(
+        episode_id=row["episode_id"],
+        profile=args.instruction_profile,
+        action_summary=action_summary,
+        trajectory_metadata=row_trajectory_metadata(row),
+    )
+    facts, raw = client.chat_json(
+        system=SYSTEM_JSON,
+        prompt=prompt,
+        images=images_for_endpoint(evidence),
+        temperature=args.review_temperature,
+        max_tokens=args.review_max_tokens,
+    )
+    return normalize_endpoint_facts(facts), raw
+
+
+def call_endpoint_fact_audit(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    evidence: Any,
+    action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
+    prompt = endpoint_fact_audit_prompt(
+        episode_id=row["episode_id"],
+        profile=args.instruction_profile,
+        action_summary=action_summary,
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
+    )
+    audit, raw = client.chat_json(
+        system=SYSTEM_JSON,
+        prompt=prompt,
+        images=images_for_endpoint(evidence),
+        temperature=args.review_temperature,
+        max_tokens=args.review_max_tokens,
+    )
+    audited_facts = audit.get("endpoint_facts") if isinstance(audit.get("endpoint_facts"), dict) else endpoint_facts
+    return normalize_endpoint_facts(audited_facts), raw, audit
 
 
 def call_plan_write(
@@ -106,20 +287,108 @@ def call_plan_write(
     row: Mapping[str, Any],
     evidence: Any,
     action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
     args: argparse.Namespace,
+    temperature: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], str]:
     prompt = plan_write_prompt(
         episode_id=row["episode_id"],
         profile=args.instruction_profile,
         action_summary=action_summary,
-        trajectory_metadata=row.get("trajectory_metadata") or {},
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
     )
     return client.chat_json(
         system=SYSTEM_JSON,
         prompt=prompt,
         images=images_for_llm(evidence),
-        temperature=args.planner_temperature,
+        temperature=args.planner_temperature if temperature is None else temperature,
         max_tokens=args.planner_max_tokens,
+    )
+
+
+def call_segment_facts(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    segment: Any,
+    segment_count: int,
+    action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], str]:
+    prompt = segment_fact_prompt(
+        episode_id=row["episode_id"],
+        profile=args.instruction_profile,
+        action_summary=action_summary,
+        segment_action_summary=segment.action_summary,
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
+        segment_id=segment.segment_id,
+        segment_count=segment_count,
+        segment_frames=segment.frames,
+    )
+    return client.chat_json(
+        system=SYSTEM_JSON,
+        prompt=prompt,
+        images=[(f"SEGMENT {segment.segment_id} evidence", segment.sheet)],
+        temperature=args.planner_temperature,
+        max_tokens=args.segment_fact_max_tokens,
+    )
+
+
+def call_segmented_merge(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    evidence: Any,
+    action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
+    segment_facts: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+    temperature: Optional[float] = None,
+) -> Tuple[Dict[str, Any], str]:
+    prompt = segmented_merge_prompt(
+        episode_id=row["episode_id"],
+        profile=args.instruction_profile,
+        action_summary=action_summary,
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
+        segment_facts=segment_facts,
+    )
+    return client.chat_json(
+        system=SYSTEM_JSON,
+        prompt=prompt,
+        images=images_for_llm(evidence),
+        temperature=args.planner_temperature if temperature is None else temperature,
+        max_tokens=args.planner_max_tokens,
+    )
+
+
+def call_candidate_judge(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    evidence: Any,
+    action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], str]:
+    prompt = candidate_judge_prompt(
+        episode_id=row["episode_id"],
+        profile=args.instruction_profile,
+        action_summary=action_summary,
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
+        candidates=candidates,
+    )
+    return client.chat_json(
+        system=SYSTEM_JSON,
+        prompt=prompt,
+        images=images_for_llm(evidence),
+        temperature=args.review_temperature,
+        max_tokens=args.review_max_tokens,
     )
 
 
@@ -129,6 +398,8 @@ def call_audit(
     row: Mapping[str, Any],
     evidence: Any,
     action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
+    route_plan: Mapping[str, Any],
     instruction: str,
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], str]:
@@ -136,7 +407,9 @@ def call_audit(
         episode_id=row["episode_id"],
         profile=args.instruction_profile,
         action_summary=action_summary,
-        trajectory_metadata=row.get("trajectory_metadata") or {},
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
+        route_plan=route_plan,
         instruction=instruction,
     )
     return client.chat_json(
@@ -154,6 +427,7 @@ def call_repair(
     row: Mapping[str, Any],
     evidence: Any,
     action_summary: Mapping[str, Any],
+    endpoint_facts: Mapping[str, Any],
     route_plan: Mapping[str, Any],
     failed_instruction: str,
     issues: Any,
@@ -163,7 +437,8 @@ def call_repair(
         episode_id=row["episode_id"],
         profile=args.instruction_profile,
         action_summary=action_summary,
-        trajectory_metadata=row.get("trajectory_metadata") or {},
+        trajectory_metadata=row_trajectory_metadata(row),
+        endpoint_facts=endpoint_facts,
         route_plan=route_plan,
         failed_instruction=failed_instruction,
         issues=issues,
@@ -198,26 +473,165 @@ def generate_one(
         evidence = build_evidence(row, args)
         actions = [int(action) for action in row["actions"]]
         action_summary = compact_action_summary(actions, len(evidence.frame_paths))
+        trajectory_metadata = row_trajectory_metadata(row)
+        endpoint_facts, raw_responses["endpoint_facts"] = call_endpoint_facts(
+            client,
+            row=row,
+            evidence=evidence,
+            action_summary=action_summary,
+            args=args,
+        )
+        endpoint_fact_audit: Dict[str, Any] = {}
+        endpoint_facts, raw_responses["endpoint_fact_audit"], endpoint_fact_audit = call_endpoint_fact_audit(
+            client,
+            row=row,
+            evidence=evidence,
+            action_summary=action_summary,
+            endpoint_facts=endpoint_facts,
+            args=args,
+        )
         plan: Dict[str, Any] = {}
+        segment_facts: List[Dict[str, Any]] = []
         instruction = ""
         deterministic = {"passed": False, "failures": ["not_generated"], "warnings": []}
         audit: Dict[str, Any] = {}
         for stage_attempt in range(max(1, args.stage_retries + 1)):
-            plan, raw_responses["plan_write"] = call_plan_write(
-                client,
-                row=row,
-                evidence=evidence,
-                action_summary=action_summary,
-                args=args,
-            )
+            candidate_options: List[Dict[str, Any]] = []
+            if use_segmented_route(evidence, args, actions):
+                segment_facts = []
+                for segment in evidence.segment_sheets:
+                    facts, raw = call_segment_facts(
+                        client,
+                        row=row,
+                        segment=segment,
+                        segment_count=len(evidence.segment_sheets),
+                        action_summary=action_summary,
+                        endpoint_facts=endpoint_facts,
+                        args=args,
+                    )
+                    raw_responses[f"segment_{segment.segment_id:02d}_facts"] = raw
+                    segment_facts.append(facts)
+                for candidate_index in range(max(1, int(getattr(args, "candidate_count", 1)))):
+                    candidate_temperature = (
+                        args.planner_temperature
+                        if candidate_index == 0
+                        else float(getattr(args, "candidate_temperature", args.temperature))
+                    )
+                    candidate_plan, raw = call_segmented_merge(
+                        client,
+                        row=row,
+                        evidence=evidence,
+                        action_summary=action_summary,
+                        endpoint_facts=endpoint_facts,
+                        segment_facts=segment_facts,
+                        args=args,
+                        temperature=candidate_temperature,
+                    )
+                    raw_responses[f"segmented_merge_{candidate_index + 1}"] = raw
+                    candidate_plan["segment_facts"] = segment_facts
+                    candidate_plan["endpoint_facts"] = endpoint_facts
+                    candidate_instruction = normalize_instruction(
+                        str(candidate_plan.get("final_instruction") or candidate_plan.get("instruction") or "")
+                    )
+                    candidate_options.append(
+                        {
+                            "index": candidate_index,
+                            "instruction": candidate_instruction,
+                            "plan": candidate_plan,
+                            "deterministic_qa": validate_instruction(
+                                candidate_instruction,
+                                profile=args.instruction_profile,
+                                actions=actions,
+                                trajectory_metadata=trajectory_metadata,
+                                route_plan=candidate_plan,
+                            ),
+                        }
+                    )
+            else:
+                for candidate_index in range(max(1, int(getattr(args, "candidate_count", 1)))):
+                    candidate_temperature = (
+                        args.planner_temperature
+                        if candidate_index == 0
+                        else float(getattr(args, "candidate_temperature", args.temperature))
+                    )
+                    candidate_plan, raw = call_plan_write(
+                        client,
+                        row=row,
+                        evidence=evidence,
+                        action_summary=action_summary,
+                        endpoint_facts=endpoint_facts,
+                        args=args,
+                        temperature=candidate_temperature,
+                    )
+                    raw_responses[f"plan_write_{candidate_index + 1}"] = raw
+                    candidate_plan["endpoint_facts"] = endpoint_facts
+                    candidate_instruction = normalize_instruction(
+                        str(candidate_plan.get("final_instruction") or candidate_plan.get("instruction") or "")
+                    )
+                    candidate_options.append(
+                        {
+                            "index": candidate_index,
+                            "instruction": candidate_instruction,
+                            "plan": candidate_plan,
+                            "deterministic_qa": validate_instruction(
+                                candidate_instruction,
+                                profile=args.instruction_profile,
+                                actions=actions,
+                                trajectory_metadata=trajectory_metadata,
+                                route_plan=candidate_plan,
+                            ),
+                        }
+                    )
+            judge: Dict[str, Any] = {}
+            selected_option = candidate_options[0]
+            if len(candidate_options) > 1:
+                judge_candidates = [
+                    {
+                        "index": option["index"],
+                        "instruction": option["instruction"],
+                        "stop_condition": (option["plan"] or {}).get("stop_condition"),
+                        "route_steps": (option["plan"] or {}).get("route_steps"),
+                        "segment_facts": (option["plan"] or {}).get("segment_facts"),
+                        "covered_route_events": (option["plan"] or {}).get("covered_route_events"),
+                        "covered_decision_boundaries": (option["plan"] or {}).get("covered_decision_boundaries"),
+                        "omitted_route_events": (option["plan"] or {}).get("omitted_route_events"),
+                        "neutralized_side_claims": (option["plan"] or {}).get("neutralized_side_claims"),
+                        "uncertain_or_avoid": (option["plan"] or {}).get("uncertain_or_avoid"),
+                        "deterministic_qa": option["deterministic_qa"],
+                    }
+                    for option in candidate_options
+                ]
+                judge, raw_responses["candidate_judge"] = call_candidate_judge(
+                    client,
+                    row=row,
+                    evidence=evidence,
+                    action_summary=action_summary,
+                    endpoint_facts=endpoint_facts,
+                    candidates=judge_candidates,
+                    args=args,
+                )
+                selected_index = selected_candidate_index(judge, candidate_options)
+                selected_option = next(
+                    (option for option in candidate_options if int(option["index"]) == selected_index),
+                    candidate_options[0],
+                )
+            plan = dict(selected_option["plan"])
+            plan["endpoint_facts"] = endpoint_facts
+            if judge:
+                plan["candidate_judge"] = judge
             instruction = normalize_instruction(
-                str(plan.get("final_instruction") or plan.get("instruction") or "")
+                str(
+                    judge.get("repair_instruction")
+                    if judge.get("needs_repair") and judge.get("repair_instruction")
+                    else selected_option["instruction"]
+                )
             )
+            plan["final_instruction"] = instruction
             deterministic = validate_instruction(
                 instruction,
                 profile=args.instruction_profile,
                 actions=actions,
-                trajectory_metadata=row.get("trajectory_metadata") or {},
+                trajectory_metadata=trajectory_metadata,
                 route_plan=plan,
             )
             if not deterministic["passed"]:
@@ -226,6 +640,7 @@ def generate_one(
                     row=row,
                     evidence=evidence,
                     action_summary=action_summary,
+                    endpoint_facts=endpoint_facts,
                     route_plan=plan,
                     failed_instruction=instruction,
                     issues=deterministic,
@@ -238,7 +653,7 @@ def generate_one(
                     instruction,
                     profile=args.instruction_profile,
                     actions=actions,
-                    trajectory_metadata=row.get("trajectory_metadata") or {},
+                    trajectory_metadata=trajectory_metadata,
                     route_plan=plan,
                 )
             if deterministic["passed"]:
@@ -250,6 +665,8 @@ def generate_one(
                 row=row,
                 evidence=evidence,
                 action_summary=action_summary,
+                endpoint_facts=endpoint_facts,
+                route_plan=plan,
                 instruction=instruction,
                 args=args,
             )
@@ -262,6 +679,7 @@ def generate_one(
                         row=row,
                         evidence=evidence,
                         action_summary=action_summary,
+                        endpoint_facts=endpoint_facts,
                         route_plan=plan,
                         failed_instruction=instruction,
                         issues=repair_issues,
@@ -274,7 +692,7 @@ def generate_one(
                     instruction,
                     profile=args.instruction_profile,
                     actions=actions,
-                    trajectory_metadata=row.get("trajectory_metadata") or {},
+                    trajectory_metadata=trajectory_metadata,
                     route_plan=plan,
                 )
                 if deterministic["passed"]:
@@ -283,6 +701,8 @@ def generate_one(
                         row=row,
                         evidence=evidence,
                         action_summary=action_summary,
+                        endpoint_facts=endpoint_facts,
+                        route_plan=plan,
                         instruction=instruction,
                         args=args,
                     )
@@ -305,12 +725,36 @@ def generate_one(
             "selected_frames": evidence.selected_frames,
             "start_frames": evidence.start_frames,
             "endpoint_frames": evidence.endpoint_frames,
+            "segment_frames": [
+                {
+                    "segment_id": segment.segment_id,
+                    "frames": segment.frames,
+                    "action_summary": segment.action_summary,
+                }
+                for segment in evidence.segment_sheets
+            ],
             "contact_sheets": {
                 "route": evidence.route_sheet_path,
                 "start": evidence.start_sheet_path,
                 "endpoint": evidence.endpoint_sheet_path,
+                "final": evidence.final_sheet_path,
+                "segments": [
+                    segment.sheet_path for segment in evidence.segment_sheets
+                ],
             },
             "route_plan": plan,
+            "endpoint_facts": endpoint_facts,
+            "endpoint_fact_audit": endpoint_fact_audit,
+            "segment_facts": segment_facts,
+            "candidate_options": [
+                {
+                    "index": option["index"],
+                    "instruction": option["instruction"],
+                    "deterministic_qa": option["deterministic_qa"],
+                    "stop_condition": (option["plan"] or {}).get("stop_condition"),
+                }
+                for option in candidate_options
+            ],
             "instruction": instruction,
             "deterministic_qa": deterministic,
             "blind_grounding_audit": audit,
@@ -361,13 +805,19 @@ def write_gallery(rows: Sequence[Dict[str, Any]], candidates: Mapping[str, Dict[
         parts.append(f"<h2>Episode {html.escape(key)} — {html.escape(str(candidate.get('status')))}</h2>")
         parts.append(f"<p>{html.escape(str(candidate.get('instruction') or ''))}</p>")
         sheets = candidate.get("contact_sheets") or {}
-        for label in ("start", "route", "endpoint"):
+        for label in ("start", "route", "endpoint", "final"):
             sheet_path = sheets.get(label)
             if sheet_path:
                 rel = Path(sheet_path).resolve().relative_to(output.parent.resolve()) if Path(sheet_path).resolve().is_relative_to(output.parent.resolve()) else Path(sheet_path).resolve()
                 parts.append(f"<h3>{label}</h3><img src='{html.escape(str(rel))}'>")
+        for index, sheet_path in enumerate(sheets.get("segments") or [], start=1):
+            if sheet_path:
+                rel = Path(sheet_path).resolve().relative_to(output.parent.resolve()) if Path(sheet_path).resolve().is_relative_to(output.parent.resolve()) else Path(sheet_path).resolve()
+                parts.append(f"<h3>segment {index}</h3><img src='{html.escape(str(rel))}'>")
         preview = {
             "route_plan": candidate.get("route_plan"),
+            "endpoint_facts": candidate.get("endpoint_facts"),
+            "segment_facts": candidate.get("segment_facts"),
             "deterministic_qa": candidate.get("deterministic_qa"),
             "audit": candidate.get("blind_grounding_audit"),
             "error": candidate.get("error"),

@@ -12,7 +12,7 @@ HM3D basis.glb + basis.navmesh
   -> 高质量 R2R-short / RxR-long trajectory
   -> ShortestPathFollower expert actions
   -> 轨迹回放与 360°视觉证据采集
-  -> 视觉证据抽取、结构化路线计划、写作、独立审核和修复
+  -> 视觉证据抽取、长路线分段理解、结构化路线计划、写作、独立审核和修复
   -> R2R VLN-CE train.json + train.json.gz + train_gt.json.gz
 ```
 
@@ -33,6 +33,7 @@ data_create/
 │   ├── prompts.py
 │   ├── qa.py
 │   ├── runner.py
+│   ├── trajectory_metadata.py
 │   └── pipeline.py              # 兼容入口，实际逻辑拆在上述模块
 └── export_vlnce.py
 ```
@@ -48,6 +49,17 @@ data_create/
 - route：left / forward / right / back；
 - start 和 endpoint：额外包含 forward-down；
 - VLM 收到的是按路线顺序排列的透视图 contact sheet。
+
+保存下来的全景已经按 agent 当前朝向对齐，正式脚本刻意不传
+`--use-action-heading`，避免根据离散 actions 再旋转一次导致 FINAL FORWARD
+指向侧面物体。只有确认输入全景是全局固定朝向时，才应打开该选项。
+
+instruction 系统不会要求 Qwen 一次读完超长路线的巨大拼图。短路线直接使用
+START / ROUTE / ENDPOINT 三张 evidence sheet；长路线默认使用 `auto` 模式：
+先把 route waypoints 切成带 1 行 overlap 的局部分段，让 Qwen 为每段抽取
+grounded route facts，再由全局 writer 结合 START / ROUTE overview / ENDPOINT
+合并成一条自然 instruction。每个分段还带真实 low-level action span 摘要，
+明确哪些视觉变化只是原地转向或小范围对齐，避免把相机朝向变化误写成“穿过某个房间”。
 
 这样既保留了全景 VLN 需要的完整空间信息，又避免让通用 VLM 直接理解畸变较大
 的 equirectangular 图。路口侧面、身后 landmark 和最终目标不容易因为相机初始
@@ -94,6 +106,13 @@ PANORAMA_JPEG_QUALITY=92
 TILE_WIDTH=384
 TILE_HEIGHT=288
 SHEET_JPEG_QUALITY=90
+
+ROUTE_EVIDENCE_MODE="auto"
+SEGMENTED_MIN_ACTIONS=80
+SEGMENT_MAX_WAYPOINTS=0
+SEGMENT_ROWS=5
+SEGMENT_OVERLAP=1
+SEGMENT_FACT_MAX_TOKENS=360
 
 BASE_URL="http://127.0.0.1:10420/v1"
 MODEL="Qwen3.6-27B"
@@ -184,7 +203,9 @@ train，RxR 使用 `RxRVLNCE-v1` train 的 guide / en-US / en-IN；先用同仓�
 - collect 外层按 scene 循环，在同一个 simulator 中采完该 scene 的 quota；
 - GT 先按 `scene_id` 分组，同一个 Habitat Env 处理该 scene 的全部 episode；
 - image render 按 `(scene_id, episode_id)` 排序，并持续复用当前 simulator；
-- instruction 阶段只读取已经保存的图片，不启动 Habitat。
+- instruction 阶段只读取已经保存的图片、actions 和 trajectory metadata，不启动
+  Habitat；其中 `reference_path` 会自动派生 `vertical_motion`，作为上/下楼描述的
+  硬约束传给 writer、audit 和 deterministic QA。
 
 每个 scene 在 collect、GT、render 三个独立阶段各加载一次。GT 支持 journal 断点续跑；
 collect 和 render 失败时可只重跑当前阶段，无需重新执行已经完成的前置阶段。
@@ -275,10 +296,14 @@ Instruction 系统的正式顺序为：
 
 ```text
 actions + selected panorama frames
-  -> perspective evidence sheets: START / ROUTE / ENDPOINT
-  -> Qwen structured route plan + draft instruction
+  -> perspective evidence sheets: START / ROUTE / ENDPOINT + forward-first FINAL-only
+  -> Qwen endpoint fact extraction from labeled FINAL views
+  -> Qwen endpoint fact audit for forward/side-view consistency
+  -> long routes: segment sheets + action-span-grounded route facts
+  -> Qwen structured route plan / segment merge + multiple draft instructions
+  -> independent visual candidate judge selects the best executable instruction
   -> deterministic route/endpoint/format gate
-  -> Qwen blind grounding audit
+  -> Qwen blind grounding audit using endpoint facts
   -> repair when either gate fails
   -> atomic clean JSONL publication
 ```
@@ -286,9 +311,40 @@ actions + selected panorama frames
 自采数据使用 `generate` 模式，进入 agent 前会清除任何 source instruction。
 `validate-gt` 还会把 simulator GT 的升降统计作为只读 trajectory metadata 交给
 同一套系统：楼梯上/下方向以真实 elevation 为硬约束，VLM 只负责识别楼梯和地标。
-对仅有 actions 的旧数据，系统用离散动作做保守的 dead-reckoning 复杂度提示，避免
-长路线被压成直线路线。最终 clean JSONL 只保留 `episode_id`、`instruction`、`actions`、
+对仅有 actions 的旧数据，系统用离散动作做保守的 dead-reckoning 复杂度和分段
+action-span 提示，避免长路线被压成直线路线，也避免把原地转向误写成穿过房间。
+FINAL-only endpoint fact pass 会把最终位置拆成带文本标签的 FORWARD / FORWARD-DOWN /
+LEFT / RIGHT / BACK 单视角图，专门抽取最终 stop 的位置类型、正前方 anchor、
+侧向/身后 anchor 和必须避免的终点/朝向说法；随后再用同一组 FINAL views 做一次
+endpoint fact audit，检查 forward/side-view 是否串列、safe stop 是否被侧面门窗或物体
+替代。writer、judge、audit 和 repair 都把审后的 endpoint facts 作为最终句子的硬证据，
+以减少 balcony 被误写成 sofa、landing 被误写成 top/bottom、side-view object 被误写成
+facing object 这类错误。
+为避免针对少数 episode 堆物体级硬规则，默认每条路线生成两个候选 instruction，
+再由独立 visual candidate judge 根据同一 START / ROUTE / ENDPOINT / FINAL evidence
+选择更忠实、可执行、终点更准的一版；deterministic QA 只负责格式、数据泄漏、
+明显自相矛盾和通用物理约束。
+最终 clean JSONL 只保留 `episode_id`、`instruction`、`actions`、
 `instruction_profile`、`input_fingerprint`、`pipeline_fingerprint` 和可选
 `trajectory_id`；contact sheet、raw response、repair/audit 结果只在 work dir 中用于恢复
 和人工审查。
 任何 trajectory、图片或 instruction 未通过硬检查时，正式 dataset 都不会发布。
+
+## Instruction 迭代验收
+
+任何 prompt、视觉证据、分段、QA 或 repair 逻辑的优化，都必须用同一批 episode
+做 previous/current 对比，不能只看当前输出。最小验收集应同时包含短路线、80+
+action 长路线、楼梯/landing、跨房间/走廊转换、复杂办公/开放空间，以及至少一条
+HM3D 自采长路线。对 ScaleVLN rewrite，还要同时展示原始 ScaleVLN instruction、
+历史 `/sub_dataset/PanoVLN.jsonl` rewrite、上一版系统输出和当前输出。
+
+每轮优化后的人工审查至少需要 4 个独立评审视角：
+
+- 路线执行性：follower 是否能根据 instruction 到达正确终点；
+- 视觉 grounding：写出的 landmark、房间名、终点 anchor 是否被图像支持；
+- 长路线/楼梯/空间转换：上/下楼、landing、hallway/room transition 是否清楚；
+- 回归与数据集质量：是否相比上一版整体提升，短路线是否未退化，失败率和成本是否可接受。
+
+只有当多数评审认为当前版本在关键路线信息、grounding 和终点表达上明确优于上一版，
+且没有新增系统性错误时，才把该改动作为默认流程。若发现退化样本，必须记录具体
+episode、旧/新输出、对应 contact sheets 和错误类型，再继续迭代。

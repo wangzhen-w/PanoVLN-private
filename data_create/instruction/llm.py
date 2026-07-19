@@ -30,19 +30,27 @@ def extract_json_object(text: str) -> Dict[str, Any]:
                         return value
                 except json.JSONDecodeError:
                     pass
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
     decoder = json.JSONDecoder()
-    found: Optional[Dict[str, Any]] = None
+    found: Optional[Tuple[int, int, Dict[str, Any]]] = None
     for index, char in enumerate(text):
         if char != "{":
             continue
         try:
-            value, _ = decoder.raw_decode(text[index:])
+            value, end = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict):
-            found = value
+            span = end
+            if found is None or span > found[1]:
+                found = (index, span, value)
     if found is not None:
-        return found
+        return found[2]
     raise ValueError(f"Model response did not contain a JSON object: {text[:500]}")
 
 
@@ -89,6 +97,8 @@ class QwenClient:
     ) -> Tuple[Dict[str, Any], str]:
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for label, image_bytes in images:
+            if str(label).strip():
+                content.append({"type": "text", "text": f"Image: {label}"})
             content.append(
                 {
                     "type": "image_url",

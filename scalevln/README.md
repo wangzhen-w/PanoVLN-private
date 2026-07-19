@@ -86,6 +86,26 @@ bash scalevln/run_rewrite.sh
 trajectory metadata 和 panorama-derived evidence sheets。因此它与 `data_create`
 自采数据使用的是同一套 source-text-blind instruction 系统。
 
+正式 rewrite 默认使用 `ROUTE_EVIDENCE_MODE="auto"`：短路线仍用 START / ROUTE /
+ENDPOINT 三张 overview evidence sheet，同时额外生成 forward-first FINAL-only
+endpoint evidence。系统会把 FINAL observation 拆成带文本标签的 FORWARD /
+FORWARD-DOWN / LEFT / RIGHT / BACK 单视角图，先抽取 stop 位置类型、正前方 anchor、
+侧向/身后 anchor 和必须避免的终点/朝向说法，再做一次 endpoint fact audit 检查
+forward/side-view 是否串列、safe stop 是否被侧面门窗或物体替代；80 action 及以上的长路线再把 route
+waypoints 拆成多个局部分段，先生成 grounded route facts，再结合 endpoint facts
+合并成一条自然 instruction。每个分段同时传入真实 action span 摘要，标出大转向、
+小平移和真实 forward 运动，降低把视角旋转误写成空间移动的概率。ScaleVLN JSONL
+中已有的 `trajectory_metadata.reference_path` 会自动派生 `vertical_motion`，
+用于约束上楼/下楼方向；这仍然不使用原 instruction。
+
+ScaleVLN 保存的全景已经以 agent 当前朝向为中心，正式脚本不传
+`--use-action-heading`。不要在默认 rewrite 中根据 actions 再做 heading re-rotation，
+否则 FINAL FORWARD 会被转到侧面视图，终点 anchor 会系统性漂移。
+
+正式脚本还会为每条路线生成两个候选 instruction，再由独立 visual candidate judge
+基于同一视觉证据和审后的 endpoint facts 选择更忠实、可执行、终点更准的一版。
+这个机制用于降低单次生成偶然回归，避免依赖针对少数 canary episode 的物体级硬规则。
+
 ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.glb`
 或 `mp3d/...` scene ID；`PanoVLN-HM3D` 新数据则使用
 `hm3d/train/<scene_dir>/<scene_name>.basis.glb`。前者由统一 `SCENES_DIR` 解析，
@@ -101,7 +121,8 @@ ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.gl
 
 ```text
 ScaleVLN trajectory/actions + panoramas
-  -> shared source-text-blind evidence-plan-write-audit generation
+  -> shared source-text-blind evidence / FINAL endpoint facts / segmented-facts generation
+  -> endpoint-grounded multi-candidate plan-write / visual judge / audit-repair
   -> 要求全部 episode 通过质量门
   -> 原子发布 REWRITE_OUTPUT
 ```
@@ -112,8 +133,17 @@ pair manifest。脚本使用 `--drop-failed false --allow-incomplete false`：�
 
 共享系统包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：终点 stop anchor 必须从
 ENDPOINT evidence 中保留到最终句子；楼梯上/下方向优先使用 trajectory metadata；
-仅有 actions 时会生成 major-turn 和 dead-reckoning 复杂度提示，避免长路线被压缩成
-直线路线。这些门不会利用原 instruction。
+actions 会生成 major-turn、dead-reckoning 复杂度和分段 action-span 提示，避免长路线
+被压缩成直线路线，也避免把原地转向误写成穿过房间。这些门不会利用原 instruction。
+
+每次修改 rewrite 的 prompt、视觉证据或 QA 逻辑后，必须在同一批 episode 上保留
+previous/current 对比，而不是只看当前版本。最小人工验收需要覆盖短路线、80+
+action 长路线、楼梯/landing、跨房间/走廊转换和复杂开放空间；每条都同时展示
+原始 ScaleVLN、历史 `/workspace/data1/dataset/PanoVLN/sub_dataset/PanoVLN.jsonl`
+rewrite、上一版系统输出和当前输出。评审至少包含 4 个独立视角：路线执行性、
+视觉 grounding、长路线/楼梯/空间转换、回归与数据集质量。只有多数评审确认当前
+版本在关键路线信息、grounding 和终点表达上明确提升，且短路线未退化，才将改动
+作为默认 rewrite 流程。
 
 ## 158 条失败样本
 

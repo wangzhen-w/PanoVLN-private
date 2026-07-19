@@ -168,6 +168,12 @@ def build_pipeline_fingerprint(args: argparse.Namespace) -> str:
         "instruction_profile": args.instruction_profile,
         "model": args.model,
         "max_waypoints": args.max_waypoints,
+        "route_evidence_mode": getattr(args, "route_evidence_mode", "auto"),
+        "segmented_min_actions": getattr(args, "segmented_min_actions", 80),
+        "segment_max_waypoints": getattr(args, "segment_max_waypoints", 0),
+        "segment_rows": getattr(args, "segment_rows", 5),
+        "segment_overlap": getattr(args, "segment_overlap", 1),
+        "segment_fact_max_tokens": getattr(args, "segment_fact_max_tokens", 280),
         "start_window_frames": args.start_window_frames,
         "endpoint_window_frames": args.endpoint_window_frames,
         "tile_width": args.tile_width,
@@ -177,7 +183,9 @@ def build_pipeline_fingerprint(args: argparse.Namespace) -> str:
         "temperature": args.temperature,
         "planner_temperature": args.planner_temperature,
         "review_temperature": args.review_temperature,
-        "prompt_family": "evidence-plan-write-audit",
+        "candidate_count": getattr(args, "candidate_count", 1),
+        "candidate_temperature": getattr(args, "candidate_temperature", 0.4),
+        "prompt_family": "segmented-evidence-labeled-final-views-endpoint-aware-boundaries-side-neutral-final-face-v5",
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

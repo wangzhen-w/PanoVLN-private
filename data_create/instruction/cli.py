@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--max-waypoints", type=int, default=14)
+    parser.add_argument("--route-evidence-mode", choices=("sheet", "segmented", "auto"), default="auto")
+    parser.add_argument("--segmented-min-actions", type=int, default=80)
+    parser.add_argument("--segment-max-waypoints", type=int, default=0, help="0 means reuse --max-waypoints")
+    parser.add_argument("--segment-rows", type=int, default=5)
+    parser.add_argument("--segment-overlap", type=int, default=1)
+    parser.add_argument("--segment-fact-max-tokens", type=int, default=280)
     parser.add_argument("--start-window-frames", type=int, default=5)
     parser.add_argument("--endpoint-window-frames", type=int, default=5)
     parser.add_argument("--tile-width", type=int, default=384)
@@ -54,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--planner-max-tokens", type=int, default=1000)
     parser.add_argument("--review-temperature", type=float, default=0.0)
     parser.add_argument("--review-max-tokens", type=int, default=700)
+    parser.add_argument("--candidate-count", type=int, default=1)
+    parser.add_argument("--candidate-temperature", type=float, default=0.4)
 
     # Backwards-compatible flags retained so existing scripts do not break.
     parser.add_argument("--fact-max-tokens", type=int, default=320)
