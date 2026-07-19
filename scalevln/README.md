@@ -84,7 +84,9 @@ bash scalevln/run_rewrite.sh
 这里明确使用 `--mode generate`。`SOURCE_JSONL` 文件物理上仍保留原 instruction，
 但 pipeline 在加载后立即把 `instruction` 置空；传给 Qwen 的只有 episode ID、actions、
 trajectory metadata 和 panorama-derived evidence sheets。因此它与 `data_create`
-自采数据使用的是同一套 source-text-blind instruction 系统。
+自采数据使用的是同一套 source-text-blind instruction 系统。正式脚本固定使用
+`--instruction-profile dense`，每条轨迹只发布一条经过候选筛选和审核的 instruction；
+不再额外生成 Concise 版本。
 
 正式 rewrite 默认使用 `ROUTE_EVIDENCE_MODE="auto"`：短路线仍用 START / ROUTE /
 ENDPOINT 三张 overview evidence sheet，同时额外生成 forward-first FINAL-only

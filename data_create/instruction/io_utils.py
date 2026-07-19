@@ -1,10 +1,9 @@
-"""I/O, normalization, and fingerprint helpers for instruction generation."""
+"""I/O and normalization helpers for instruction generation."""
 
 from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
 import json
 import math
 import os
@@ -170,84 +169,12 @@ def existing_candidates(work_dir: Path) -> Dict[str, Dict[str, Any]]:
     return read_jsonl_mapping(sorted(work_dir.glob("candidates_rank*.jsonl")))
 
 
-def source_row_payload(row: Mapping[str, Any], *, mode: str) -> Dict[str, Any]:
-    return {
-        "episode_id": str(row.get("episode_id", "")),
-        "trajectory_id": row.get("trajectory_id"),
-        "actions": [int(action) for action in row.get("actions", [])],
-        "trajectory_metadata": row.get("trajectory_metadata") or {},
-        "instruction": "" if mode == "generate" else str(row.get("instruction") or ""),
-    }
-
-
-def hash_file(path: Path, digest: "hashlib._Hash", mode: str) -> None:
-    if mode == "content":
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    elif mode == "metadata":
-        stat = path.stat()
-        digest.update(f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8"))
-    else:
-        raise ValueError(f"Unknown fingerprint mode: {mode}")
-
-
-def pipeline_source_files_sha256() -> str:
-    root = Path(__file__).resolve().parent
-    digest = hashlib.sha256()
-    for path in sorted(root.glob("*.py")):
-        digest.update(path.name.encode("utf-8"))
-        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
-    return digest.hexdigest()
-
-
-def build_pipeline_fingerprint(args: argparse.Namespace) -> str:
-    payload = {
-        "schema_version": "panovln-instruction-v1",
-        "source_files_sha256": pipeline_source_files_sha256(),
-        "mode": args.mode,
-        "instruction_profile": args.instruction_profile,
-        "model": args.model,
-        "max_waypoints": args.max_waypoints,
-        "route_evidence_mode": getattr(args, "route_evidence_mode", "auto"),
-        "segmented_min_actions": getattr(args, "segmented_min_actions", 80),
-        "segment_max_waypoints": getattr(args, "segment_max_waypoints", 0),
-        "segment_rows": getattr(args, "segment_rows", 5),
-        "segment_overlap": getattr(args, "segment_overlap", 1),
-        "segment_fact_max_tokens": getattr(args, "segment_fact_max_tokens", 280),
-        "start_window_frames": args.start_window_frames,
-        "endpoint_window_frames": args.endpoint_window_frames,
-        "tile_width": args.tile_width,
-        "tile_height": args.tile_height,
-        "jpeg_quality": args.jpeg_quality,
-        "use_action_heading": args.use_action_heading,
-        "temperature": args.temperature,
-        "planner_temperature": args.planner_temperature,
-        "review_temperature": args.review_temperature,
-        "max_tokens": args.max_tokens,
-        "fact_max_tokens": getattr(args, "fact_max_tokens", 320),
-        "planner_max_tokens": args.planner_max_tokens,
-        "review_max_tokens": args.review_max_tokens,
-        "stage_retries": args.stage_retries,
-        "disable_thinking": args.disable_thinking,
-        "blind_grounding_audit": args.blind_grounding_audit,
-        "seed": args.seed,
-        "candidate_count": getattr(args, "candidate_count", 1),
-        "candidate_temperature": getattr(args, "candidate_temperature", 0.4),
-        "prompt_family": "semantic-facts-free-language-independent-visual-review-v8",
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
 def clean_row_from_candidate(row: Mapping[str, Any], candidate: Mapping[str, Any]) -> Dict[str, Any]:
     clean = {
         "episode_id": row["episode_id"],
         "instruction": normalize_instruction(str(candidate["instruction"])),
         "actions": [int(action) for action in row["actions"]],
         "instruction_profile": candidate.get("instruction_profile"),
-        "pipeline_fingerprint": candidate.get("pipeline_fingerprint"),
-        "input_fingerprint": candidate.get("input_fingerprint"),
     }
     if row.get("trajectory_id") is not None:
         clean["trajectory_id"] = row["trajectory_id"]
@@ -256,19 +183,15 @@ def clean_row_from_candidate(row: Mapping[str, Any], candidate: Mapping[str, Any
     return clean
 
 
-def candidate_is_current(
+def candidate_is_complete(
     candidate: Optional[Mapping[str, Any]],
     *,
-    input_fingerprint: str,
-    pipeline_fingerprint: str,
     profile: str,
 ) -> bool:
     if not candidate:
         return False
     return (
         candidate.get("status") == "success"
-        and candidate.get("input_fingerprint") == input_fingerprint
-        and candidate.get("pipeline_fingerprint") == pipeline_fingerprint
         and candidate.get("instruction_profile") == profile
         and bool(str(candidate.get("instruction") or "").strip())
     )

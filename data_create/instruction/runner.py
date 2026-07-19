@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import html
 import json
 import random
@@ -11,26 +10,24 @@ import re
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
 from .actions import compact_action_summary
-from .evidence import build_evidence, evidence_frame_fingerprint
+from .evidence import build_evidence
 from .io_utils import (
     append_jsonl,
     atomic_write_jsonl,
-    build_pipeline_fingerprint,
-    candidate_is_current,
+    candidate_is_complete,
     candidate_paths,
     clean_row_from_candidate,
     episode_key,
     existing_candidates,
     normalize_instruction,
     read_jsonl,
-    source_row_payload,
 )
 from .llm import QwenClient
 from .prompts import (
@@ -88,24 +85,6 @@ def stratified_sample(rows: Sequence[Dict[str, Any]], count: int, seed: int) -> 
                 result.append(buckets[key].pop(rng.randrange(len(buckets[key]))))
     result.sort(key=lambda row: str(row["episode_id"]))
     return result
-
-
-def row_input_fingerprint(row: Mapping[str, Any], args: argparse.Namespace) -> str:
-    evidence_hash = evidence_frame_fingerprint(
-        row,
-        image_root=args.image_root,
-        max_waypoints=args.max_waypoints,
-        start_window_frames=args.start_window_frames,
-        endpoint_window_frames=args.endpoint_window_frames,
-        route_evidence_mode=args.route_evidence_mode,
-        segmented_min_actions=args.segmented_min_actions,
-        segment_max_waypoints=args.segment_max_waypoints,
-        mode=args.evidence_fingerprint_mode,
-    )
-    payload = source_row_payload(row, mode=args.mode)
-    payload["evidence_frames_sha256"] = evidence_hash
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def images_for_llm(evidence: Any) -> List[Tuple[str, bytes]]:
@@ -673,8 +652,6 @@ def generate_one(
     row: Dict[str, Any],
     *,
     args: argparse.Namespace,
-    pipeline_fingerprint: str,
-    input_fingerprint: str,
 ) -> Dict[str, Any]:
     client = QwenClient(
         base_url=args.base_url,
@@ -968,8 +945,6 @@ def generate_one(
             "old_instruction": "",
             "instruction_profile": args.instruction_profile,
             "completed_at_unix": time.time(),
-            "pipeline_fingerprint": pipeline_fingerprint,
-            "input_fingerprint": input_fingerprint,
             "actions": actions,
             "image_key": evidence.image_key,
             "selected_frames": evidence.selected_frames,
@@ -1030,8 +1005,6 @@ def generate_one(
             "old_instruction": "",
             "instruction_profile": args.instruction_profile,
             "completed_at_unix": time.time(),
-            "pipeline_fingerprint": pipeline_fingerprint,
-            "input_fingerprint": input_fingerprint,
             "actions": row.get("actions"),
             "instruction": "",
             "error": {
@@ -1100,55 +1073,78 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             disable_thinking=args.disable_thinking,
         ).preflight()
     rows = select_rows(read_jsonl(args.input_jsonl, mode=args.mode), args)
-    pipeline_fingerprint = build_pipeline_fingerprint(args)
     old_candidates = existing_candidates(work_dir) if args.resume else {}
-    fingerprints: Dict[str, str] = {}
-    pending: List[Tuple[int, Dict[str, Any], str]] = []
+    pending: List[Tuple[int, Dict[str, Any]]] = []
     current_candidates: Dict[str, Dict[str, Any]] = {}
     for index, row in enumerate(rows):
-        fingerprint = row_input_fingerprint(row, args)
-        fingerprints[episode_key(row)] = fingerprint
         existing = old_candidates.get(episode_key(row))
-        if candidate_is_current(
+        if candidate_is_complete(
             existing,
-            input_fingerprint=fingerprint,
-            pipeline_fingerprint=pipeline_fingerprint,
             profile=args.instruction_profile,
         ):
             current_candidates[episode_key(row)] = existing  # type: ignore[assignment]
         else:
-            pending.append((index, row, fingerprint))
+            pending.append((index, row))
 
-    candidate_files = candidate_paths(work_dir, max(1, args.num_workers))
-    failed_files = [work_dir / f"failed_rank{index}.jsonl" for index in range(max(1, args.num_workers))]
-    progress = tqdm(total=len(pending), desc=f"instruction {args.instruction_profile}", unit="ep")
+    print(
+        f"[instruction] reused {len(current_candidates)} completed episodes; "
+        f"remaining {len(pending)}"
+    )
+
+    worker_count = max(1, args.num_workers)
+    candidate_files = candidate_paths(work_dir, worker_count)
+    failed_files = [work_dir / f"failed_rank{index}.jsonl" for index in range(worker_count)]
+    progress = tqdm(
+        total=len(rows),
+        initial=len(current_candidates),
+        desc=f"instruction {args.instruction_profile}",
+        unit="ep",
+    )
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    futures: Dict[Future[Dict[str, Any]], Tuple[int, Dict[str, Any]]] = {}
+    pending_iter = iter(pending)
+
+    def submit_next() -> bool:
+        try:
+            index, row = next(pending_iter)
+        except StopIteration:
+            return False
+        future = executor.submit(
+            generate_one,
+            row,
+            args=args,
+        )
+        futures[future] = (index, row)
+        return True
+
     try:
-        with ThreadPoolExecutor(max_workers=max(1, args.num_workers)) as executor:
-            futures = {
-                executor.submit(
-                    generate_one,
-                    row,
-                    args=args,
-                    pipeline_fingerprint=pipeline_fingerprint,
-                    input_fingerprint=fingerprint,
-                ): (index, row, fingerprint)
-                for index, row, fingerprint in pending
-            }
-            for future in as_completed(futures):
-                index, row, _ = futures[future]
+        for _ in range(worker_count):
+            if not submit_next():
+                break
+        while futures:
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                index, row = futures[future]
+                del futures[future]
                 candidate = future.result()
-                rank = index % max(1, args.num_workers)
+                rank = index % worker_count
                 append_jsonl(candidate_files[rank], candidate)
                 if candidate.get("status") != "success":
                     append_jsonl(failed_files[rank], candidate)
-                if candidate_is_current(
+                if candidate_is_complete(
                     candidate,
-                    input_fingerprint=fingerprints[episode_key(row)],
-                    pipeline_fingerprint=pipeline_fingerprint,
                     profile=args.instruction_profile,
                 ):
                     current_candidates[episode_key(row)] = candidate
                 progress.update(1)
+                submit_next()
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
     finally:
         progress.close()
 
@@ -1157,10 +1153,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     for row in rows:
         key = episode_key(row)
         candidate = current_candidates.get(key)
-        if candidate_is_current(
+        if candidate_is_complete(
             candidate,
-            input_fingerprint=fingerprints[key],
-            pipeline_fingerprint=pipeline_fingerprint,
             profile=args.instruction_profile,
         ):
             clean_rows.append(clean_row_from_candidate(row, candidate or {}))
@@ -1179,7 +1173,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "missing_rows": len(missing),
             "missing_preview": missing[:30],
             "output_partial": partial if clean_rows else None,
-            "pipeline_fingerprint": pipeline_fingerprint,
             "source_text_blind": args.mode == "generate",
         }
         (work_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1198,7 +1191,6 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "missing_preview": missing[:30],
         "output_jsonl": args.output_jsonl,
         "work_dir": str(work_dir),
-        "pipeline_fingerprint": pipeline_fingerprint,
         "source_text_blind": args.mode == "generate",
         "ignored_source_text_count": sum(1 for row in rows if args.mode == "generate"),
         "source_instruction_visible_to_models": args.mode != "generate",

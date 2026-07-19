@@ -53,7 +53,7 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --output-jsonl "${REWRITE_OUTPUT}" \
   --work-dir "${WORK_DIR}" \
   --mode generate \
-  --instruction-profile concise \
+  --instruction-profile dense \
   --provider qwen \
   --base-url "${BASE_URL}" \
   --model "${MODEL}" \

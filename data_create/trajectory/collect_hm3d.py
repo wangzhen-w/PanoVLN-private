@@ -10,18 +10,25 @@ anchor to reproduce the instruction-fidelity challenge absent from pure PointNav
 from __future__ import annotations
 
 import argparse
+import copy
 import gzip
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import random
 import shutil
+import sqlite3
 import statistics
+import time
+import traceback
 from pathlib import Path
+from queue import Empty
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from data_create.trajectory.scene_paths import public_scene_id, resolve_scene_path
 
@@ -55,15 +62,24 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--split", default="train")
     collect.add_argument("--scene-ids", default=None, help="comma-separated folder ids")
     collect.add_argument(
-        "--require-semantic-assets",
-        action="store_true",
+        "--num-trajectories",
+        type=int,
+        default=100,
         help=(
-            "Use only scenes that have both .semantic.glb and .semantic.txt. "
-            "Optional when a downstream semantic-grounding stage needs them; "
-            "the RGB/VLM pipeline itself does not."
+            "Desired trajectory count. Quality gates are never relaxed if the "
+            "eligible scenes cannot supply the full target."
         ),
     )
-    collect.add_argument("--num-trajectories", type=int, default=100)
+    collect.add_argument(
+        "--max-recovery-rounds",
+        type=int,
+        default=1,
+        help=(
+            "Additional all-scene sampling rounds after the initial scene-sharded "
+            "round. After this limit, publish the largest ratio-balanced set of "
+            "accepted trajectories instead of weakening quality gates."
+        ),
+    )
     collect.add_argument(
         "--r2r-ratio",
         type=float,
@@ -146,9 +162,31 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--seed", type=int, default=42)
     collect.add_argument("--gpu-device-id", type=int, default=0)
     collect.add_argument(
+        "--gpu-device-ids",
+        default=None,
+        help=(
+            "Comma-separated Habitat GPU IDs. With multiple process slots, scenes "
+            "are partitioned so one scene is owned by only one worker."
+        ),
+    )
+    collect.add_argument(
+        "--processes-per-gpu",
+        type=int,
+        default=1,
+        help="Independent Habitat collection processes assigned to each GPU.",
+    )
+    collect.add_argument(
         "--output",
         required=True,
         help="Internal trajectory dataset JSON.GZ used by later stages.",
+    )
+    collect.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume trajectory sampling from the single-worker SQLite checkpoint or "
+            "the per-worker checkpoint directory. State is removed after publication."
+        ),
     )
     collect.add_argument(
         "--overwrite",
@@ -171,6 +209,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate.add_argument("--goal-radius", type=float, default=0.3)
     validate.add_argument("--max-actions", type=int, default=500)
+    validate.add_argument(
+        "--drop-invalid",
+        action="store_true",
+        help=(
+            "Replace the trajectory and GT datasets with atomically written "
+            "subsets that pass every GT replay check. This is intended for "
+            "dataset creation, where quality is preferred over an exact count."
+        ),
+    )
 
     render = subparsers.add_parser(
         "render-panoramas",
@@ -198,6 +245,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum replay-position deviation in meters from GT locations.",
     )
     render.add_argument("--gpu-device-id", type=int, default=0)
+    render.add_argument(
+        "--gpu-device-ids",
+        default=None,
+        help="Comma-separated Habitat GPU IDs used by panorama workers.",
+    )
+    render.add_argument(
+        "--processes-per-gpu",
+        type=int,
+        default=1,
+        help="Independent panorama-rendering processes assigned to each GPU.",
+    )
+    render.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from the per-episode render journal and validated directories "
+            "left in OUTPUT_ROOT.rendering."
+        ),
+    )
     render.add_argument("--max-episodes", type=int, default=None)
     render.add_argument(
         "--allow-partial-render",
@@ -207,7 +273,46 @@ def build_parser() -> argparse.ArgumentParser:
             "The printed summary still marks selection_complete=false."
         ),
     )
+    render.add_argument(
+        "--generation-jsonl",
+        default=None,
+        help=(
+            "Instruction-generation input JSONL to keep aligned when invalid "
+            "rendered episodes are filtered."
+        ),
+    )
+    render.add_argument(
+        "--drop-invalid",
+        action="store_true",
+        help=(
+            "Publish only episodes whose panorama replay passes every hard check, "
+            "and filter dataset, GT, and generation JSONL to the same IDs."
+        ),
+    )
     return parser
+
+
+def habitat_process_slots(args: argparse.Namespace) -> List[int]:
+    """Expand GPU IDs into fixed process slots without changing CUDA visibility."""
+
+    raw_ids = getattr(args, "gpu_device_ids", None)
+    if raw_ids is None or not str(raw_ids).strip():
+        gpu_ids = [int(args.gpu_device_id)]
+    else:
+        try:
+            gpu_ids = [int(item.strip()) for item in str(raw_ids).split(",") if item.strip()]
+        except ValueError as error:
+            raise ValueError("--gpu-device-ids must be comma-separated integers") from error
+        if not gpu_ids:
+            raise ValueError("--gpu-device-ids must contain at least one GPU ID")
+        if len(set(gpu_ids)) != len(gpu_ids):
+            raise ValueError("--gpu-device-ids must not contain duplicates")
+        if min(gpu_ids) < 0:
+            raise ValueError("GPU device IDs must be non-negative")
+    processes_per_gpu = int(getattr(args, "processes_per_gpu", 1))
+    if processes_per_gpu <= 0:
+        raise ValueError("--processes-per-gpu must be positive")
+    return [gpu_id for gpu_id in gpu_ids for _ in range(processes_per_gpu)]
 
 
 def read_profile_distances(
@@ -264,7 +369,6 @@ def discover_scenes(
     root: str,
     split: str,
     scene_ids: Optional[str],
-    require_semantic_assets: bool = False,
 ) -> List[Path]:
     wanted = {
         item.strip() for item in (scene_ids or "").split(",") if item.strip()
@@ -280,15 +384,6 @@ def discover_scenes(
         raise FileNotFoundError(
             f"HM3D scenes are missing basis navmeshes: {missing_navmeshes[:10]}"
         )
-    if require_semantic_assets:
-        scenes = [
-            scene
-            for scene in scenes
-            if scene.with_name(scene.name.replace(".basis.glb", ".semantic.glb")).is_file()
-            and scene.with_name(
-                scene.name.replace(".basis.glb", ".semantic.txt")
-            ).is_file()
-        ]
     if wanted:
         scenes = [scene for scene in scenes if scene.parent.name in wanted]
         missing = sorted(wanted - {scene.parent.name for scene in scenes})
@@ -911,6 +1006,183 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     os.replace(temporary, path)
 
 
+COLLECT_CHECKPOINT_SCHEMA = "panovln-collect-checkpoint-v1"
+
+
+def nested_tuple(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(nested_tuple(item) for item in value)
+    return value
+
+
+def collect_run_manifest(
+    args: argparse.Namespace,
+    scenes: Sequence[Path],
+) -> Dict[str, Any]:
+    # Hardware scheduling can be changed when resuming without changing the
+    # requested dataset. Sampling parameters and scene ownership remain hashed.
+    excluded = {
+        "command",
+        "output",
+        "overwrite",
+        "resume",
+        "gpu_device_id",
+        "gpu_device_ids",
+        "processes_per_gpu",
+    }
+    configuration = {
+        key: value
+        for key, value in sorted(vars(args).items())
+        if key not in excluded and not key.startswith("_")
+    }
+    configuration["scene_root"] = str(Path(args.scene_root).resolve())
+    profile_path = Path(args.trajectory_profile_config).resolve()
+    configuration["trajectory_profile_config"] = str(profile_path)
+    configuration["trajectory_profile_sha256"] = sha256_file(profile_path)
+    configuration["ordered_scenes"] = [
+        public_scene_id(scene, args.scene_root) for scene in scenes
+    ]
+    encoded = json.dumps(
+        configuration, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "schema_version": COLLECT_CHECKPOINT_SCHEMA,
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+        "configuration": configuration,
+    }
+
+
+def candidate_sampling_seed(base_seed: int, scene_index: int, attempt_index: int) -> int:
+    encoded = f"{base_seed}:{scene_index}:{attempt_index}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:4], "little")
+
+
+def remove_collect_checkpoint(path: Path) -> None:
+    for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        candidate.unlink(missing_ok=True)
+
+
+class CollectCheckpoint:
+    """Transactional trajectory rows plus compact resumable sampler state."""
+
+    def __init__(
+        self,
+        path: Path,
+        manifest: Dict[str, Any],
+        initial_state: Dict[str, Any],
+        resume: bool,
+    ) -> None:
+        existed = path.exists()
+        if existed and not resume:
+            raise FileExistsError(
+                f"Trajectory checkpoint exists; rerun with --resume: {path}"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=FULL")
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS metadata "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS trajectories "
+            "(episode_id INTEGER PRIMARY KEY, row_json TEXT NOT NULL)"
+        )
+        self.connection.commit()
+
+        if existed:
+            try:
+                stored_manifest = self._read_metadata("manifest")
+                if stored_manifest.get("schema_version") != COLLECT_CHECKPOINT_SCHEMA:
+                    raise ValueError(f"Unsupported trajectory checkpoint schema: {path}")
+                if stored_manifest.get("fingerprint") != manifest["fingerprint"]:
+                    raise ValueError(
+                        "Trajectory resume inputs or sampling parameters changed. Preserve "
+                        f"the old checkpoint for inspection or remove it: {path}"
+                    )
+                self.state = self._read_metadata("state")
+            except Exception:
+                self.connection.close()
+                raise
+        else:
+            self.state = initial_state
+            with self.connection:
+                self._write_metadata("manifest", manifest)
+                self._write_metadata("state", initial_state)
+
+    def _read_metadata(self, key: str) -> Dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Trajectory checkpoint is missing metadata {key!r}")
+        value = json.loads(row[0])
+        if not isinstance(value, dict):
+            raise ValueError(f"Trajectory checkpoint metadata {key!r} is invalid")
+        return value
+
+    def _write_metadata(self, key: str, value: Dict[str, Any]) -> None:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        self.connection.execute(
+            "INSERT INTO metadata(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, encoded),
+        )
+
+    def load_trajectories(self) -> List[Dict[str, Any]]:
+        rows = []
+        for expected_id, (episode_id, row_json) in enumerate(
+            self.connection.execute(
+                "SELECT episode_id, row_json FROM trajectories ORDER BY episode_id"
+            )
+        ):
+            if episode_id != expected_id:
+                raise ValueError(
+                    "Trajectory checkpoint episode IDs are not contiguous: "
+                    f"expected={expected_id}, actual={episode_id}"
+                )
+            row = json.loads(row_json)
+            if not isinstance(row, dict) or row.get("episode_id") != episode_id:
+                raise ValueError(
+                    f"Trajectory checkpoint row {episode_id} is malformed"
+                )
+            rows.append(row)
+        if int(self.state.get("collected_count", -1)) != len(rows):
+            raise ValueError(
+                "Trajectory checkpoint state/row count mismatch: "
+                f"state={self.state.get('collected_count')}, rows={len(rows)}"
+            )
+        return rows
+
+    def commit(
+        self,
+        state: Dict[str, Any],
+        trajectory: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        with self.connection:
+            if trajectory is not None:
+                episode_id = int(trajectory["episode_id"])
+                self.connection.execute(
+                    "INSERT INTO trajectories(episode_id, row_json) VALUES (?, ?)",
+                    (
+                        episode_id,
+                        json.dumps(
+                            trajectory,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            self._write_metadata("state", state)
+        self.state = state
+
+    def close(self) -> None:
+        self.connection.close()
+
+
 def summarize_trajectories(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     def dist(key: str, subset: Sequence[Dict[str, Any]] = rows) -> Dict[str, float]:
         values = [float(row["metrics"][key]) for row in subset]
@@ -987,15 +1259,543 @@ def summarize_trajectories(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _balanced_counts(total: int, parts: int) -> List[int]:
+    if total < 0 or parts <= 0:
+        raise ValueError("Balanced allocation requires total >= 0 and parts > 0")
+    quotient, remainder = divmod(total, parts)
+    return [quotient + (index < remainder) for index in range(parts)]
+
+
+def _collect_worker_entry(worker_args: argparse.Namespace) -> None:
+    """Spawn-safe collection worker; its output/checkpoint belongs to one shard."""
+
+    _collect_sequential(worker_args)
+
+
+def _collect_shard_progress(output: Path, checkpoint: Path, expected: int) -> int:
+    if output.is_file():
+        return expected
+    if not checkpoint.is_file():
+        return 0
+    try:
+        connection = sqlite3.connect(f"file:{checkpoint}?mode=ro", uri=True, timeout=0.1)
+        try:
+            row = connection.execute("SELECT COUNT(*) FROM trajectories").fetchone()
+            return min(expected, int(row[0]) if row else 0)
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _largest_ratio_balanced_set(
+    episodes: Sequence[Dict[str, Any]],
+    desired_total: int,
+    r2r_ratio: float,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Return the largest unique subset that preserves the requested family ratio."""
+
+    unique: List[Dict[str, Any]] = []
+    seen_hashes = set()
+    duplicate_count = 0
+    for episode in episodes:
+        route_hash = (episode.get("info") or {}).get("route_hash")
+        if not route_hash:
+            raise RuntimeError("Collected trajectory is missing route_hash")
+        route_hash = str(route_hash)
+        if route_hash in seen_hashes:
+            duplicate_count += 1
+            continue
+        family = (episode.get("info") or {}).get("family")
+        if family not in {"r2r", "rxr"}:
+            raise RuntimeError(f"Collected trajectory has invalid family: {family!r}")
+        seen_hashes.add(route_hash)
+        unique.append(episode)
+
+    available = {
+        family: sum((episode.get("info") or {}).get("family") == family for episode in unique)
+        for family in ("r2r", "rxr")
+    }
+    final_total = min(int(desired_total), len(unique))
+    while final_total > 0:
+        r2r_count = int(math.floor(final_total * r2r_ratio + 0.5))
+        rxr_count = final_total - r2r_count
+        if r2r_count <= available["r2r"] and rxr_count <= available["rxr"]:
+            break
+        final_total -= 1
+    if final_total <= 0:
+        raise RuntimeError(
+            "Accepted trajectories cannot form a non-empty set at the requested "
+            f"R2R/RxR ratio; available={available}"
+        )
+
+    required_r2r = int(math.floor(final_total * r2r_ratio + 0.5))
+    required = {"r2r": required_r2r, "rxr": final_total - required_r2r}
+    kept = {"r2r": 0, "rxr": 0}
+    selected: List[Dict[str, Any]] = []
+    for episode in unique:
+        family = str((episode.get("info") or {}).get("family"))
+        if kept[family] >= required[family]:
+            continue
+        selected.append(episode)
+        kept[family] += 1
+    if kept != required:
+        raise RuntimeError(
+            f"Failed to construct ratio-balanced set: required={required}, kept={kept}"
+        )
+    return selected, duplicate_count
+
+
+def _collect_parallel(args: argparse.Namespace, slots: Sequence[int]) -> None:
+    """Collect scene shards and publish the largest quality-passing balanced set."""
+
+    recovery_depth = int(getattr(args, "_recovery_depth", 0))
+    output_path = Path(args.output)
+    partial_path = Path(str(output_path) + ".partial")
+    checkpoint_path = Path(str(output_path) + ".collect.sqlite3")
+    shard_root = Path(str(output_path) + ".collect_workers")
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive")
+    if args.overwrite:
+        output_path.unlink(missing_ok=True)
+        partial_path.unlink(missing_ok=True)
+        remove_collect_checkpoint(checkpoint_path)
+        if shard_root.exists():
+            shutil.rmtree(shard_root)
+    if output_path.exists():
+        if not args.resume:
+            raise FileExistsError(
+                f"Trajectory output already exists; use --resume or --overwrite: {output_path}"
+            )
+        with gzip.open(output_path, "rt", encoding="utf-8") as handle:
+            existing_dataset = json.load(handle)
+        existing_episodes = existing_dataset.get("episodes")
+        if not isinstance(existing_episodes, list) or (
+            not existing_episodes and recovery_depth == 0
+        ):
+            raise ValueError(
+                f"Existing trajectory output does not contain valid episodes: {output_path}"
+            )
+        if not existing_episodes:
+            if shard_root.exists():
+                shutil.rmtree(shard_root)
+            print(f"[collect] recovery round already recorded no progress: {output_path}")
+            return
+        balanced, duplicates = _largest_ratio_balanced_set(
+            existing_episodes,
+            min(len(existing_episodes), int(args.num_trajectories)),
+            float(args.r2r_ratio),
+        )
+        if len(balanced) != len(existing_episodes) or duplicates:
+            raise ValueError(
+                "Existing trajectory output is not unique and ratio-balanced for the "
+                f"current request: {output_path}"
+            )
+        if shard_root.exists():
+            shutil.rmtree(shard_root)
+        remove_collect_checkpoint(checkpoint_path)
+        partial_path.unlink(missing_ok=True)
+        print(
+            f"[collect] already published: {output_path} "
+            f"({len(existing_episodes)}/{args.num_trajectories} desired)",
+            flush=True,
+        )
+        return
+    if checkpoint_path.exists():
+        raise ValueError(
+            "A single-process trajectory checkpoint already exists. Resume once with "
+            "one collection process, or use --overwrite before changing to parallel collection: "
+            f"{checkpoint_path}"
+        )
+    if shard_root.exists() and not args.resume:
+        raise FileExistsError(
+            f"Parallel collection state exists; rerun with --resume: {shard_root}"
+        )
+    if partial_path.exists() and not shard_root.exists():
+        raise FileExistsError(
+            "A failed partial trajectory file exists without parallel checkpoints; "
+            f"inspect it and use --overwrite to restart: {partial_path}"
+        )
+
+    assignment_rng = random.Random(args.seed)
+    scenes = discover_scenes(args.scene_root, args.split, args.scene_ids)
+    assignment_rng.shuffle(scenes)
+    worker_count = min(len(slots), len(scenes), int(args.num_trajectories))
+    if worker_count <= 1:
+        single_args = copy.deepcopy(args)
+        single_args.gpu_device_id = int(slots[0])
+        single_args.gpu_device_ids = None
+        single_args.processes_per_gpu = 1
+        collect(single_args)
+        return
+
+    active_slots = list(slots[:worker_count])
+    scene_shards = [scenes[index::worker_count] for index in range(worker_count)]
+    trajectory_counts = _balanced_counts(int(args.num_trajectories), worker_count)
+    total_r2r = int(math.floor(args.num_trajectories * args.r2r_ratio + 0.5))
+    family_plan = ["r2r"] * total_r2r + ["rxr"] * (args.num_trajectories - total_r2r)
+    assignment_rng.shuffle(family_plan)
+
+    shard_root.mkdir(parents=True, exist_ok=True)
+    worker_args_list: List[argparse.Namespace] = []
+    shard_outputs: List[Path] = []
+    offset = 0
+    for worker_id, (gpu_id, count, scene_shard) in enumerate(
+        zip(active_slots, trajectory_counts, scene_shards)
+    ):
+        shard_families = family_plan[offset : offset + count]
+        offset += count
+        r2r_count = shard_families.count("r2r")
+        shard_output = shard_root / f"worker_{worker_id:03d}.json.gz"
+        shard_outputs.append(shard_output)
+        worker_args = copy.deepcopy(args)
+        worker_args.output = str(shard_output)
+        worker_args.num_trajectories = count
+        worker_args.r2r_ratio = r2r_count / count
+        worker_args.rxr_ratio = 1.0 - worker_args.r2r_ratio
+        worker_args.scene_ids = ",".join(scene.parent.name for scene in scene_shard)
+        worker_args.seed = candidate_sampling_seed(args.seed, worker_id, count)
+        worker_args.gpu_device_id = int(gpu_id)
+        worker_args.gpu_device_ids = None
+        worker_args.processes_per_gpu = 1
+        worker_args.overwrite = False
+        worker_args._disable_progress = True
+        worker_args._quiet_output = True
+        worker_args._allow_partial = True
+        worker_args_list.append(worker_args)
+
+    context = multiprocessing.get_context("spawn")
+    processes: List[multiprocessing.Process] = []
+    progress = tqdm(
+        total=args.num_trajectories,
+        desc="trajectory",
+        unit="ep",
+        dynamic_ncols=True,
+    )
+    observed = [0] * worker_count
+    try:
+        for worker_id, worker_args in enumerate(worker_args_list):
+            process = context.Process(
+                target=_collect_worker_entry,
+                args=(worker_args,),
+                name=f"trajectory-gpu{worker_args.gpu_device_id}-worker{worker_id}",
+            )
+            process.start()
+            processes.append(process)
+
+        while any(process.is_alive() for process in processes):
+            for worker_id, (shard_output, expected) in enumerate(
+                zip(shard_outputs, trajectory_counts)
+            ):
+                current = _collect_shard_progress(
+                    shard_output,
+                    Path(str(shard_output) + ".collect.sqlite3"),
+                    expected,
+                )
+                if current > observed[worker_id]:
+                    progress.update(current - observed[worker_id])
+                    observed[worker_id] = current
+            progress.set_postfix(
+                workers=worker_count,
+                alive=sum(process.is_alive() for process in processes),
+                gpus=",".join(str(gpu) for gpu in sorted(set(active_slots))),
+                refresh=False,
+            )
+            failed = [
+                process
+                for process in processes
+                if process.exitcode not in (None, 0)
+            ]
+            if failed:
+                raise RuntimeError(
+                    "Parallel trajectory worker failed: "
+                    + ", ".join(f"{process.name}={process.exitcode}" for process in failed)
+                )
+            time.sleep(0.25)
+        for process in processes:
+            process.join()
+        failed = [process for process in processes if process.exitcode != 0]
+        if failed:
+            raise RuntimeError(
+                "Parallel trajectory worker failed: "
+                + ", ".join(f"{process.name}={process.exitcode}" for process in failed)
+            )
+        # Capture the last transactions committed immediately before each
+        # worker exited. A capacity-exhausted shard can legitimately be short.
+        for worker_id, expected in enumerate(trajectory_counts):
+            current = _collect_shard_progress(
+                shard_outputs[worker_id],
+                Path(str(shard_outputs[worker_id]) + ".collect.sqlite3"),
+                expected,
+            )
+            if current > observed[worker_id]:
+                progress.update(current - observed[worker_id])
+                observed[worker_id] = current
+    except (Exception, KeyboardInterrupt):
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=10)
+        raise
+    finally:
+        progress.close()
+
+    merged: List[Dict[str, Any]] = []
+    for shard_output, expected in zip(shard_outputs, trajectory_counts):
+        partial_shard = Path(str(shard_output) + ".partial")
+        published_shard = shard_output if shard_output.is_file() else partial_shard
+        if not published_shard.is_file():
+            raise FileNotFoundError(
+                f"Collection worker did not publish complete or partial data: {shard_output}"
+            )
+        with gzip.open(published_shard, "rt", encoding="utf-8") as handle:
+            shard_dataset = json.load(handle)
+        shard_episodes = shard_dataset.get("episodes")
+        if (
+            not isinstance(shard_episodes, list)
+            or len(shard_episodes) > expected
+        ):
+            raise ValueError(
+                f"Invalid collection shard {published_shard}: "
+                f"expected at most {expected} episodes"
+            )
+        merged.extend(shard_episodes)
+
+    family_counts = {
+        family: sum((episode.get("info") or {}).get("family") == family for episode in merged)
+        for family in ("r2r", "rxr")
+    }
+    expected_family_counts = {
+        "r2r": total_r2r,
+        "rxr": args.num_trajectories - total_r2r,
+    }
+    remaining_family_counts = {
+        family: expected_family_counts[family] - family_counts[family]
+        for family in ("r2r", "rxr")
+    }
+    if min(remaining_family_counts.values()) < 0:
+        raise RuntimeError(
+            "Collection shards exceeded a requested family count: "
+            f"expected={expected_family_counts}, actual={family_counts}"
+        )
+    missing_count = sum(remaining_family_counts.values())
+    recovered_count = 0
+    if missing_count:
+        max_recovery_rounds = int(args.max_recovery_rounds)
+        if recovery_depth < max_recovery_rounds:
+            print(
+                "[collect] scene shards exhausted before reaching the desired count; "
+                f"starting recovery round {recovery_depth + 1}/{max_recovery_rounds} "
+                f"for up to {missing_count} trajectories "
+                f"(r2r={remaining_family_counts['r2r']}, "
+                f"rxr={remaining_family_counts['rxr']}).",
+                flush=True,
+            )
+            recovery_output = shard_root / "recovery.json.gz"
+            recovery_args = copy.deepcopy(args)
+            recovery_args.output = str(recovery_output)
+            recovery_args.num_trajectories = missing_count
+            recovery_args.r2r_ratio = remaining_family_counts["r2r"] / missing_count
+            recovery_args.rxr_ratio = remaining_family_counts["rxr"] / missing_count
+            recovery_args.seed = candidate_sampling_seed(
+                args.seed,
+                10_000 + recovery_depth,
+                missing_count,
+            )
+            recovery_args.resume = True
+            recovery_args.overwrite = False
+            recovery_args._recovery_depth = recovery_depth + 1
+            _collect_parallel(recovery_args, slots)
+            with gzip.open(recovery_output, "rt", encoding="utf-8") as handle:
+                recovery_dataset = json.load(handle)
+            recovery_episodes = recovery_dataset.get("episodes")
+            if (
+                not isinstance(recovery_episodes, list)
+                or len(recovery_episodes) > missing_count
+            ):
+                raise RuntimeError(
+                    f"Trajectory recovery produced an invalid dataset: {recovery_output}"
+                )
+            merged.extend(recovery_episodes)
+            recovered_count = len(recovery_episodes)
+        else:
+            print(
+                "[collect] desired count is unavailable after the configured recovery "
+                "rounds; publishing the largest quality-passing balanced dataset.",
+                flush=True,
+            )
+
+    if not merged:
+        if recovery_depth == 0:
+            raise RuntimeError("Parallel collection made no progress in any scene shard")
+        atomic_json_gz(
+            output_path,
+            {"episodes": [], "instruction_vocab": EMPTY_INSTRUCTION_VOCAB},
+        )
+        partial_path.unlink(missing_ok=True)
+        shutil.rmtree(shard_root)
+        print(
+            "[collect] recovery round produced no additional quality-passing trajectories.",
+            flush=True,
+        )
+        return
+
+    merged, duplicate_count = _largest_ratio_balanced_set(
+        merged,
+        int(args.num_trajectories),
+        float(args.r2r_ratio),
+    )
+    family_counts = {
+        family: sum((episode.get("info") or {}).get("family") == family for episode in merged)
+        for family in ("r2r", "rxr")
+    }
+
+    for episode_id, episode in enumerate(merged):
+        episode["episode_id"] = episode_id
+        episode["trajectory_id"] = episode_id
+    hashes = [str((episode.get("info") or {}).get("route_hash")) for episode in merged]
+    if len(set(hashes)) != len(hashes) or "None" in hashes:
+        raise RuntimeError("Merged trajectory shards contain missing or duplicate route hashes")
+
+    atomic_json_gz(
+        output_path,
+        {"episodes": merged, "instruction_vocab": EMPTY_INSTRUCTION_VOCAB},
+    )
+    partial_path.unlink(missing_ok=True)
+    shutil.rmtree(shard_root)
+    print(
+        json.dumps(
+            {
+                "schema_version": "panovln-hm3d-trajectory-parallel-v1",
+                "status": (
+                    "target_reached"
+                    if len(merged) == args.num_trajectories
+                    else "quality_limited"
+                ),
+                "dataset": str(output_path),
+                "desired_trajectories": int(args.num_trajectories),
+                "trajectories": len(merged),
+                "family_counts": family_counts,
+                "scenes": len({episode["scene_id"] for episode in merged}),
+                "workers": worker_count,
+                "gpu_process_slots": active_slots,
+                "recovered_trajectories": recovered_count,
+                "deduplicated_trajectories": duplicate_count,
+                "all_hard_checks_pass": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def collect(args: argparse.Namespace) -> None:
+    if int(args.max_recovery_rounds) < 0:
+        raise ValueError("--max-recovery-rounds must be non-negative")
+    slots = habitat_process_slots(args)
+    if len(slots) == 1:
+        args.gpu_device_id = int(slots[0])
+        args._allow_partial = True
+        _collect_sequential(args)
+        output_path = Path(args.output)
+        partial_path = Path(str(output_path) + ".partial")
+        if output_path.is_file():
+            return
+        if not partial_path.is_file():
+            raise RuntimeError("Single-process collector did not publish any trajectories")
+        with gzip.open(partial_path, "rt", encoding="utf-8") as handle:
+            partial_dataset = json.load(handle)
+        partial_episodes = partial_dataset.get("episodes")
+        if not isinstance(partial_episodes, list):
+            raise RuntimeError(f"Invalid partial trajectory dataset: {partial_path}")
+        selected, duplicate_count = _largest_ratio_balanced_set(
+            partial_episodes,
+            int(args.num_trajectories),
+            float(args.r2r_ratio),
+        )
+        for episode_id, episode in enumerate(selected):
+            episode["episode_id"] = episode_id
+            episode["trajectory_id"] = episode_id
+        atomic_json_gz(
+            output_path,
+            {"episodes": selected, "instruction_vocab": EMPTY_INSTRUCTION_VOCAB},
+        )
+        partial_path.unlink(missing_ok=True)
+        remove_collect_checkpoint(Path(str(output_path) + ".collect.sqlite3"))
+        print(
+            json.dumps(
+                {
+                    "schema_version": "panovln-hm3d-trajectory-single-v1",
+                    "status": "quality_limited",
+                    "dataset": str(output_path),
+                    "desired_trajectories": int(args.num_trajectories),
+                    "trajectories": len(selected),
+                    "deduplicated_trajectories": duplicate_count,
+                    "all_hard_checks_pass": True,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        _collect_parallel(args, slots)
+
+
+def _collect_sequential(args: argparse.Namespace) -> None:
     os.environ.setdefault("MAGNUM_LOG", "quiet")
     os.environ.setdefault("HABITAT_SIM_LOG", "quiet")
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite are mutually exclusive")
+
+    output_path = Path(args.output)
+    partial_path = Path(str(output_path) + ".partial")
+    checkpoint_path = Path(str(output_path) + ".collect.sqlite3")
+    if args.overwrite:
+        output_path.unlink(missing_ok=True)
+        partial_path.unlink(missing_ok=True)
+        remove_collect_checkpoint(checkpoint_path)
+    if output_path.exists():
+        if not args.resume:
+            raise FileExistsError(
+                f"Trajectory output already exists; use --resume or --overwrite: {output_path}"
+            )
+        with gzip.open(output_path, "rt", encoding="utf-8") as handle:
+            existing_dataset = json.load(handle)
+        existing_episodes = existing_dataset.get("episodes")
+        if not isinstance(existing_episodes, list) or not existing_episodes:
+            raise ValueError(
+                f"Existing trajectory output does not contain valid episodes: {output_path}"
+            )
+        balanced, duplicates = _largest_ratio_balanced_set(
+            existing_episodes,
+            min(len(existing_episodes), int(args.num_trajectories)),
+            float(args.r2r_ratio),
+        )
+        if len(balanced) != len(existing_episodes) or duplicates:
+            raise ValueError(
+                "Existing trajectory output is not unique and ratio-balanced for the "
+                f"current request: {output_path}"
+            )
+        remove_collect_checkpoint(checkpoint_path)
+        partial_path.unlink(missing_ok=True)
+        print(
+            f"[collect] already published: {output_path} "
+            f"({len(existing_episodes)}/{args.num_trajectories} desired)",
+            flush=True,
+        )
+        return
+    if partial_path.exists() and not checkpoint_path.exists():
+        raise FileExistsError(
+            "A legacy/failed partial trajectory file exists without a resumable "
+            f"checkpoint; inspect it and use --overwrite to restart: {partial_path}"
+        )
+
     rng = random.Random(args.seed)
     scenes = discover_scenes(
         args.scene_root,
         args.split,
         args.scene_ids,
-        args.require_semantic_assets,
     )
     # A seeded shuffle avoids lexicographic scene bias while remaining reproducible.
     rng.shuffle(scenes)
@@ -1030,105 +1830,249 @@ def collect(args: argparse.Namespace) -> None:
         else []
     )
     planned_detours = distribute_detours(families, args.rxr_detour_fraction, rng)
-    output_path = Path(args.output)
-    partial_path = Path(str(output_path) + ".partial")
-    existing = [path for path in (output_path, partial_path) if path.exists()]
-    if existing and not args.overwrite:
-        raise FileExistsError(
-            "Trajectory output already exists; use --overwrite to replace it: "
-            + ", ".join(str(path) for path in existing)
-        )
-    if args.overwrite:
-        output_path.unlink(missing_ok=True)
-        partial_path.unlink(missing_ok=True)
-    collected: List[Dict[str, Any]] = []
-    hashes = set()
-    failures = []
+    initial_state = {
+        "scene_index": 0,
+        "scene_quota": 0,
+        "accepted_in_scene": 0,
+        "consecutive_failures_in_scene": 0,
+        "attempt_index": 0,
+        "collected_count": 0,
+        "sampling_failure_count": 0,
+        "sampling_failure_preview": [],
+        "rng_state": rng.getstate(),
+    }
+    checkpoint = CollectCheckpoint(
+        checkpoint_path,
+        collect_run_manifest(args, scenes),
+        initial_state,
+        resume=bool(args.resume),
+    )
+    try:
+        state = checkpoint.state
+        collected = checkpoint.load_trajectories()
+    except Exception:
+        checkpoint.close()
+        raise
+    if not 0 <= int(state.get("scene_index", -1)) <= len(scenes):
+        checkpoint.close()
+        raise ValueError("Trajectory checkpoint has an invalid scene index")
+    if len(collected) > args.num_trajectories:
+        checkpoint.close()
+        raise ValueError("Trajectory checkpoint exceeds requested trajectory count")
+    rng.setstate(nested_tuple(state["rng_state"]))
+    hashes = {str(row["route_hash"]) for row in collected}
+    if len(hashes) != len(collected):
+        checkpoint.close()
+        raise ValueError("Trajectory checkpoint contains duplicate route hashes")
+    family_counts = {
+        family: sum(row["family"] == family for row in collected)
+        for family in ("r2r", "rxr")
+    }
+    progress = tqdm(
+        total=args.num_trajectories,
+        initial=len(collected),
+        desc=str(getattr(args, "_progress_desc", "trajectory")),
+        unit="ep",
+        dynamic_ncols=True,
+        disable=bool(getattr(args, "_disable_progress", False)),
+    )
 
-    for scene_index, scene in enumerate(scenes):
-        remaining_scenes = len(scenes) - scene_index
-        remaining_routes = args.num_trajectories - len(collected)
-        if remaining_routes <= 0:
-            break
-        quota = math.ceil(remaining_routes / remaining_scenes)
-        simulator = make_simulator(scene, args, args.seed + scene_index)
-        scene_id = public_scene_id(scene, args.scene_root)
-        accepted_here = 0
-        exhausted_here = 0
-        try:
-            while accepted_here < quota and len(collected) < args.num_trajectories:
-                family = families[len(collected)]
-                distances = r2r_distances if family == "r2r" else rxr_distances
-                target_distance = rng.choice(distances)
-                make_detour = planned_detours[len(collected)]
-                sampled = sample_one(
-                    simulator,
-                    family,
-                    target_distance,
-                    make_detour,
-                    rng,
-                    args,
+    def update_state(
+        *,
+        scene_index: int,
+        scene_quota: int,
+        accepted_in_scene: int,
+        consecutive_failures: int,
+        attempt_index: int,
+        collected_count: int,
+        failure_count: int,
+        failure_preview: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "scene_index": scene_index,
+            "scene_quota": scene_quota,
+            "accepted_in_scene": accepted_in_scene,
+            "consecutive_failures_in_scene": consecutive_failures,
+            "attempt_index": attempt_index,
+            "collected_count": collected_count,
+            "sampling_failure_count": failure_count,
+            "sampling_failure_preview": list(failure_preview),
+            "rng_state": rng.getstate(),
+        }
+
+    try:
+        scene_index = int(state["scene_index"])
+        while scene_index < len(scenes) and len(collected) < args.num_trajectories:
+            remaining_scenes = len(scenes) - scene_index
+            remaining_routes = args.num_trajectories - len(collected)
+            scene_quota = int(state.get("scene_quota", 0))
+            if scene_quota <= 0:
+                scene_quota = math.ceil(remaining_routes / remaining_scenes)
+                state = update_state(
+                    scene_index=scene_index,
+                    scene_quota=scene_quota,
+                    accepted_in_scene=0,
+                    consecutive_failures=0,
+                    attempt_index=int(state["attempt_index"]),
+                    collected_count=len(collected),
+                    failure_count=int(state["sampling_failure_count"]),
+                    failure_preview=state["sampling_failure_preview"],
                 )
-                if sampled is None:
-                    exhausted_here += 1
-                    failures.append(
-                        {
+                checkpoint.commit(state)
+
+            scene = scenes[scene_index]
+            scene_id = public_scene_id(scene, args.scene_root)
+            accepted_here = int(state["accepted_in_scene"])
+            exhausted_here = int(state["consecutive_failures_in_scene"])
+            attempt_index = int(state["attempt_index"])
+            failure_count = int(state["sampling_failure_count"])
+            failure_preview = list(state["sampling_failure_preview"])
+            simulator = make_simulator(scene, args, args.seed + scene_index)
+            try:
+                while accepted_here < scene_quota and len(collected) < args.num_trajectories:
+                    episode_index = len(collected)
+                    family = families[episode_index]
+                    distances = r2r_distances if family == "r2r" else rxr_distances
+                    target_distance = rng.choice(distances)
+                    make_detour = planned_detours[episode_index]
+                    progress.set_postfix(
+                        scene=scene.parent.name,
+                        family=family,
+                        r2r=family_counts["r2r"],
+                        rxr=family_counts["rxr"],
+                        failures=failure_count,
+                        attempts=attempt_index,
+                        refresh=False,
+                    )
+                    simulator.pathfinder.seed(
+                        candidate_sampling_seed(args.seed, scene_index, attempt_index)
+                    )
+                    sampled = sample_one(
+                        simulator,
+                        family,
+                        target_distance,
+                        make_detour,
+                        rng,
+                        args,
+                    )
+                    attempt_index += 1
+                    failure: Optional[Dict[str, Any]] = None
+                    if sampled is None:
+                        exhausted_here += 1
+                        failure = {
                             "scene_id": scene_id,
                             "family": family,
                             "target_distance": target_distance,
                             "detour": make_detour,
                             "reason": "sampling_attempts_exhausted",
                         }
-                    )
-                    if exhausted_here >= args.max_sampling_failures_per_scene:
-                        break
-                    continue
-                visual_metrics = route_visual_metrics(
-                    simulator,
-                    sampled["route_keypoints"],
-                    args.max_visual_checkpoints,
-                )
-                sampled["metrics"].update(visual_metrics)
-                if visual_metrics["visual_black_ratio_max"] > args.max_black_ratio:
-                    exhausted_here += 1
-                    failures.append(
+                    else:
+                        visual_metrics = route_visual_metrics(
+                            simulator,
+                            sampled["route_keypoints"],
+                            args.max_visual_checkpoints,
+                        )
+                        sampled["metrics"].update(visual_metrics)
+                        if visual_metrics["visual_black_ratio_max"] > args.max_black_ratio:
+                            exhausted_here += 1
+                            failure = {
+                                "scene_id": scene_id,
+                                "family": family,
+                                "target_distance": target_distance,
+                                "detour": make_detour,
+                                "reason": "visual_scan_void",
+                                **visual_metrics,
+                            }
+
+                    digest = None
+                    if sampled is not None and failure is None:
+                        digest = route_hash(scene_id, sampled["reference_path"])
+                        if digest in hashes:
+                            exhausted_here += 1
+                            failure = {
+                                "scene_id": scene_id,
+                                "family": family,
+                                "target_distance": target_distance,
+                                "detour": make_detour,
+                                "reason": "duplicate_route_hash",
+                            }
+
+                    if failure is not None:
+                        failure_count += 1
+                        if len(failure_preview) < 20:
+                            failure_preview.append(failure)
+                        state = update_state(
+                            scene_index=scene_index,
+                            scene_quota=scene_quota,
+                            accepted_in_scene=accepted_here,
+                            consecutive_failures=exhausted_here,
+                            attempt_index=attempt_index,
+                            collected_count=len(collected),
+                            failure_count=failure_count,
+                            failure_preview=failure_preview,
+                        )
+                        checkpoint.commit(state)
+                        if exhausted_here >= args.max_sampling_failures_per_scene:
+                            break
+                        continue
+
+                    assert sampled is not None and digest is not None
+                    episode_id = len(collected)
+                    sampled.update(
                         {
+                            "episode_id": episode_id,
+                            # Physical trajectory IDs also key panorama directories.
+                            "trajectory_id": episode_id,
                             "scene_id": scene_id,
-                            "family": family,
-                            "target_distance": target_distance,
-                            "detour": make_detour,
-                            "reason": "visual_scan_void",
-                            **visual_metrics,
+                            "scene_path": str(scene),
+                            "route_hash": digest,
+                            "seed": args.seed,
                         }
                     )
-                    if exhausted_here >= args.max_sampling_failures_per_scene:
-                        break
-                    continue
-                digest = route_hash(scene_id, sampled["reference_path"])
-                if digest in hashes:
-                    exhausted_here += 1
-                    if exhausted_here >= args.max_sampling_failures_per_scene:
-                        break
-                    continue
-                hashes.add(digest)
-                episode_id = len(collected)
-                sampled.update(
-                    {
-                        "episode_id": episode_id,
-                        # Rendering and export key physical trajectories by the
-                        # source episode ID, matching R2R/ScaleVLN conventions.
-                        "trajectory_id": episode_id,
-                        "scene_id": scene_id,
-                        "scene_path": str(scene),
-                        "route_hash": digest,
-                        "seed": args.seed,
-                    }
-                )
-                collected.append(sampled)
-                accepted_here += 1
-                exhausted_here = 0
-        finally:
-            simulator.close()
+                    accepted_here += 1
+                    exhausted_here = 0
+                    state = update_state(
+                        scene_index=scene_index,
+                        scene_quota=scene_quota,
+                        accepted_in_scene=accepted_here,
+                        consecutive_failures=exhausted_here,
+                        attempt_index=attempt_index,
+                        collected_count=len(collected) + 1,
+                        failure_count=failure_count,
+                        failure_preview=failure_preview,
+                    )
+                    checkpoint.commit(state, trajectory=sampled)
+                    collected.append(sampled)
+                    hashes.add(digest)
+                    family_counts[family] += 1
+                    progress.set_postfix(
+                        scene=scene.parent.name,
+                        family=family,
+                        r2r=family_counts["r2r"],
+                        rxr=family_counts["rxr"],
+                        failures=failure_count,
+                        attempts=attempt_index,
+                        refresh=False,
+                    )
+                    progress.update(1)
+            finally:
+                simulator.close()
+
+            scene_index += 1
+            state = update_state(
+                scene_index=scene_index,
+                scene_quota=0,
+                accepted_in_scene=0,
+                consecutive_failures=0,
+                attempt_index=attempt_index,
+                collected_count=len(collected),
+                failure_count=failure_count,
+                failure_preview=failure_preview,
+            )
+            checkpoint.commit(state)
+    finally:
+        progress.close()
+        checkpoint.close()
 
     episodes = []
     for row in collected:
@@ -1229,8 +2173,8 @@ def collect(args: argparse.Namespace) -> None:
         },
         "expected_family_counts": expected_family_counts,
         "summary": summary,
-        "sampling_failures": len(failures),
-        "sampling_failure_preview": failures[:20],
+        "sampling_failures": int(state["sampling_failure_count"]),
+        "sampling_failure_preview": state["sampling_failure_preview"],
         "hard_checks": hard_checks,
     }
     atomic_json_gz(
@@ -1239,11 +2183,15 @@ def collect(args: argparse.Namespace) -> None:
     )
     if complete:
         partial_path.unlink(missing_ok=True)
-    print(json.dumps(publication, ensure_ascii=False, indent=2))
+        remove_collect_checkpoint(checkpoint_path)
+    if not bool(getattr(args, "_quiet_output", False)):
+        print(json.dumps(publication, ensure_ascii=False, indent=2))
     if len(collected) != args.num_trajectories:
+        if bool(getattr(args, "_allow_partial", False)):
+            return
         raise RuntimeError(
             f"Collected {len(collected)}/{args.num_trajectories}; "
-            f"sampling_failures={len(failures)}"
+            f"sampling_failures={state['sampling_failure_count']}"
         )
     if not all(hard_checks.values()):
         raise RuntimeError(f"Hard collection checks failed: {hard_checks}")
@@ -1319,6 +2267,32 @@ def validate_gt(args: argparse.Namespace) -> None:
     extra_gt_ids = sorted(set(gt) - set(episodes))
     if extra_gt_ids:
         issue_counts["extra_gt_records"] = len(extra_gt_ids)
+    source_all_hard_checks_pass = not issue_counts and len(episodes) == len(gt)
+    valid_episode_ids = [row["episode_id"] for row in rows if not row["issues"]]
+    invalid_episode_ids = [row["episode_id"] for row in rows if row["issues"]]
+    filtered = False
+    if args.drop_invalid and not source_all_hard_checks_pass:
+        if not valid_episode_ids:
+            raise RuntimeError(
+                "Every trajectory failed GT validation; refusing to publish an empty dataset"
+            )
+        valid_id_set = set(valid_episode_ids)
+        filtered_dataset = dict(dataset)
+        filtered_dataset["episodes"] = [
+            episode
+            for episode in dataset["episodes"]
+            if str(episode["episode_id"]) in valid_id_set
+        ]
+        filtered_gt = {
+            episode_id: record
+            for episode_id, record in gt.items()
+            if episode_id in valid_id_set
+        }
+        atomic_json_gz(Path(args.gt), filtered_gt)
+        atomic_json_gz(Path(args.dataset), filtered_dataset)
+        filtered = True
+
+    command_succeeded = source_all_hard_checks_pass or filtered
     summary = {
         "episodes": len(episodes),
         "gt_records": len(gt),
@@ -1327,7 +2301,12 @@ def validate_gt(args: argparse.Namespace) -> None:
         "issue_counts": issue_counts,
         "action_count_mean": statistics.mean(action_counts) if action_counts else None,
         "action_count_max": max(action_counts) if action_counts else None,
-        "all_hard_checks_pass": not issue_counts and len(episodes) == len(gt),
+        "source_all_hard_checks_pass": source_all_hard_checks_pass,
+        "filtered_invalid_episodes": len(invalid_episode_ids) if filtered else 0,
+        "filtered_extra_gt_records": len(extra_gt_ids) if filtered else 0,
+        "published_episodes": len(valid_episode_ids) if filtered else len(episodes),
+        "dropped_episode_preview": invalid_episode_ids[:20] if filtered else [],
+        "all_hard_checks_pass": command_succeeded,
     }
     generation_rows = []
     if args.generation_jsonl:
@@ -1369,7 +2348,7 @@ def validate_gt(args: argparse.Namespace) -> None:
                 }
             )
         generation_path = Path(args.generation_jsonl)
-        if summary["all_hard_checks_pass"]:
+        if command_succeeded:
             Path(str(generation_path) + ".partial").unlink(missing_ok=True)
             write_jsonl(generation_path, generation_rows)
             summary["generation_jsonl"] = str(generation_path)
@@ -1380,7 +2359,7 @@ def validate_gt(args: argparse.Namespace) -> None:
             summary["generation_jsonl_partial"] = str(partial_path)
         summary["generation_rows"] = len(generation_rows)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if not summary["all_hard_checks_pass"]:
+    if not command_succeeded:
         raise RuntimeError(f"Trajectory GT validation failed: {issue_counts}")
 
 
@@ -1435,24 +2414,243 @@ def save_panorama(observation: np.ndarray, path: Path, jpeg_quality: int) -> flo
     return black_ratio
 
 
-def rendered_frame_fingerprint(
-    output_root: Path,
-    episode_ids: Sequence[str],
-) -> Tuple[str, int]:
+def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    count = 0
-    for episode_id in sorted(episode_ids, key=lambda value: int(value)):
-        for path in sorted(
-            (output_root / episode_id).glob("frame_*.jpg"),
-            key=lambda item: int(item.stem.split("_")[-1]),
-        ):
-            relative = path.relative_to(output_root).as_posix()
-            digest.update(relative.encode("utf-8") + b"\0")
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            count += 1
-    return digest.hexdigest(), count
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def render_run_manifest(
+    args: argparse.Namespace,
+    episodes: Sequence[Dict[str, Any]],
+    dataset_total: int,
+) -> Dict[str, Any]:
+    """Fingerprint every input that can change the rendered observations."""
+
+    dataset_path = Path(args.dataset).resolve()
+    gt_path = Path(args.gt).resolve()
+    configuration = {
+        "dataset_sha256": sha256_file(dataset_path),
+        "gt_sha256": sha256_file(gt_path),
+        "scene_root": str(Path(args.scene_root).resolve()),
+        "dataset_total": dataset_total,
+        "selected_episode_ids": [str(episode["episode_id"]) for episode in episodes],
+        "width": int(args.width),
+        "height": int(args.height),
+        "sensor_height": float(args.sensor_height),
+        "forward_step_size": float(args.forward_step_size),
+        "turn_angle": float(args.turn_angle),
+        "jpeg_quality": int(args.jpeg_quality),
+        "max_black_ratio": float(args.max_black_ratio),
+        "pose_tolerance": float(args.pose_tolerance),
+    }
+    encoded = json.dumps(
+        configuration, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "schema_version": "panovln-render-resume-v1",
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+        "configuration": configuration,
+    }
+
+
+def read_render_journal(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Read the latest episode records and repair a crash-truncated final line."""
+
+    if not path.exists():
+        return {}
+    raw_lines = path.read_bytes().splitlines(keepends=True)
+    records: Dict[str, Dict[str, Any]] = {}
+    valid_bytes = 0
+    for index, raw_line in enumerate(raw_lines):
+        if not raw_line.strip():
+            valid_bytes += len(raw_line)
+            continue
+        try:
+            row = json.loads(raw_line.decode("utf-8"))
+            episode_id = str(row["episode_id"])
+            if not isinstance(row.get("issues"), list):
+                raise ValueError(f"Render journal row {index + 1} has no issues list")
+            records[episode_id] = row
+            valid_bytes += len(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            if index != len(raw_lines) - 1:
+                raise ValueError(
+                    f"Invalid render journal at line {index + 1}: {path}"
+                ) from error
+            with path.open("r+b") as handle:
+                handle.truncate(valid_bytes)
+            break
+    return records
+
+
+def append_render_journal(handle, row: Dict[str, Any]) -> None:
+    handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+    handle.flush()
+
+
+def completed_render_is_reusable(
+    result: Optional[Dict[str, Any]],
+    output_root: Path,
+    episode_id: str,
+    gt_record: Optional[Dict[str, Any]],
+    include_failed: bool = False,
+) -> bool:
+    """Trust only an atomically published episode directory with matching journal data."""
+
+    if result is None or not isinstance(gt_record, dict):
+        return False
+    failed = bool(result.get("issues"))
+    if failed and not include_failed:
+        return False
+    actions = gt_record.get("actions")
+    if not isinstance(actions, list):
+        return False
+    expected_frames = len(actions) + 1
+    if (
+        result.get("frame_count") != expected_frames
+        or result.get("expected_frame_count") != expected_frames
+    ):
+        return False
+    directory = (
+        output_root / f".episode_{episode_id}.failed"
+        if failed
+        else output_root / episode_id
+    )
+    return (
+        directory.is_dir()
+        and (directory / "frame_0.jpg").is_file()
+        and (directory / f"frame_{expected_frames - 1}.jpg").is_file()
+    )
+
+
+def _stage_json_gz(path: Path, payload: Dict[str, Any]) -> Path:
+    temporary = path.with_name(f".{path.name}.render-filter.{os.getpid()}")
+    try:
+        with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+        return temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _stage_filtered_generation_jsonl(
+    path: Path,
+    selected_ids: Set[str],
+    successful_ids: Set[str],
+) -> Path:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing generation JSONL required for filtering: {path}")
+    seen: Set[str] = set()
+    temporary = path.with_name(f".{path.name}.render-filter.{os.getpid()}")
+    retained = 0
+    try:
+        with path.open("r", encoding="utf-8") as source, temporary.open(
+            "w", encoding="utf-8"
+        ) as destination:
+            for line_number, line in enumerate(source, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    episode_id = str(row["episode_id"])
+                except (json.JSONDecodeError, KeyError, TypeError) as error:
+                    raise ValueError(
+                        f"Invalid generation JSONL row {path}:{line_number}"
+                    ) from error
+                if episode_id in seen:
+                    raise ValueError(
+                        f"Duplicate generation episode_id={episode_id} in {path}"
+                    )
+                if episode_id not in selected_ids:
+                    raise ValueError(
+                        f"Generation episode_id={episode_id} is absent from render dataset"
+                    )
+                seen.add(episode_id)
+                if episode_id in successful_ids:
+                    destination.write(
+                        json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+                    )
+                    retained += 1
+        missing = selected_ids - seen
+        if missing:
+            raise ValueError(
+                f"Generation JSONL is missing {len(missing)} rendered episodes; "
+                f"examples={sorted(missing)[:10]}"
+            )
+        if retained != len(successful_ids):
+            raise RuntimeError(
+                f"Filtered generation row count mismatch: {retained} != "
+                f"{len(successful_ids)}"
+            )
+        return temporary
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def publish_filtered_render_sources(
+    args: argparse.Namespace,
+    dataset: Dict[str, Any],
+    gt: Dict[str, Any],
+    selected_ids: Set[str],
+    successful_ids: Set[str],
+) -> None:
+    """Stage aligned trajectory, GT, and agent inputs before replacing sources."""
+
+    if not args.generation_jsonl:
+        raise ValueError("--drop-invalid requires --generation-jsonl")
+    filtered_dataset = dict(dataset)
+    filtered_dataset["episodes"] = [
+        episode
+        for episode in dataset["episodes"]
+        if str(episode["episode_id"]) in successful_ids
+    ]
+    filtered_gt = {
+        episode_id: record
+        for episode_id, record in gt.items()
+        if episode_id in successful_ids
+    }
+    if len(filtered_dataset["episodes"]) != len(successful_ids):
+        raise RuntimeError("Filtered trajectory dataset does not match successful images")
+    if len(filtered_gt) != len(successful_ids):
+        raise RuntimeError("Filtered GT dataset does not match successful images")
+
+    dataset_path = Path(args.dataset)
+    gt_path = Path(args.gt)
+    generation_path = Path(args.generation_jsonl)
+    staged: List[Tuple[Path, Path]] = []
+    try:
+        staged.append((dataset_path, _stage_json_gz(dataset_path, filtered_dataset)))
+        staged.append((gt_path, _stage_json_gz(gt_path, filtered_gt)))
+        staged.append(
+            (
+                generation_path,
+                _stage_filtered_generation_jsonl(
+                    generation_path, selected_ids, successful_ids
+                ),
+            )
+        )
+        for destination, temporary in staged:
+            os.replace(temporary, destination)
+    finally:
+        for _, temporary in staged:
+            temporary.unlink(missing_ok=True)
 
 
 def replace_directory_atomically(staging: Path, destination: Path) -> None:
@@ -1474,10 +2672,343 @@ def replace_directory_atomically(staging: Path, destination: Path) -> None:
         shutil.rmtree(backup)
 
 
-def render_panorama_episodes(args: argparse.Namespace) -> None:
+def _render_one_panorama_episode(
+    simulator,
+    episode: Dict[str, Any],
+    record: Optional[Dict[str, Any]],
+    args: argparse.Namespace,
+    output_root: Path,
+) -> Dict[str, Any]:
+    """Render and atomically publish one episode inside a scene-owned worker."""
+
     from habitat_sim import AgentState
     from habitat_sim.utils.common import quat_from_coeffs
 
+    episode_id = str(episode["episode_id"])
+    scene_id = str(episode["scene_id"])
+    episode_dir = output_root / episode_id
+    temporary_dir = output_root / f".episode_{episode_id}.tmp"
+    failed_dir = output_root / f".episode_{episode_id}.failed"
+    for stale_path in (episode_dir, temporary_dir, failed_dir):
+        if stale_path.exists():
+            shutil.rmtree(stale_path)
+
+    if not isinstance(record, dict):
+        return {
+            "episode_id": episode_id,
+            "scene_id": scene_id,
+            "frame_count": 0,
+            "expected_frame_count": 0,
+            "collision_count": 0,
+            "pose_error_max": None,
+            "final_goal_error": None,
+            "black_ratio_mean": None,
+            "black_ratio_max": None,
+            "issues": ["missing_gt"],
+        }
+
+    action_name = {1: "move_forward", 2: "turn_left", 3: "turn_right"}
+    actions = [int(action) for action in record.get("actions", [])]
+    locations = [vec(location) for location in record.get("locations", [])]
+    state = AgentState()
+    state.position = np.asarray(episode["start_position"], dtype=np.float32)
+    state.rotation = quat_from_coeffs(
+        np.asarray(episode["start_rotation"], dtype=np.float64)
+    )
+    simulator.get_agent(0).set_state(state, reset_sensors=True)
+    temporary_dir.mkdir(parents=True, exist_ok=True)
+    black_ratios: List[float] = []
+    issues: List[str] = []
+    pose_errors: List[float] = []
+    start_pose = np.asarray(
+        simulator.get_agent(0).get_state().position, dtype=np.float64
+    )
+    if not locations:
+        issues.append("missing_locations")
+    else:
+        start_error = float(np.linalg.norm(start_pose - locations[0]))
+        pose_errors.append(start_error)
+        if start_error > args.pose_tolerance:
+            issues.append("start_pose_mismatch")
+    observation = simulator.get_sensor_observations()["rgb"]
+    black_ratios.append(
+        save_panorama(
+            observation,
+            temporary_dir / "frame_0.jpg",
+            args.jpeg_quality,
+        )
+    )
+    collision_count = 0
+    location_index = 0
+    for action_index, raw_action in enumerate(actions, start=1):
+        action = int(raw_action)
+        if action not in action_name:
+            issues.append(f"unsupported_action_{action}")
+            break
+        before = np.asarray(
+            simulator.get_agent(0).get_state().position, dtype=np.float64
+        )
+        observations = simulator.step(action_name[action])
+        after = np.asarray(
+            simulator.get_agent(0).get_state().position, dtype=np.float64
+        )
+        if action == 1 and float(np.linalg.norm(after - before)) < (
+            args.forward_step_size * 0.5
+        ):
+            collision_count += 1
+        if action == 1:
+            location_index += 1
+            if location_index >= len(locations):
+                issues.append("missing_gt_location_for_forward")
+            else:
+                pose_error = float(np.linalg.norm(after - locations[location_index]))
+                pose_errors.append(pose_error)
+                if pose_error > args.pose_tolerance:
+                    issues.append("replay_pose_mismatch")
+        black_ratios.append(
+            save_panorama(
+                observations["rgb"],
+                temporary_dir / f"frame_{action_index}.jpg",
+                args.jpeg_quality,
+            )
+        )
+    if locations and location_index != len(locations) - 1:
+        issues.append("unused_gt_locations")
+    final_position = np.asarray(
+        simulator.get_agent(0).get_state().position, dtype=np.float64
+    )
+    goal = vec(episode["goals"][0]["position"])
+    goal_radius = float(episode["goals"][0].get("radius", 0.3))
+    final_goal_error = float(np.linalg.norm(final_position - goal))
+    if final_goal_error > goal_radius + args.pose_tolerance:
+        issues.append("render_goal_radius_failure")
+    expected_frames = len(actions) + 1
+    actual_frames = len(list(temporary_dir.glob("frame_*.jpg")))
+    if actual_frames != expected_frames:
+        issues.append("frame_count_mismatch")
+    if collision_count:
+        issues.append("render_replay_collision")
+    if black_ratios and max(black_ratios) > args.max_black_ratio:
+        issues.append("excessive_black_pixels")
+    issues = sorted(set(issues))
+    result = {
+        "episode_id": episode_id,
+        "scene_id": scene_id,
+        "frame_count": actual_frames,
+        "expected_frame_count": expected_frames,
+        "collision_count": collision_count,
+        "pose_error_max": max(pose_errors) if pose_errors else None,
+        "final_goal_error": final_goal_error,
+        "black_ratio_mean": statistics.mean(black_ratios),
+        "black_ratio_max": max(black_ratios),
+        "issues": issues,
+    }
+    target_dir = episode_dir if not issues else failed_dir
+    os.replace(temporary_dir, target_dir)
+    return result
+
+
+def _panorama_worker_entry(
+    worker_id: int,
+    gpu_device_id: int,
+    input_path: str,
+    args: argparse.Namespace,
+    output_root: str,
+    result_queue,
+) -> None:
+    """Persistent Habitat process: each listed scene is loaded exactly once."""
+
+    os.environ.setdefault("MAGNUM_LOG", "quiet")
+    os.environ.setdefault("HABITAT_SIM_LOG", "quiet")
+    worker_args = copy.deepcopy(args)
+    worker_args.gpu_device_id = int(gpu_device_id)
+    simulator = None
+    try:
+        with gzip.open(input_path, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        for batch in payload["scene_batches"]:
+            scene_id = str(batch["scene_id"])
+            scene_path = resolve_scene_path(worker_args.scene_root, scene_id)
+            simulator = make_panorama_simulator(scene_path, worker_args)
+            try:
+                for item in batch["items"]:
+                    result = _render_one_panorama_episode(
+                        simulator,
+                        item["episode"],
+                        item.get("gt"),
+                        worker_args,
+                        Path(output_root),
+                    )
+                    result_queue.put({"type": "result", "result": result})
+            finally:
+                simulator.close()
+                simulator = None
+        result_queue.put({"type": "done", "worker_id": worker_id})
+    except BaseException as error:
+        if simulator is not None:
+            simulator.close()
+        result_queue.put(
+            {
+                "type": "error",
+                "worker_id": worker_id,
+                "error": f"{type(error).__name__}: {error}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+        raise
+
+
+def _parallel_render_batches(
+    pending_episodes: Sequence[Dict[str, Any]],
+    gt: Dict[str, Any],
+    args: argparse.Namespace,
+    output_root: Path,
+    journal_handle,
+    results_by_id: Dict[str, Dict[str, Any]],
+    progress,
+    resumed_episodes: int,
+) -> None:
+    """Assign whole scenes to fixed GPU workers and journal results in the parent."""
+
+    slots = habitat_process_slots(args)
+    by_scene: Dict[str, List[Dict[str, Any]]] = {}
+    for episode in pending_episodes:
+        by_scene.setdefault(str(episode["scene_id"]), []).append(episode)
+    worker_count = min(len(slots), len(by_scene))
+    if worker_count <= 0:
+        return
+    active_slots = slots[:worker_count]
+    assignments: List[List[Tuple[str, List[Dict[str, Any]]]]] = [
+        [] for _ in range(worker_count)
+    ]
+    loads = [0] * worker_count
+    weighted_scenes = []
+    for scene_id, scene_episodes in by_scene.items():
+        weight = sum(
+            len((gt.get(str(episode["episode_id"])) or {}).get("actions", [])) + 1
+            for episode in scene_episodes
+        )
+        weighted_scenes.append((weight, scene_id, scene_episodes))
+    for weight, scene_id, scene_episodes in sorted(
+        weighted_scenes, key=lambda item: (-item[0], item[1])
+    ):
+        worker_id = min(range(worker_count), key=lambda index: (loads[index], index))
+        assignments[worker_id].append((scene_id, scene_episodes))
+        loads[worker_id] += weight
+
+    worker_root = output_root / ".render_workers"
+    if worker_root.exists():
+        shutil.rmtree(worker_root)
+    worker_root.mkdir(parents=True)
+    input_paths: List[Path] = []
+    for worker_id, batches in enumerate(assignments):
+        input_path = worker_root / f"worker_{worker_id:03d}.json.gz"
+        atomic_json_gz(
+            input_path,
+            {
+                "scene_batches": [
+                    {
+                        "scene_id": scene_id,
+                        "items": [
+                            {
+                                "episode": episode,
+                                "gt": gt.get(str(episode["episode_id"])),
+                            }
+                            for episode in scene_episodes
+                        ],
+                    }
+                    for scene_id, scene_episodes in batches
+                ]
+            },
+        )
+        input_paths.append(input_path)
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    processes: List[multiprocessing.Process] = []
+    completed_workers = set()
+    try:
+        for worker_id, (gpu_id, input_path) in enumerate(zip(active_slots, input_paths)):
+            process = context.Process(
+                target=_panorama_worker_entry,
+                args=(
+                    worker_id,
+                    gpu_id,
+                    str(input_path),
+                    args,
+                    str(output_root),
+                    result_queue,
+                ),
+                name=f"panorama-gpu{gpu_id}-worker{worker_id}",
+            )
+            process.start()
+            processes.append(process)
+
+        while len(completed_workers) < worker_count:
+            try:
+                message = result_queue.get(timeout=0.5)
+            except Empty:
+                failed = [
+                    process
+                    for process in processes
+                    if process.exitcode not in (None, 0)
+                ]
+                if failed:
+                    raise RuntimeError(
+                        "Panorama worker exited before reporting completion: "
+                        + ", ".join(
+                            f"{process.name}={process.exitcode}" for process in failed
+                        )
+                    )
+                continue
+            message_type = message.get("type")
+            if message_type == "error":
+                raise RuntimeError(
+                    f"Panorama worker {message.get('worker_id')} failed: "
+                    f"{message.get('error')}\n{message.get('traceback')}"
+                )
+            if message_type == "done":
+                completed_workers.add(int(message["worker_id"]))
+                continue
+            if message_type != "result" or not isinstance(message.get("result"), dict):
+                raise RuntimeError(f"Invalid panorama worker message: {message}")
+            result = message["result"]
+            episode_id = str(result["episode_id"])
+            if episode_id in results_by_id:
+                raise RuntimeError(f"Panorama worker returned duplicate episode {episode_id}")
+            append_render_journal(journal_handle, result)
+            results_by_id[episode_id] = result
+            progress.update(1)
+            progress.set_postfix(
+                workers=worker_count,
+                gpus=",".join(str(gpu) for gpu in sorted(set(active_slots))),
+                resumed=resumed_episodes,
+                refresh=False,
+            )
+
+        for process in processes:
+            process.join()
+        failed = [process for process in processes if process.exitcode != 0]
+        if failed:
+            raise RuntimeError(
+                "Panorama worker failed: "
+                + ", ".join(f"{process.name}={process.exitcode}" for process in failed)
+            )
+    except (Exception, KeyboardInterrupt):
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=10)
+        raise
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+        if worker_root.exists():
+            shutil.rmtree(worker_root)
+
+
+def render_panorama_episodes(args: argparse.Namespace) -> None:
     os.environ.setdefault("MAGNUM_LOG", "quiet")
     os.environ.setdefault("HABITAT_SIM_LOG", "quiet")
     with gzip.open(args.dataset, "rt", encoding="utf-8") as handle:
@@ -1489,169 +3020,175 @@ def render_panorama_episodes(args: argparse.Namespace) -> None:
     if args.max_episodes is not None and args.max_episodes > 0:
         episodes = episodes[: args.max_episodes]
     episodes.sort(key=lambda episode: (str(episode["scene_id"]), int(episode["episode_id"])))
-    action_name = {1: "move_forward", 2: "turn_left", 3: "turn_right"}
     final_output_root = Path(args.output_root)
     output_root = Path(str(final_output_root) + ".rendering")
-    if output_root.exists():
-        shutil.rmtree(output_root)
+    legacy_failed_root = Path(str(final_output_root) + ".failed")
+    if output_root.exists() and legacy_failed_root.exists():
+        raise FileExistsError(
+            f"Both render resume roots exist: {output_root}, {legacy_failed_root}"
+        )
+    if legacy_failed_root.exists():
+        if not args.resume:
+            raise FileExistsError(
+                f"Previous render state exists; rerun with --resume: {legacy_failed_root}"
+            )
+        os.replace(legacy_failed_root, output_root)
+    if output_root.exists() and not args.resume:
+        raise FileExistsError(
+            f"Previous render state exists; rerun with --resume: {output_root}"
+        )
     output_root.mkdir(parents=True, exist_ok=True)
-    results = []
-    active_scene = None
-    simulator = None
+
+    state_path = output_root / ".render_state.json"
+    journal_path = output_root / ".render_journal.jsonl"
+    expected_manifest = render_run_manifest(args, episodes, dataset_total)
+    if state_path.exists():
+        with state_path.open("r", encoding="utf-8") as handle:
+            existing_manifest = json.load(handle)
+        if existing_manifest.get("fingerprint") != expected_manifest["fingerprint"]:
+            raise ValueError(
+                "Render resume inputs or settings changed. Preserve the old directory for "
+                f"inspection or remove it before starting a new render: {output_root}"
+            )
+    else:
+        leftovers = list(output_root.iterdir())
+        if leftovers:
+            raise ValueError(
+                f"Render resume root has no valid state manifest: {output_root}"
+            )
+        atomic_json(state_path, expected_manifest)
+
+    journal_records = read_render_journal(journal_path)
+    selected_ids = {str(episode["episode_id"]) for episode in episodes}
+    unknown_journal_ids = sorted(set(journal_records) - selected_ids)
+    if unknown_journal_ids:
+        raise ValueError(
+            f"Render journal contains episodes outside the current selection: "
+            f"{unknown_journal_ids[:10]}"
+        )
+    results_by_id: Dict[str, Dict[str, Any]] = {}
+    for episode in episodes:
+        episode_id = str(episode["episode_id"])
+        result = journal_records.get(episode_id)
+        if completed_render_is_reusable(
+            result,
+            output_root,
+            episode_id,
+            gt.get(episode_id),
+            include_failed=bool(args.drop_invalid),
+        ):
+            results_by_id[episode_id] = result  # type: ignore[assignment]
+
+    resumed_episodes = len(results_by_id)
+    pending_episodes = [
+        episode
+        for episode in episodes
+        if str(episode["episode_id"]) not in results_by_id
+    ]
+    progress = tqdm(
+        total=len(episodes),
+        initial=resumed_episodes,
+        desc="panorama",
+        unit="ep",
+        dynamic_ncols=True,
+    )
     try:
-        for episode in episodes:
-            episode_id = str(episode["episode_id"])
-            scene_id = str(episode["scene_id"])
-            if scene_id != active_scene:
-                if simulator is not None:
-                    simulator.close()
-                scene_path = resolve_scene_path(args.scene_root, scene_id)
-                simulator = make_panorama_simulator(scene_path, args)
-                active_scene = scene_id
-            assert simulator is not None
-            record = gt.get(episode_id)
-            if record is None:
-                results.append({"episode_id": episode_id, "issues": ["missing_gt"]})
-                continue
-            actions = [int(action) for action in record.get("actions", [])]
-            locations = [vec(location) for location in record.get("locations", [])]
-            state = AgentState()
-            state.position = np.asarray(episode["start_position"], dtype=np.float32)
-            state.rotation = quat_from_coeffs(
-                np.asarray(episode["start_rotation"], dtype=np.float64)
-            )
-            simulator.get_agent(0).set_state(state, reset_sensors=True)
-            episode_dir = output_root / episode_id
-            temporary_dir = output_root / f".episode_{episode_id}.tmp"
-            failed_dir = output_root / f".episode_{episode_id}.failed"
-            temporary_dir.mkdir(parents=True, exist_ok=True)
-            black_ratios = []
-            issues = []
-            pose_errors: List[float] = []
-            start_pose = np.asarray(
-                simulator.get_agent(0).get_state().position, dtype=np.float64
-            )
-            if not locations:
-                issues.append("missing_locations")
+        with journal_path.open("a", encoding="utf-8") as journal_handle:
+            slots = habitat_process_slots(args)
+            if len(slots) > 1 and pending_episodes:
+                _parallel_render_batches(
+                    pending_episodes,
+                    gt,
+                    args,
+                    output_root,
+                    journal_handle,
+                    results_by_id,
+                    progress,
+                    resumed_episodes,
+                )
             else:
-                start_error = float(np.linalg.norm(start_pose - locations[0]))
-                pose_errors.append(start_error)
-                if start_error > args.pose_tolerance:
-                    issues.append("start_pose_mismatch")
-            observation = simulator.get_sensor_observations()["rgb"]
-            black_ratios.append(
-                save_panorama(
-                    observation,
-                    temporary_dir / "frame_0.jpg",
-                    args.jpeg_quality,
-                )
-            )
-            collision_count = 0
-            location_index = 0
-            for action_index, raw_action in enumerate(actions, start=1):
-                action = int(raw_action)
-                if action not in action_name:
-                    issues.append(f"unsupported_action_{action}")
-                    break
-                before = np.asarray(
-                    simulator.get_agent(0).get_state().position, dtype=np.float64
-                )
-                observations = simulator.step(action_name[action])
-                after = np.asarray(
-                    simulator.get_agent(0).get_state().position, dtype=np.float64
-                )
-                if action == 1 and float(np.linalg.norm(after - before)) < (
-                    args.forward_step_size * 0.5
-                ):
-                    collision_count += 1
-                if action == 1:
-                    location_index += 1
-                    if location_index >= len(locations):
-                        issues.append("missing_gt_location_for_forward")
-                    else:
-                        pose_error = float(
-                            np.linalg.norm(after - locations[location_index])
+                active_scene = None
+                simulator = None
+                args.gpu_device_id = int(slots[0])
+                try:
+                    for episode in pending_episodes:
+                        episode_id = str(episode["episode_id"])
+                        scene_id = str(episode["scene_id"])
+                        if scene_id != active_scene:
+                            if simulator is not None:
+                                simulator.close()
+                            scene_path = resolve_scene_path(args.scene_root, scene_id)
+                            simulator = make_panorama_simulator(scene_path, args)
+                            active_scene = scene_id
+                        assert simulator is not None
+                        result = _render_one_panorama_episode(
+                            simulator,
+                            episode,
+                            gt.get(episode_id),
+                            args,
+                            output_root,
                         )
-                        pose_errors.append(pose_error)
-                        if pose_error > args.pose_tolerance:
-                            issues.append("replay_pose_mismatch")
-                black_ratios.append(
-                    save_panorama(
-                        observations["rgb"],
-                        temporary_dir / f"frame_{action_index}.jpg",
-                        args.jpeg_quality,
-                    )
-                )
-            if locations and location_index != len(locations) - 1:
-                issues.append("unused_gt_locations")
-            final_position = np.asarray(
-                simulator.get_agent(0).get_state().position, dtype=np.float64
-            )
-            goal = vec(episode["goals"][0]["position"])
-            goal_radius = float(episode["goals"][0].get("radius", 0.3))
-            final_goal_error = float(np.linalg.norm(final_position - goal))
-            if final_goal_error > goal_radius + args.pose_tolerance:
-                issues.append("render_goal_radius_failure")
-            expected_frames = len(actions) + 1
-            actual_frames = len(list(temporary_dir.glob("frame_*.jpg")))
-            if actual_frames != expected_frames:
-                issues.append("frame_count_mismatch")
-            if collision_count:
-                issues.append("render_replay_collision")
-            if black_ratios and max(black_ratios) > args.max_black_ratio:
-                issues.append("excessive_black_pixels")
-            issues = sorted(set(issues))
-            target_dir = episode_dir if not issues else failed_dir
-            os.replace(temporary_dir, target_dir)
-            results.append(
-                {
-                    "episode_id": episode_id,
-                    "scene_id": scene_id,
-                    "frame_count": actual_frames,
-                    "expected_frame_count": expected_frames,
-                    "collision_count": collision_count,
-                    "pose_error_max": max(pose_errors) if pose_errors else None,
-                    "final_goal_error": final_goal_error,
-                    "black_ratio_mean": statistics.mean(black_ratios),
-                    "black_ratio_max": max(black_ratios),
-                    "issues": issues,
-                }
-            )
-    except Exception as error:
-        failed_root = Path(str(final_output_root) + ".failed")
-        if failed_root.exists():
-            shutil.rmtree(failed_root)
-        if output_root.exists():
-            os.replace(output_root, failed_root)
+                        append_render_journal(journal_handle, result)
+                        results_by_id[episode_id] = result
+                        progress.update(1)
+                        progress.set_postfix(
+                            scene=Path(scene_id).stem,
+                            resumed=resumed_episodes,
+                            refresh=False,
+                        )
+                finally:
+                    if simulator is not None:
+                        simulator.close()
+    except (Exception, KeyboardInterrupt) as error:
         fatal_summary = {
             "dataset_total": dataset_total,
             "selected": len(episodes),
-            "episodes_completed": len(results),
+            "episodes_completed": len(results_by_id),
+            "resumed_episodes": resumed_episodes,
             "image_root": str(final_output_root.resolve()),
-            "failed_artifact_root": str(failed_root.resolve()),
+            "resume_root": str(output_root.resolve()),
             "fatal_error": f"{type(error).__name__}: {error}",
             "all_hard_checks_pass": False,
         }
         print(json.dumps(fatal_summary, ensure_ascii=False, indent=2))
         raise
     finally:
-        if simulator is not None:
-            simulator.close()
+        progress.close()
+
+    results = [
+        results_by_id[str(episode["episode_id"])]
+        for episode in episodes
+        if str(episode["episode_id"]) in results_by_id
+    ]
     issue_counts: Dict[str, int] = {}
     for result in results:
         for issue in result.get("issues", []):
             issue_counts[issue] = issue_counts.get(issue, 0) + 1
-    selected_hard_checks_pass = bool(results) and not issue_counts
+    selected_hard_checks_pass = (
+        bool(results) and len(results) == len(episodes) and not issue_counts
+    )
     selection_complete = len(episodes) == dataset_total
     successful_ids = [
         str(result["episode_id"])
         for result in results
         if not result.get("issues")
     ]
-    image_sha256, rendered_frame_count = rendered_frame_fingerprint(
-        output_root, successful_ids
+    successful_id_set = set(successful_ids)
+    rendered_frame_count = sum(
+        int(result.get("frame_count") or 0)
+        for result in results
+        if not result.get("issues")
     )
-    command_succeeded = selected_hard_checks_pass and (
+    all_results_complete = bool(results) and len(results) == len(episodes)
+    can_filter = bool(
+        args.drop_invalid
+        and selection_complete
+        and all_results_complete
+        and successful_id_set
+    )
+    command_succeeded = (
+        selected_hard_checks_pass or can_filter
+    ) and (
         selection_complete or args.allow_partial_render
     )
     summary = {
@@ -1659,6 +3196,8 @@ def render_panorama_episodes(args: argparse.Namespace) -> None:
         "selected": len(episodes),
         "selection_complete": selection_complete,
         "episodes": len(results),
+        "resumed_episodes": resumed_episodes,
+        "rendered_this_run": len(results) - resumed_episodes,
         "passed": sum(not result.get("issues") for result in results),
         "failed": sum(bool(result.get("issues")) for result in results),
         "issue_counts": issue_counts,
@@ -1677,7 +3216,10 @@ def render_panorama_episodes(args: argparse.Namespace) -> None:
         ][:50],
         "image_root": str(final_output_root.resolve()),
         "rendered_frame_count": rendered_frame_count,
-        "rendered_frames_sha256": image_sha256,
+        "filtered_invalid_episodes": (
+            len(results) - len(successful_ids) if can_filter else 0
+        ),
+        "published_episodes": len(successful_ids) if can_filter else len(results),
         "selected_hard_checks_pass": selected_hard_checks_pass,
         "full_dataset_hard_checks_pass": (
             selected_hard_checks_pass and selection_complete
@@ -1685,13 +3227,25 @@ def render_panorama_episodes(args: argparse.Namespace) -> None:
         "all_hard_checks_pass": command_succeeded,
     }
     if command_succeeded:
+        if can_filter and not selected_hard_checks_pass:
+            publish_filtered_render_sources(
+                args,
+                dataset,
+                gt,
+                selected_ids,
+                successful_id_set,
+            )
+            for result in results:
+                if result.get("issues"):
+                    shutil.rmtree(
+                        output_root / f".episode_{result['episode_id']}.failed",
+                        ignore_errors=True,
+                    )
         replace_directory_atomically(output_root, final_output_root)
+        (final_output_root / journal_path.name).unlink(missing_ok=True)
+        (final_output_root / state_path.name).unlink(missing_ok=True)
     else:
-        failed_root = Path(str(final_output_root) + ".failed")
-        if failed_root.exists():
-            shutil.rmtree(failed_root)
-        os.replace(output_root, failed_root)
-        summary["failed_artifact_root"] = str(failed_root.resolve())
+        summary["resume_root"] = str(output_root.resolve())
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if not command_succeeded:
         raise RuntimeError(f"Panorama rendering validation failed: {issue_counts}")

@@ -54,6 +54,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-episode-steps", type=int, default=500)
     parser.add_argument("--gpu-device-id", type=int, default=0)
     parser.add_argument(
+        "--gpu-device-ids",
+        default=None,
+        help=(
+            "Comma-separated Habitat GPU IDs. Multiple process slots enable the "
+            "scene-sharded GT coordinator."
+        ),
+    )
+    parser.add_argument(
+        "--processes-per-gpu",
+        type=int,
+        default=1,
+        help="Independent scene-batched GT processes assigned to each GPU.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Continue from a valid JSONL journal, or accept an already-complete output.",
@@ -123,6 +137,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-episodes must be >= 1")
     if args.goal_radius <= 0:
         raise ValueError("--goal-radius must be > 0")
+    if args.processes_per_gpu < 1:
+        raise ValueError("--processes-per-gpu must be >= 1")
     if args.overwrite and args.resume:
         raise ValueError("--overwrite and --resume are mutually exclusive")
     is_partial_selection = (
@@ -433,13 +449,30 @@ def generate_gt(args: argparse.Namespace, habitat_runtime: Tuple) -> Dict[str, i
     if not all_episodes:
         raise ValueError(f"Dataset has no episodes: {dataset_path}")
     all_ids = validate_unique_episode_ids(all_episodes)
-    selected = slice_and_shard_episodes(
-        all_episodes,
-        args.start_index,
-        args.max_episodes,
-        args.rank,
-        args.world_size,
-    )
+    assigned_episode_ids = getattr(args, "_assigned_episode_ids", None)
+    if assigned_episode_ids is None:
+        selected = slice_and_shard_episodes(
+            all_episodes,
+            args.start_index,
+            args.max_episodes,
+            args.rank,
+            args.world_size,
+        )
+    else:
+        assigned_id_set = {str(episode_id) for episode_id in assigned_episode_ids}
+        selected = [
+            episode
+            for episode in all_episodes
+            if episode_id_of(episode) in assigned_id_set
+        ]
+        missing_assignments = assigned_id_set - {
+            episode_id_of(episode) for episode in selected
+        }
+        if missing_assignments:
+            raise ValueError(
+                "GT worker assignment contains episode IDs absent from its dataset: "
+                f"{sorted(missing_assignments)[:10]}"
+            )
     if not selected:
         raise ValueError(f"Episode selection is empty: {dataset_path}")
     if args.sort_by_scene:
@@ -487,7 +520,7 @@ def generate_gt(args: argparse.Namespace, habitat_runtime: Tuple) -> Dict[str, i
             unit="ep",
             dynamic_ncols=True,
         )
-        if tqdm is not None
+        if tqdm is not None and not bool(getattr(args, "_disable_progress", False))
         else None
     )
 
@@ -538,7 +571,10 @@ def generate_gt(args: argparse.Namespace, habitat_runtime: Tuple) -> Dict[str, i
                                     done=f"{processed + skipped}/{len(selected)}",
                                     refresh=False,
                                 )
-                            if processed % args.gt_log_every == 0:
+                            if (
+                                processed % args.gt_log_every == 0
+                                and not bool(getattr(args, "_quiet_output", False))
+                            ):
                                 print(
                                     f"[generate-gt] scene={scene_id} processed={processed} "
                                     f"skipped={skipped} elapsed={time.time() - started_at:.1f}s",
@@ -560,26 +596,41 @@ def generate_gt(args: argparse.Namespace, habitat_runtime: Tuple) -> Dict[str, i
             finalize_gt_records(journal_records, expected_final_ids, output_path)
             if not args.keep_jsonl:
                 journal_path.unlink()
-            print(
-                f"[generate-gt] atomically finalized {output_path} "
-                f"processed={processed} skipped={skipped} "
-                f"elapsed={time.time() - started_at:.1f}s",
-                flush=True,
-            )
+            if not bool(getattr(args, "_quiet_output", False)):
+                print(
+                    f"[generate-gt] atomically finalized {output_path} "
+                    f"processed={processed} skipped={skipped} "
+                    f"elapsed={time.time() - started_at:.1f}s",
+                    flush=True,
+                )
         return {"processed": processed, "skipped": skipped, "selected": len(selected)}
     finally:
         if progress is not None:
             progress.close()
         batch_directory = work_directory / ".gt_scene_batches"
-        if batch_directory.exists() and not any(batch_directory.iterdir()):
-            batch_directory.rmdir()
+        try:
+            if batch_directory.exists() and not any(batch_directory.iterdir()):
+                batch_directory.rmdir()
+        except OSError:
+            # Another GT worker may create or remove a batch file concurrently.
+            pass
 
 
 def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
-    runtime = import_habitat_runtime(args.repo_root)
-    generate_gt(args, runtime)
+    from data_create.trajectory.parallel_gt import (  # noqa: WPS433
+        generate_gt_parallel,
+        habitat_process_slots,
+    )
+
+    slots = habitat_process_slots(args)
+    if len(slots) == 1:
+        args.gpu_device_id = int(slots[0])
+        runtime = import_habitat_runtime(args.repo_root)
+        generate_gt(args, runtime)
+    else:
+        generate_gt_parallel(args, slots)
 
 
 if __name__ == "__main__":

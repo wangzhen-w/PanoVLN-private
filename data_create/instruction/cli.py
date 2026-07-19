@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
 from .io_utils import str2bool
 from .runner import run
@@ -47,7 +49,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-width", type=int, default=384)
     parser.add_argument("--tile-height", type=int, default=288)
     parser.add_argument("--jpeg-quality", type=int, default=90)
-    parser.add_argument("--evidence-fingerprint-mode", choices=("content", "metadata"), default="content")
     parser.add_argument("--use-action-heading", type=str2bool, default=False)
     parser.add_argument("--save-contact-sheets", action="store_true")
     parser.add_argument("--write-gallery", action="store_true")
@@ -86,7 +87,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.provider != "qwen":
         raise ValueError("Only the OpenAI-compatible Qwen provider is implemented")
-    summary = run(args)
+    try:
+        summary = run(args)
+    except KeyboardInterrupt:
+        # Completed candidate journals are already closed. Exit immediately
+        # instead of waiting for active HTTP threads; the next run resumes by
+        # episode_id from those journals.
+        print("\n[instruction] interrupted; resumable progress has been preserved", file=sys.stderr)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

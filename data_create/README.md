@@ -26,7 +26,8 @@ data_create/
 ├── config/trajectory_profiles.json
 ├── trajectory/
 │   ├── collect_hm3d.py
-│   └── generate_gt.py
+│   ├── generate_gt.py
+│   └── parallel_gt.py
 ├── instruction/
 │   ├── actions.py
 │   ├── evidence.py
@@ -68,14 +69,15 @@ grounded route facts，再由全局 writer 结合 START / ROUTE overview / ENDPO
 最终 VLN-CE dataset 不引用这些图片，它们主要是 instruction 制作证据，也可供
 后续全景训练数据预处理复用。
 
-正式配置使用 `2048×1024` 全景、JPEG 质量 92，并投影为 `384×288` 透视 tile、
+正式配置使用 `1600×800` 全景、JPEG 质量 92，并投影为 `384×288` 透视 tile、
 contact sheet JPEG 质量 90。只提高全景而保留原来的 `256×192` tile 无法明显改善
 VLM 最终看到的 landmark；两级分辨率必须一起提高。`512×384` tile 会让长路线的
 多图请求接近当前 Qwen3.6-27B 的上下文上限，因此没有作为默认值。
 正式图片尺寸由 `run_data_creation.sh` 的 `PANORAMA_WIDTH/HEIGHT` 传给
-`render-panoramas`；`hm3d_vln.yaml` 也保持相同的 2K 默认。GT 阶段使用
-`--minimal-observations` 关闭 RGB sensor，所以不会为求 action 额外渲染高清图。
-与原来的 `1280×640` 相比，2K 全景的渲染像素约为 2.56 倍，应按磁盘容量调整
+`render-panoramas`，因此该脚本中的值是发布图片分辨率的唯一配置。GT 阶段使用
+`--minimal-observations` 关闭 `hm3d_vln.yaml` 的 RGB sensor，所以 YAML 中的 sensor
+尺寸不会改变正式图片，也不会为求 action 额外渲染高清图。
+与原来的 `1280×640` 相比，当前全景的渲染像素约为 1.56 倍，应按磁盘容量调整
 `NUM_TRAJECTORIES` 分批生产。
 
 ## 配置与运行
@@ -83,16 +85,20 @@ VLM 最终看到的 landmark；两级分辨率必须一起提高。`512×384` ti
 所有用户配置都在 [run_data_creation.sh](run_data_creation.sh) 顶部直接赋值：
 
 ```bash
-SAVE_ROOT="/workspace/data1/dataset/PanoVLN/generated/PanoVLN-HM3D"
+SAVE_ROOT="/workspace/data1/dataset/general_VLN_data/PanoVLN"
 SCENE_ROOT="/workspace/data1/dataset/general_VLN_data/HM3D"
 SCENE_SPLIT="train"
 TRAJECTORY_PROFILE_CONFIG="${REPO_ROOT}/data_create/config/trajectory_profiles.json"
-NUM_TRAJECTORIES=110000
-R2R_RATIO=0.40
-RXR_RATIO=0.60
+NUM_TRAJECTORIES=210000
+COLLECT_RECOVERY_ROUNDS=1
+R2R_RATIO=0.35
+RXR_RATIO=0.65
 SEED=42
 GOAL_RADIUS=0.3
-GPU_DEVICE_ID=0
+GPU_DEVICE_IDS="0,1,2,3,4,5,6,7"
+COLLECT_PROCESSES_PER_GPU=2
+GT_PROCESSES_PER_GPU=2
+RENDER_PROCESSES_PER_GPU=2
 
 MAX_ANCHOR_TURN_DEGREES=90
 VISUAL_CHECK_WIDTH=512
@@ -101,8 +107,8 @@ SENSOR_HEIGHT=1.25
 MAX_VISUAL_CHECKPOINTS=24
 MAX_BLACK_RATIO=0.10
 
-PANORAMA_WIDTH=2048
-PANORAMA_HEIGHT=1024
+PANORAMA_WIDTH=1600
+PANORAMA_HEIGHT=800
 PANORAMA_JPEG_QUALITY=92
 TILE_WIDTH=384
 TILE_HEIGHT=288
@@ -121,6 +127,13 @@ API_KEY="test"
 NUM_WORKERS=40
 STAGE="full"
 ```
+
+`GPU_DEVICE_IDS` 是逗号分隔的 Habitat GPU 列表，例如 `"0,1,2,3"`。
+collect、GT 与 render 的实际进程上限分别是 GPU 数乘以对应的
+`*_PROCESSES_PER_GPU`。当前 8 卡配置会各启动最多 16 个进程；若需与其他任务共享
+GPU，直接缩短列表或降低相应阶段的每卡进程数。
+`NUM_WORKERS` 仅表示 instruction API 的并发请求数，与 Habitat 进程数无关。
+GT 阶段关闭 RGB observations，因此通常主要受 Habitat 路径规划和 CPU 吞吐限制。
 
 `SCENE_ROOT` 是唯一的场景根目录，内部应具有下面的 split-aware 结构：
 
@@ -153,7 +166,7 @@ bash data_create/run_data_creation.sh
 - `collect`：按 scene 批量采集 trajectory；
 - `gt`：生成 expert actions，严格验证后生成 agent 输入；
 - `images`：回放 expert actions 并采集全景视觉证据；
-- `instruction`：为同一批 trajectory 生成 concise 和 dense instruction；
+- `instruction`：为每条 trajectory 生成一条经过候选筛选和审核的 Dense instruction；
 - `export`：发布 `train.json`、同内容的 `train.json.gz` 以及
   `train_gt.json.gz`，随后清理中间文件；
 - `full`：依次完成全部阶段。
@@ -161,19 +174,20 @@ bash data_create/run_data_creation.sh
 ## 场景覆盖与 trajectory 分配
 
 `R2R_RATIO` 和 `RXR_RATIO` 控制两类 trajectory 的数量比例，必须是非负有限数且
-在浮点容差内相加等于 1。R2R 数量按 `NUM_TRAJECTORIES * R2R_RATIO` 取最近整数，RxR 使用
-剩余数量，因此总数不会因取整变化。例如当前 110,000 条、40%/60% 会严格生成
-44,000 条 R2R-like trajectory 和 66,000 条 RxR-like trajectory。family 列表再按
-`SEED` 做可复现打乱；失败的候选只会在当前 family 内重采，不会悄悄改变最终比例。
-该比例对完整数据集全局成立，不要求每个 scene 内部也恰好达到 40%/60%；采集摘要会
-同时打印目标数量、实际数量和实际比例，目标与实际数量不一致时不会通过质量门。
+在浮点容差内相加等于 1。`NUM_TRAJECTORIES` 是期望规模而非发布下限：R2R 期望数量按
+`NUM_TRAJECTORIES * R2R_RATIO` 取最近整数，RxR 使用剩余数量。family 列表再按
+`SEED` 做可复现打乱；失败候选只在当前 family 内重采，不会悄悄改变比例。
+该比例对完整数据集全局成立，不要求每个 scene 内部也达到 35%/65%。若 HM3D 在所有
+硬质量门下只能提供约 190k 条，collector 会确定性发布不超过 190k 的最大 35%/65%
+平衡子集，而不会降低几何或视觉质量标准来凑到 210k。终端摘要同时打印期望数量、
+实际数量和 family counts。
 
 R2R-like 的目标长度来自 R2R action 统计并限制在 5--20 m，使用起终点最短路径；
 RxR-like 的目标长度来自 RxR action 统计并限制在 5--40 m，且可包含通过全部几何
 质量门的合理 detour。`trajectory_profiles.json` 只保存 MOVE_FORWARD 数量换算得到的
 匿名距离直方图，不含两套数据的 instruction、trajectory、scene ID 或 episode ID；
-因此开源运行不依赖仓库外的 R2R/RxR JSONL。每条最终 trajectory 仍会分别生成
-concise 与 dense 两个 instruction，语言版本数量不受这两个 trajectory 比例控制。
+因此开源运行不依赖仓库外的 R2R/RxR JSONL。每条最终 trajectory 只生成一条
+Dense instruction；这里的 Dense 表示信息足以清楚执行路线，并不要求逐 action 描述。
 `R2R_RATIO/RXR_RATIO` 决定两类轨迹各采多少，profile 则决定每类内部的目标长度
 按什么频率抽样；它是当前 collector 的必需输入，不是额外数据集产物。
 直方图的来源和复现元数据写在配置文件内：R2R 使用 `R2RVLNCE-v1`
@@ -191,8 +205,8 @@ train，RxR 使用 `RxRVLNCE-v1` train 的 guide / en-US / en-IN；先用同仓�
 当前分配规则会在剩余场景间动态均分剩余 trajectory：所有场景都能采满时，每个
 场景的数量最多相差 1；某个场景无法产生当前要求的长轨迹或 detour 时，其缺口会
 由后续场景承担，因此不承诺严格等量。阶段结束时会在终端打印实际场景数量范围。
-若总数不足，collection 只写入隐藏工作区的 partial 文件并失败，不会把不完整数据
-伪装成正式数据集。
+若总数不足，collection 仍只发布所有硬检查都通过的数据；不足目标的状态会在终端
+标为 `quality_limited`，而不是把期望规模伪装成实际规模。
 
 需要人工指定场景集合时，可直接调用 collector 的 `--scene-ids`；正式默认入口不
 提供按前 N 个场景截断的选项。
@@ -201,15 +215,50 @@ train，RxR 使用 `RxRVLNCE-v1` train 的 guide / en-US / en-IN；先用同仓�
 
 三个 Habitat 阶段都不会逐 episode 切换场景：
 
-- collect 外层按 scene 循环，在同一个 simulator 中采完该 scene 的 quota；
-- GT 先按 `scene_id` 分组，同一个 Habitat Env 处理该 scene 的全部 episode；
-- image render 按 `(scene_id, episode_id)` 排序，并持续复用当前 simulator；
+- collect 将互不重叠的 scene 分片交给独立进程，每个进程在同一个 simulator 中
+  采完当前 scene 的 quota；同一个 scene 不会同时交给两个 GPU worker；
+- GT 将完整 scene 按预计路径长度平衡给多个 GPU worker，同一个 Habitat Env 处理
+  该 scene 的全部 episode；
+- image render 以完整 scene 为调度单元，并按预计 frame 数平衡各进程负载；一个
+  worker 加载 scene 后连续回放其中所有待处理 episode；
 - instruction 阶段只读取已经保存的图片、actions 和 trajectory metadata，不启动
   Habitat；其中 `reference_path` 会自动派生 `vertical_motion`，作为上/下楼描述的
   硬约束传给 writer、audit 和 deterministic QA。
 
-每个 scene 在 collect、GT、render 三个独立阶段各加载一次。GT 支持 journal 断点续跑；
-collect 和 render 失败时可只重跑当前阶段，无需重新执行已经完成的前置阶段。
+每个被处理的 scene 在 collect、GT、render 三个独立阶段内各自只由一个 worker 加载。
+GT 为各 worker 保存独立 journal，主进程显示聚合进度条；它也会继承旧单进程
+`GT_JOURNAL` 已完成的 episode。全部完成后按 dataset 顺序原子合并 GT 并删除 worker
+状态，因此中断后使用相同 GPU/进程配置重跑即可续跑；
+render 也会为每个已通过回放检查的 episode 原子保存图片目录并追加 journal。中断后
+重新运行同一个 `images` 阶段，会校验 dataset、GT 和渲染参数 fingerprint，跳过已完成
+episode，并继续显示一个聚合的 `panorama` 进度条；同一个 scene 的待处理 episode
+仍会一起回放。GPU 列表和每卡进程数是运行调度参数，不进入图片 fingerprint，因此
+恢复时可以按当时的空闲显存调整并行度。
+在 `full` 阶段中，每个原子发布的阶段产物都会直接作为完成标记：已有 trajectory 时
+跳过采样，同时已有 GT 与 agent input 时跳过 GT 生成和校验，已有正式 `images/` 时跳过
+渲染，已有最终 instruction JSONL 时跳过 instruction。instruction 中断时只读取 agent
+input 和 progress journal，不检查 trajectory、GT，也不为输入或图片计算 fingerprint。
+每条 `status=success` 的 journal 记录直接按 `episode_id` 视为完成。因此在任一阶段中断后
+可以直接重新运行正式脚本，从最近一个
+未完成阶段继续。显式选择单独的 `gt`、`images`、`instruction` 等 `STAGE` 仍会执行该
+阶段，便于需要时主动重建。instruction 调度器只保留一个并发窗口，不会把全部 episode
+预先塞入线程池；中断时会取消尚未开始的请求，已经完成的结果仍保留在 journal 中。
+恢复时进度条从 journal 中累计成功数开始显示。如果主动更换了 prompt、视觉证据或
+agent 工作流并希望全部重写，应使用新的 `INSTRUCTION_WORK_DIR`，或先删除旧版本的
+progress 目录；同一个 work dir 的语义就是继续同一批生成任务。
+collect 本身需要
+原子发布目标规模或 quality-limited 规模后才进入后续阶段；采集过程中会把每条已接受
+trajectory 和 sampler 状态事务性地
+写入 SQLite checkpoint。单进程时路径是
+`trajectories.json.gz.collect.sqlite3`；多进程时每个 scene shard 在
+`trajectories.json.gz.collect_workers/` 下维护独立 checkpoint，主进程只显示一个聚合的
+`trajectory` 进度条。若在 collect 内部中断，重新运行同一个 `collect` 或 `full` 阶段
+会校验各分片采样配置 fingerprint 并继续；恢复后的待采样 episode 仍按 scene 成批处理。
+首轮某个 scene shard 即使耗尽自己的场景也不会拖垮其他 worker；主进程会等待所有
+分片结束，再按缺少的 R2R/RxR 数量进行最多 `COLLECT_RECOVERY_ROUNDS` 轮全场景补采。
+默认只补采一轮；结束后对 route hash 去重，并按目标比例保留最大可用规模。所有轨迹
+重新编号并通过全局检查后才原子发布。checkpoint 和 worker 临时目录随后自动删除，
+不会成为公开产物。
 
 ## 输出
 
@@ -224,7 +273,9 @@ SAVE_ROOT/
 ```
 
 原始 trajectory GT、agent input、instruction JSONL 和生成进度只存在于
-`SAVE_ROOT/.work/`。全部检查通过并发布 dataset/GT 文件后，脚本自动删除
+`SAVE_ROOT/.work/`。图片渲染中断时，已验证图片和 resume journal 暂存在
+`SAVE_ROOT/images.rendering/`；成功后该目录会原子发布为 `images/`，其中的状态文件
+会在发布前删除。全部检查通过并发布 dataset/GT 文件后，脚本自动删除
 `.work/`；中途失败时保留它以便从对应阶段恢复。旧的 `subset_00` 是无实际分片的
 遗留层级，已经删除。
 
@@ -233,8 +284,8 @@ SAVE_ROOT/
 
 `train_gt.json.gz` 采用 R2R schema，key 与最终 `train.json` 的 episode ID 严格
 一致；每条记录只含 `locations`、`actions`、`forward_steps`。actions 最后一项是
-唯一 STOP=0，concise/dense 两个 episode 共享完全相同的 GT。原始无 STOP GT 仍
-只在 `.work/` 中，exporter 核验后生成最终配对 GT。
+唯一 STOP=0。每条物理 trajectory 对应一个 episode 和一份 GT；原始无 STOP GT 仍
+只在 `.work/` 中，exporter 核验后生成最终 GT。
 
 图片与 action 的对应关系也是发布硬检查：`frame_0.jpg` 是起始状态；对最后的
 STOP 之前每个 `actions[k]`，执行后得到 `frame_{k+1}.jpg`；最后一个 STOP 在最终
@@ -248,15 +299,15 @@ episode_gt = train_gt[str(episode["episode_id"])]
 frame_dir = image_root / str(episode["trajectory_id"])
 ```
 
-不能默认用 `episode_id` 查图片。这样同一 trajectory 的 concise/dense episode 各有
-独立 R2R-compatible GT key，却共享同一个图片目录。仓库的
+不能默认用 `episode_id` 查图片。`trajectory_id` 明确记录图片所属的物理轨迹，
+`episode_id` 则与 R2R-compatible GT key 对齐。仓库的
 `src/data/prepare_training_data.py` 已改为优先使用 annotation 的 `trajectory_id`，
 字段不存在时回退 `episode_id`，所以旧 R2R/RxR/ScaleVLN 三字段 annotation 行为不变。
 把本数据转换为训练 JSONL 时必须保留 `trajectory_id`。
 
 `train.json` 与 `train.json.gz` 内容完全相同，使用脚本统一配置的 0.3 m goal radius
-和整数 episode/trajectory ID。concise/dense 共享完全相同的场景、trajectory、制作期
-actions 和图片，仅改变语言密度；actions 放在按最终 episode ID 索引的
+和整数 episode/trajectory ID。最终数据保持“一条物理 trajectory、一条 Dense
+instruction、一个 episode”；actions 放在按最终 episode ID 索引的
 `train_gt.json.gz`，不嵌入 episode。
 
 `instruction_vocab` 只保留与 ScaleVLN 一致的空结构，各 episode 的
@@ -270,7 +321,7 @@ tokenizer，不在发布数据中绑定 R2R 的旧 vocabulary，也不做无实�
 不包含 `actions` 或 `locations`；这些字段按 R2R 约定放在 GT 文件中。也可以直接
 从 reference path 重新调用 Habitat 复算，使用本目录 `config/hm3d_vln.yaml` 中的
 0.25 m forward step、15° turn 和同一个 0.3 m goal radius。
-同一条 trajectory 的多个语言版本共享 `trajectory_id`，该 ID 也就是对应图片目录名。
+`trajectory_id` 是物理轨迹 ID，也就是对应图片目录名。
 
 ## 质量门
 
@@ -290,7 +341,7 @@ Trajectory 至少检查：
 急转从 6 条降为 0。`MAX_BLACK_RATIO=0.10` 也做了 mixed 100 条对照：两组都采满，
 0.35 会放入 11 条超过 0.10 的路线（其中 8 条人工确认存在大面积 scan void）；
 0.10 的 accepted p95/max 为 0.042/0.094，耗时只从 133.5 s 增至 144.3 s。
-高清 `2048×1024` render 会用同一个阈值再查完整 action replay，低清预检负责在
+正式 `1600×800` render 会用同一个阈值再查完整 action replay，低清预检负责在
 昂贵 GT、高清渲染和 VLM 调用之前淘汰明显脏路线。
 
 Instruction 系统的正式顺序为：
@@ -334,10 +385,16 @@ endpoint agent 只输出结构化语义事实，不提前起草可发布的 stop
 朝向短语和 landmark 词表不作为发布硬门。模型派生 facts 与 instruction 的
 不一致只记为诊断 warning，最终语义发布门由独立视觉 audit 决定。
 最终 clean JSONL 只保留 `episode_id`、`instruction`、`actions`、
-`instruction_profile`、`input_fingerprint`、`pipeline_fingerprint` 和可选
-`trajectory_id`；contact sheet、raw response、repair/audit 结果只在 work dir 中用于恢复
+`instruction_profile` 和可选 `trajectory_id`；contact sheet、raw response、
+repair/audit 结果只在 work dir 中用于恢复
 和人工审查。
-任何 trajectory、图片或 instruction 未通过硬检查时，正式 dataset 都不会发布。
+GT 和高清图片回放后的逐 episode 硬检查都会自动同时过滤 trajectory、GT、agent
+输入和图片中的失败样本，因此最终规模可以略低于采样规模；质量优先于凑齐精确
+数量。图片阶段只汇总已记录的帧数，不会为报告重新读取数 TB JPEG 计算全量哈希。
+Instruction 断点续跑只使用已成功 episode ID；正式 agent input 和图片树一经发布即视为
+不可变。Qwen 启动前不会遍历图片或计算哈希。实际构建每条
+视觉证据时仍会严格检查 action/frame 数量并读取对应图片。
+过滤后仍有任何 instruction 未通过硬检查时，正式 dataset 都不会发布。
 
 ## Instruction 迭代验收
 

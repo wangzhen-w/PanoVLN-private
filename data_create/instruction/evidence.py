@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import re
 from dataclasses import dataclass
@@ -21,9 +20,6 @@ from .actions import (
     select_route_frames,
     select_start_frames,
 )
-from .io_utils import hash_file
-
-
 @dataclass(frozen=True)
 class SegmentEvidence:
     segment_id: int
@@ -50,7 +46,6 @@ class EvidencePacket:
     endpoint_sheet_path: Optional[str]
     final_sheet_path: Optional[str]
     segment_sheets: List[SegmentEvidence]
-    evidence_fingerprint: str
 
 
 def image_key_candidates(row: Mapping[str, Any]) -> List[str]:
@@ -292,65 +287,6 @@ def route_needs_segmented_evidence(
     return translated_positions > 2 * evidence_capacity and route_choices >= 3
 
 
-def evidence_frame_fingerprint(
-    row: Mapping[str, Any],
-    *,
-    image_root: str,
-    max_waypoints: int,
-    start_window_frames: int,
-    endpoint_window_frames: int,
-    route_evidence_mode: str = "auto",
-    segmented_min_actions: int = 80,
-    segment_max_waypoints: int = 0,
-    mode: str = "content",
-) -> str:
-    _, frame_paths = sorted_frame_paths(image_root, row)
-    actions = [int(action) for action in row["actions"]]
-    expected = sum(action != 0 for action in actions) + 1
-    if len(frame_paths) != expected:
-        raise ValueError(
-            f"Action/frame mismatch for episode {row.get('episode_id')}: "
-            f"expected {expected}, found {len(frame_paths)}"
-        )
-    route_selected = select_route_frames(actions, len(frame_paths), max_waypoints)
-    extra_segment_frames: List[int] = []
-    use_segments = route_evidence_mode == "segmented" or (
-        route_evidence_mode == "auto"
-        and route_needs_segmented_evidence(
-            actions,
-            action_threshold=int(segmented_min_actions),
-            max_waypoints=int(max_waypoints),
-        )
-    )
-    if use_segments:
-        if int(segment_max_waypoints) <= 0:
-            segment_max_waypoints = max_waypoints
-        extra_segment_frames = select_route_frames(
-            actions,
-            len(frame_paths),
-            segment_max_waypoints,
-        )
-    selected = sorted(
-        set(
-            route_selected
-            + extra_segment_frames
-            + select_start_frames(actions, len(frame_paths), start_window_frames)
-            + select_endpoint_frames(actions, len(frame_paths), endpoint_window_frames)
-        )
-    )
-    digest = hashlib.sha256()
-    digest.update(json_bytes({"selected_frames": selected, "image_keys": image_key_candidates(row)}))
-    for index in selected:
-        hash_file(frame_paths[index], digest, mode)
-    return digest.hexdigest()
-
-
-def json_bytes(value: Any) -> bytes:
-    import json
-
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
 def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
     image_key, frame_paths = sorted_frame_paths(args.image_root, row)
     actions = [int(action) for action in row["actions"]]
@@ -504,17 +440,6 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
                 )
             )
         segment_sheets = saved_segments
-    fingerprint = evidence_frame_fingerprint(
-        row,
-        image_root=args.image_root,
-        max_waypoints=args.max_waypoints,
-        start_window_frames=args.start_window_frames,
-        endpoint_window_frames=args.endpoint_window_frames,
-        route_evidence_mode=getattr(args, "route_evidence_mode", "auto"),
-        segmented_min_actions=getattr(args, "segmented_min_actions", 80),
-        segment_max_waypoints=getattr(args, "segment_max_waypoints", 0),
-        mode=args.evidence_fingerprint_mode,
-    )
     return EvidencePacket(
         image_key=image_key,
         selected_frames=selected,
@@ -531,5 +456,4 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
         endpoint_sheet_path=endpoint_path,
         final_sheet_path=final_path,
         segment_sheets=segment_sheets,
-        evidence_fingerprint=fingerprint,
     )

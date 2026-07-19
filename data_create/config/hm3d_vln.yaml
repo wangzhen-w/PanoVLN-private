@@ -22,9 +22,9 @@ habitat:
       main_agent:
         sim_sensors:
           rgb_sensor:
-            # GT 正式入口会关闭 observation sensors；保留 2K 默认供直接回放使用。
-            width: 2048
-            height: 1024
+            # GT 正式入口会关闭 observation sensors；该尺寸仅供直接回放使用。
+            width: 1600
+            height: 800
     forward_step_size: 0.25
     turn_angle: 15
     habitat_sim_v0:

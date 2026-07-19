@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export paired instructions and expert actions to the ScaleVLN-style VLN-CE contract.
+"""Export verified instructions and expert actions to the ScaleVLN-style VLN-CE contract.
 
 The exporter is deliberately a strict publication gate.  It does not try to
-repair incomplete instruction runs or malformed trajectories: both instruction
-styles must describe the same source episodes and carry matching trajectory
-provenance before any output is published.
+repair incomplete instruction runs or malformed trajectories.  Every supplied
+instruction variant must describe the same source episodes and carry matching
+trajectory provenance before any output is published.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 from data_create.trajectory.scene_paths import validate_public_scene_id
 
 
-REQUIRED_STYLES = ("concise", "dense")
+SUPPORTED_STYLES = ("concise", "dense")
 QUATERNION_NORM_TOLERANCE = 1e-3
 POSITION_TOLERANCE = 1e-3
 EMPTY_INSTRUCTION_VOCAB = {
@@ -46,7 +46,10 @@ def parse_args() -> argparse.Namespace:
         action="append",
         required=True,
         metavar="STYLE=JSONL",
-        help="Verified instruction JSONL; provide concise and dense exactly once.",
+        help=(
+            "Verified instruction JSONL. Provide one or more unique variants; "
+            "the formal PanoVLN-HM3D pipeline supplies dense only."
+        ),
     )
     parser.add_argument("--output", required=True)
     parser.add_argument(
@@ -74,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "--allow-subset",
         action="store_true",
         help=(
-            "Allow the paired variant files to cover a strict subset of the "
+            "Allow the instruction variant files to cover a strict subset of the "
             "dataset. By default, complete episode coverage is required."
         ),
     )
@@ -137,17 +140,16 @@ def parse_variants(values: Iterable[str]) -> List[Tuple[str, str]]:
         style, path = value.split("=", 1)
         style = style.strip()
         path = path.strip()
-        if style not in REQUIRED_STYLES:
+        if style not in SUPPORTED_STYLES:
             raise ValueError(f"Unknown instruction style: {style}")
         if style in parsed:
             raise ValueError(f"Duplicate style: {style}")
         if not path:
             raise ValueError(f"Variant {style} has an empty path")
         parsed[style] = path
-    missing = sorted(set(REQUIRED_STYLES) - set(parsed))
-    if missing:
-        raise ValueError(f"Both concise and dense variants are required; missing={missing}")
-    return [(style, parsed[style]) for style in REQUIRED_STYLES]
+    if not parsed:
+        raise ValueError("At least one instruction variant is required")
+    return [(style, parsed[style]) for style in SUPPORTED_STYLES if style in parsed]
 
 
 def validate_finite_numbers(value: Any, context: str) -> None:
@@ -405,14 +407,6 @@ def validate_row_provenance(
         )
     evidence["trajectory_id"] = str(trajectory_id)
 
-    input_fingerprint = row.get("input_fingerprint")
-    if not isinstance(input_fingerprint, str) or not input_fingerprint:
-        raise ValueError(f"{context} must carry a non-empty input_fingerprint")
-    evidence["input_fingerprint"] = input_fingerprint
-    pipeline_fingerprint = row.get("pipeline_fingerprint")
-    if not isinstance(pipeline_fingerprint, str) or not pipeline_fingerprint:
-        raise ValueError(f"{context} must carry a non-empty pipeline_fingerprint")
-
     route_hash = row.get("source_route_hash", row.get("route_hash"))
     if route_hash is not None:
         source_hash = (source.get("info") or {}).get("route_hash")
@@ -427,31 +421,42 @@ def validate_row_provenance(
     return evidence
 
 
-def validate_paired_provenance(
+def validate_variant_provenance(
     evidence_by_style: Mapping[str, Mapping[str, Any]], episode_id: int
 ) -> Tuple[int, ...] | None:
-    concise = evidence_by_style["concise"]
-    dense = evidence_by_style["dense"]
-    for key in ("trajectory_id", "input_fingerprint"):
-        if key not in concise or key not in dense or concise[key] != dense[key]:
-            raise ValueError(f"Episode {episode_id} concise/dense {key} does not match")
-    if ("actions" in concise) != ("actions" in dense):
-        raise ValueError(
-            f"Episode {episode_id} paired variants must both carry actions or both omit them"
-        )
-    if "actions" in concise:
-        if concise["actions"] != dense["actions"]:
-            raise ValueError(f"Episode {episode_id} concise/dense actions do not match")
-        return concise["actions"]
+    styles = list(evidence_by_style)
+    if not styles:
+        raise ValueError(f"Episode {episode_id} has no instruction variants")
+    reference_style = styles[0]
+    reference = evidence_by_style[reference_style]
 
-    common_keys = set(concise) & set(dense) & {"trajectory_id", "route_hash"}
-    if not common_keys:
+    for key in ("trajectory_id",):
+        if key not in reference:
+            raise ValueError(
+                f"Episode {episode_id} variant {reference_style} has no {key}"
+            )
+        for style in styles[1:]:
+            evidence = evidence_by_style[style]
+            if key not in evidence or evidence[key] != reference[key]:
+                raise ValueError(
+                    f"Episode {episode_id} variants {reference_style}/{style} "
+                    f"{key} do not match"
+                )
+
+    carries_actions = ["actions" in evidence_by_style[style] for style in styles]
+    if any(carries_actions) and not all(carries_actions):
         raise ValueError(
-            f"Episode {episode_id} concise/dense rows have no common provenance field"
+            f"Episode {episode_id} variants must all carry actions or all omit them"
         )
-    for key in common_keys:
-        if concise[key] != dense[key]:
-            raise ValueError(f"Episode {episode_id} concise/dense {key} does not match")
+    if all(carries_actions):
+        reference_actions = reference["actions"]
+        for style in styles[1:]:
+            if evidence_by_style[style]["actions"] != reference_actions:
+                raise ValueError(
+                    f"Episode {episode_id} variants {reference_style}/{style} "
+                    "actions do not match"
+                )
+        return reference_actions
     return None
 
 
@@ -558,19 +563,23 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
         source_episodes[episode_id] = episode
 
     rows_by_style = {style: read_jsonl(path) for style, path in variants}
-    concise_ids = set(rows_by_style["concise"])
-    dense_ids = set(rows_by_style["dense"])
-    if concise_ids != dense_ids:
-        concise_only = sorted(concise_ids - dense_ids)
-        dense_only = sorted(dense_ids - concise_ids)
-        raise ValueError(
-            "Concise/dense episode ID sets must be identical: "
-            f"concise_only={concise_only[:10]}, dense_only={dense_only[:10]}"
-        )
-    selected_ids = sorted(concise_ids)
+    styles = [style for style, _ in variants]
+    reference_style = styles[0]
+    reference_ids = set(rows_by_style[reference_style])
+    for style in styles[1:]:
+        style_ids = set(rows_by_style[style])
+        if style_ids != reference_ids:
+            reference_only = sorted(reference_ids - style_ids)
+            style_only = sorted(style_ids - reference_ids)
+            raise ValueError(
+                "Instruction variant episode ID sets must be identical: "
+                f"{reference_style}_only={reference_only[:10]}, "
+                f"{style}_only={style_only[:10]}"
+            )
+    selected_ids = sorted(reference_ids)
     source_ids = set(source_episodes)
-    extra = sorted(concise_ids - source_ids)
-    missing = sorted(source_ids - concise_ids)
+    extra = sorted(reference_ids - source_ids)
+    missing = sorted(source_ids - reference_ids)
     if extra:
         raise ValueError(f"Variant episode IDs are absent from dataset: {extra[:10]}")
     allow_subset = bool(getattr(args, "allow_subset", False))
@@ -633,7 +642,7 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
                 f"missing={sorted(expected_image_directories - actual_image_directories)[:10]}, "
                 f"extra={sorted(actual_image_directories - expected_image_directories)[:10]}"
             )
-    pair_actions: Dict[int, Tuple[int, ...] | None] = {}
+    variant_actions: Dict[int, Tuple[int, ...] | None] = {}
     for episode_id in selected_ids:
         evidence = {
             style: validate_row_provenance(
@@ -642,27 +651,27 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
                 style,
                 episode_id,
             )
-            for style in REQUIRED_STYLES
+            for style in styles
         }
-        pair_actions[episode_id] = validate_paired_provenance(evidence, episode_id)
-        if pair_actions[episode_id] is None:
+        variant_actions[episode_id] = validate_variant_provenance(evidence, episode_id)
+        if variant_actions[episode_id] is None:
             raise ValueError(
                 f"Episode {episode_id} variants must carry actions when publishing GT"
             )
         expected_actions = tuple(selected_source_gt[episode_id]["actions"] + [0])
-        if pair_actions[episode_id] != expected_actions:
+        if variant_actions[episode_id] != expected_actions:
             raise ValueError(
                 f"Episode {episode_id} variant actions do not equal source GT actions + STOP"
             )
 
     output_episodes: List[Dict[str, Any]] = []
-    per_style = {style: 0 for style in REQUIRED_STYLES}
+    per_style = {style: 0 for style in styles}
     output_gt: Dict[str, Dict[str, Any]] = {}
-    # Interleave concise/dense so every adjacent pair shares trajectory_id.
+    # Group any explicitly requested variants by their shared physical trajectory.
     for source_id in selected_ids:
         source = source_episodes[source_id]
         source_info = dict(source.get("info") or {})
-        for style in REQUIRED_STYLES:
+        for style in styles:
             row = rows_by_style[style][source_id]
             per_style[style] += 1
 
@@ -717,15 +726,15 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
             raise ValueError(f"GT episode {key} forward_steps mismatch")
         if len(record["locations"]) != record["forward_steps"] + 1:
             raise ValueError(f"GT episode {key} locations mismatch")
-    for index in range(0, len(output_episodes), len(REQUIRED_STYLES)):
-        pair = output_episodes[index : index + len(REQUIRED_STYLES)]
-        if len(pair) != len(REQUIRED_STYLES):
-            raise ValueError("Published episode list ends with an incomplete style pair")
-        if len({episode["trajectory_id"] for episode in pair}) != 1:
-            raise ValueError("Adjacent concise/dense episodes do not share trajectory_id")
-        pair_gt = [output_gt[str(episode["episode_id"])] for episode in pair]
-        if pair_gt[1:] != pair_gt[:-1]:
-            raise ValueError("Adjacent concise/dense episodes do not share identical GT")
+    for index in range(0, len(output_episodes), len(styles)):
+        group = output_episodes[index : index + len(styles)]
+        if len(group) != len(styles):
+            raise ValueError("Published episode list ends with an incomplete variant group")
+        if len({episode["trajectory_id"] for episode in group}) != 1:
+            raise ValueError("Adjacent instruction variants do not share trajectory_id")
+        group_gt = [output_gt[str(episode["episode_id"])] for episode in group]
+        if group_gt[1:] != group_gt[:-1]:
+            raise ValueError("Adjacent instruction variants do not share identical GT")
 
     output = {
         "episodes": output_episodes,
@@ -733,7 +742,7 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
     }
     summary = {
         "dataset_trajectories": len(source_episodes),
-        "paired_trajectories": len(selected_ids),
+        "selected_trajectories": len(selected_ids),
         "exported_episodes": len(output_episodes),
         "allow_subset": allow_subset,
         "is_subset": len(selected_ids) != len(source_episodes),
