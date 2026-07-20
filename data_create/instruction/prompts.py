@@ -9,7 +9,26 @@ from typing import Any, Dict, Mapping
 SYSTEM_JSON = (
     "You are a careful VLN navigation-instruction annotator. Use only the "
     "trajectory evidence provided in this request. Do not copy or infer from "
-    "any source instruction. Do not reveal reasoning. Output only valid JSON. /no_think"
+    "any source instruction. Do not reveal reasoning. Output only valid JSON."
+)
+
+FINAL_INSTRUCTION_SYSTEM_JSON = (
+    "You are a careful VLN navigation-instruction annotator. Use only the "
+    "trajectory evidence provided in this request. In final, repaired, or corrected "
+    "instructions, let the actual route determine the discourse and wording. A useful "
+    "starting context, direct action, orientation, space transition, or landmark-led cue "
+    "may all be natural; no opening form is required or forbidden. Do not default to one "
+    "corpus-wide formula or mechanically replace it with another. Do not reveal reasoning. "
+    "Output only valid JSON."
+)
+
+ALTERNATIVE_INSTRUCTION_SYSTEM_JSON = (
+    "You are the language-realization writer for a grounded VLN route. The supplied route "
+    "draft and semantic plan are the complete content boundary: preserve their route order, "
+    "decisions, landmarks, and endpoint, without adding visual facts. Express that content "
+    "as an independently organized, natural instruction rather than copying the source's "
+    "first clause or sentence structure. There is no required replacement opener, verb, "
+    "syntax, or length. Do not reveal reasoning. Output only valid JSON."
 )
 
 
@@ -17,12 +36,59 @@ def style_requirements(profile: str) -> str:
     if profile == "dense":
         return (
             "Use enough grounded route decisions and progress cues to make a long or "
-            "ambiguous route executable. Let the route determine the length and structure."
+            "ambiguous route executable. Let the route determine the length, discourse, "
+            "and sentence structure."
         )
     return (
         "Use the smallest set of grounded route decisions, progress cues, and endpoint "
-        "facts that still makes the route executable."
+        "facts that still makes the route executable. Let the route determine the discourse "
+        "and sentence structure."
     )
+
+
+def alternative_realization_prompt(
+    *,
+    episode_id: Any,
+    profile: str,
+    source_instruction: str,
+    route_content: Mapping[str, Any],
+    discourse_intent: Mapping[str, str],
+) -> str:
+    schema = {
+        "preserved_route_content": [
+            "brief ordered checks showing that navigation-critical source content was retained"
+        ],
+        "final_instruction": "independently worded instruction to publish",
+    }
+    return f"""
+Rewrite one grounded VLN route as a natural instruction. This is language realization, not a new visual interpretation.
+
+Episode: {episode_id}
+Instruction profile: {profile}
+
+Discourse intent for this episode:
+{json.dumps(discourse_intent or {}, ensure_ascii=False, indent=2)}
+
+The intent is a high-level organizational suggestion, not a sentence template. It never overrides grounded route content. If it does not fit the available facts, use the closest natural organization without inventing evidence.
+
+Grounded source instruction:
+{source_instruction}
+
+Grounded semantic content:
+{json.dumps(route_content or {}, ensure_ascii=False, indent=2)}
+
+Requirements:
+- Preserve the same executable route order, necessary decisions and transitions, useful landmarks, stair direction, and final stopping location.
+- Do not add, remove, reverse, or relocate navigation facts merely to make the wording different. Generalize a phrase only when its extra detail has no navigation value.
+- Starting context, direct action, orientation, space transition, and landmark-led phrasing are all valid when they make this particular route clear. The literal word `Start` is neither required nor forbidden.
+- Reorganize the discourse independently rather than copying the source opening sentence-by-sentence or performing mechanical synonym replacement.
+- Do not create apparent diversity by shifting every route to one alternative stock opener.
+- Choose the structure that communicates this particular route naturally. There is no required first word, transition phrase, sentence count, or length.
+- Do not mention drafts, plans, facts, images, frames, action IDs, degrees, or coordinates.
+
+Return exactly this JSON schema:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+"""
 
 
 def endpoint_fact_prompt(
@@ -151,11 +217,11 @@ def plan_write_prompt(
     }
     return f"""
 You will receive three visual evidence sheets, in this order:
-1. START: the start and early translated positions.
+1. EARLY ROUTE: the initial and early translated positions.
 2. ROUTE: selected translated positions along the path. Each row is a physical waypoint; columns show left, forward, right, and back views.
 3. ENDPOINT: the final approach and terminal view. The row labeled FINAL is the true stopping observation.
 
-The route is panoramic VLN: write directions that a follower can execute from the start to the final stop. The labels are evidence labels only; do not mention images, frames, rows, sheets, or action IDs in the final instruction.
+The route is panoramic VLN: write directions that a follower can execute from the initial observation to the final stop. The labels are evidence labels only; do not mention images, frames, rows, sheets, or action IDs in the final instruction.
 
 Episode: {episode_id}
 Instruction profile: {profile}
@@ -178,6 +244,7 @@ Quality rules:
 - Treat trajectory `vertical_motion` as a hard physical constraint whenever stairs are described.
 - Make the final location uniquely identifiable from the endpoint facts and evidence. The FINAL camera is already at the destination; do not extend the route toward a distant or side/back context object.
 - Preserve the meaning of verified endpoint facts, but choose your own wording. There is no required opening, sentence count, syntax, navigation verb, or literal stop word.
+- Let this route determine whether initial-scene context or a direct navigation cue is the clearest opening; neither form is preferred globally.
 - Let route complexity determine length. Missing unimportant objects or local heading adjustments is acceptable when the route remains executable.
 - Do not mention images, evidence labels, frames, action IDs, degrees, or coordinates in the instruction.
 
@@ -292,7 +359,7 @@ def segmented_merge_prompt(
     }
     return f"""
 Write the final VLN instruction by merging ordered segment facts into one natural route instruction.
-You will also receive START, ROUTE overview, and ENDPOINT evidence sheets. Use the segment facts to preserve route order and local transitions. Use ENDPOINT evidence as the authority for the final stopping condition.
+You will also receive EARLY ROUTE, ROUTE overview, and ENDPOINT evidence sheets. Use the segment facts to preserve route order and local transitions. Use ENDPOINT evidence as the authority for the final stopping condition.
 
 Episode: {episode_id}
 Instruction profile: {profile}
@@ -318,6 +385,7 @@ Merge rules:
 - Use landmarks selectively to resolve choices, confirm useful progress, or identify the destination. Do not add surface detail merely to make the instruction longer.
 - Treat the FINAL camera location and verified `stop_location_anchor` as the destination. Forward distance and side/back context must not extend or redirect the route.
 - Preserve endpoint meaning and necessary route decisions, but paraphrase freely. There is no required opening, sentence count, syntax, transition phrase, navigation verb, or literal stop word.
+- Let this route determine whether initial-scene context or a direct navigation cue is the clearest opening; neither form is preferred globally.
 - Let route complexity determine the amount of detail. Missing low-level actions, local alignments, and unimportant objects is acceptable when the route remains executable.
 - Do not mention segments, evidence labels, images, frames, action IDs, degrees, or coordinates.
 
@@ -365,7 +433,7 @@ def candidate_judge_prompt(
     }
     return f"""
 You are choosing the best publishable VLN instruction from multiple candidates.
-You will receive START, ROUTE, ENDPOINT, and FINAL STOP visual evidence. The route is panoramic navigation: choose the instruction that best helps a follower execute the true route and stop at the true final location.
+You will receive EARLY ROUTE, ROUTE, ENDPOINT, and FINAL STOP visual evidence. The route is panoramic navigation: choose the instruction that best helps a follower execute the true route and stop at the true final location.
 
 Episode: {episode_id}
 Instruction profile: {profile}
@@ -390,6 +458,7 @@ Selection criteria:
 - Treat forward, side, and back views as context around the same final camera. A context object beyond the stop must not extend the route or replace the camera's stopping area.
 - Side and back anchors may validly identify where that camera is standing even though they are not the forward destination or final facing direction.
 - When candidates are equally correct and executable, prefer the one that reads naturally without redundancy. Do not reward a particular opening, sentence count, verb, phrase, or length.
+- When equally grounded candidates differ only in discourse, prefer wording organized around this route's useful actions and transitions rather than reusable introductory boilerplate. A genuinely useful initial landmark is navigation content, not boilerplate.
 - When the final location is semantically clear, do not add or subtract quality for the literal words "start", "stop", or "wait".
 - If no single candidate is fully best, but one candidate has the better route transitions and another has the better endpoint, set `needs_repair=true` and provide one corrected full instruction grounded directly in the raw evidence.
 - If all candidates have a fixable endpoint or route issue, set `needs_repair=true` and provide one corrected full instruction in `repair_instruction`.
@@ -428,7 +497,7 @@ def audit_prompt(
         "corrected_instruction": "empty if no correction is needed",
     }
     return f"""
-You are independently auditing one generated VLN instruction against the same START, ROUTE, and ENDPOINT evidence sheets. You did not write the instruction.
+You are independently auditing one generated VLN instruction against the same EARLY ROUTE, ROUTE, and ENDPOINT evidence sheets. You did not write the instruction.
 
 Episode: {episode_id}
 Instruction profile: {profile}
@@ -478,7 +547,7 @@ def repair_prompt(
         "changes": ["brief list of fixes"],
     }
     return f"""
-Repair the generated VLN instruction using the START, ROUTE, and ENDPOINT evidence.
+Repair the generated VLN instruction using the EARLY ROUTE, ROUTE, and ENDPOINT evidence.
 
 Episode: {episode_id}
 Instruction profile: {profile}

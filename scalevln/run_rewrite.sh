@@ -9,10 +9,10 @@ PYTHON_BIN="python"
 # 只需要修改这三个数据路径。
 SOURCE_JSONL="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln.jsonl"
 IMAGE_ROOT="/workspace/data1/dataset/PanoVLN/images/scalevln"
-REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen36_27b_panovln.jsonl"
+REWRITE_OUTPUT="/workspace/data1/dataset/PanoVLN/sub_dataset/scalevln_qwen36_35b_a3b_panovln.jsonl"
 
 BASE_URL="http://127.0.0.1:10420/v1"
-MODEL="Qwen3.6-27B"
+MODEL="Qwen3.6-35B-A3B"
 API_KEY="test"
 
 NUM_WORKERS=40
@@ -24,8 +24,8 @@ SEGMENT_ROWS=5
 SEGMENT_OVERLAP=1
 START_WINDOW_FRAMES=6
 ENDPOINT_WINDOW_FRAMES=6
-CANDIDATE_COUNT=2  # 每条路线生成多个候选后由独立视觉 judge 选择，降低单次采样回归。
-CANDIDATE_TEMPERATURE=0.4
+CANDIDATE_COUNT=2  # 每条路线保留 grounded draft 与独立 language realization，再做视觉验真。
+CANDIDATE_TEMPERATURE=0.4  # language-realization 温度；grounding 与 review 仍保持 0 以稳定事实。
 TILE_WIDTH=320
 TILE_HEIGHT=240
 SHEET_JPEG_QUALITY=90
@@ -93,7 +93,7 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --blind-grounding-audit true \
   --route-audit true \
   --spatial-audit true \
-  --drop-failed false \
+  --drop-failed true \
   --allow-incomplete false \
   --resume true
 

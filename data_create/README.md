@@ -72,7 +72,7 @@ grounded route facts，再由全局 writer 结合 START / ROUTE overview / ENDPO
 正式配置使用 `1600×800` 全景、JPEG 质量 92，并投影为 `384×288` 透视 tile、
 contact sheet JPEG 质量 90。只提高全景而保留原来的 `256×192` tile 无法明显改善
 VLM 最终看到的 landmark；两级分辨率必须一起提高。`512×384` tile 会让长路线的
-多图请求接近当前 Qwen3.6-27B 的上下文上限，因此没有作为默认值。
+多图请求接近当前 Qwen3.6-35B-A3B 的上下文上限，因此没有作为默认值。
 正式图片尺寸由 `run_data_creation.sh` 的 `PANORAMA_WIDTH/HEIGHT` 传给
 `render-panoramas`，因此该脚本中的值是发布图片分辨率的唯一配置。GT 阶段使用
 `--minimal-observations` 关闭 `hm3d_vln.yaml` 的 RGB sensor，所以 YAML 中的 sensor
@@ -122,7 +122,7 @@ SEGMENT_OVERLAP=1
 SEGMENT_FACT_MAX_TOKENS=360
 
 BASE_URL="http://127.0.0.1:10420/v1"
-MODEL="Qwen3.6-27B"
+MODEL="Qwen3.6-35B-A3B"
 API_KEY="test"
 NUM_WORKERS=40
 STAGE="full"
@@ -352,8 +352,9 @@ actions + selected panorama frames
   -> Qwen semantic stop-location extraction from ENDPOINT approach + labeled FINAL views
   -> Qwen endpoint fact audit; failed corrections require a fresh verification
   -> long or action-complex routes: segment sheets + action-span-grounded route facts
-  -> free-form Qwen writing from verified semantic route/endpoint facts
-  -> independent visual judge reads raw evidence and selects/repairs the best draft
+  -> grounded Qwen writer drafts from verified semantic route/endpoint facts
+  -> independent language-realization writer reorganizes the grounded draft without new visual claims
+  -> independent visual judge reads raw evidence and verifies both drafts; publish the approved realization or fall back to the grounded draft
   -> deterministic format and simulator-geometry gate
   -> Qwen blind grounding audit reads raw evidence without derived facts/plans
   -> blind correction and re-audit when grounding fails
@@ -371,16 +372,25 @@ LEFT / RIGHT / BACK 单视角图，把“相机当前站立位置”与“正前
 endpoint fact audit，检查 forward/side-view 是否串列，以及前方 anchor 是已到达还是在 FINAL 后仍位于前方。
 endpoint agent 只输出结构化语义事实，不提前起草可发布的 stop phrase。audit 如果改写了 facts，改写结果必须再通过一次验证才能进入 writer；持续失败
 时丢弃整份派生 endpoint facts，writer 回退到原始 ENDPOINT / FINAL evidence，而不是传播
-未验证事实或让整批任务失败。writer 只受路线顺序、关键决策、视觉 grounding、楼梯方向和
-终点语义约束，不规定开头、句数、句法、导航动词或必须出现 `stop/wait`；长度随路线复杂度
-自适应，并把相邻语义事件组织成连贯指引，而不是逐 action 复述。endpoint facts 只帮助 writer
-生成候选，不再被 deterministic QA 当作视觉真值。candidate judge 和最终 blind audit 只读取原始视觉、actions 和几何
+未验证事实或让整批任务失败。grounded writer 只受路线顺序、关键决策、视觉 grounding、楼梯方向和
+终点语义约束；language-realization writer 以该事实底稿为内容边界，重新组织自然表达，不重复做一次
+容易产生不同路线解释的视觉规划。系统不规定开头、句数、句法、导航动词或必须出现 `stop/wait`；
+起点背景、直接动作、朝向、空间过渡或 landmark 都可以自然组织在开头，`Start` 既不要求也不禁止，
+但不能让任一形式成为整套数据的默认起手式。长度随路线复杂度
+自适应，并把相邻语义事件组织成连贯指引，而不是逐 action 复述。endpoint facts 只帮助 grounded writer
+生成底稿，不再被 deterministic QA 当作视觉真值。candidate judge 和最终 blind audit 只读取原始视觉、actions 和几何
 约束，从而能够纠正多个候选共享的错误 endpoint 解释。judge/audit 必须先分别写出
 原始证据中的空间序列、instruction 实际表达的空间序列以及前方 anchor 是否在 FINAL 相机处已到达，
 只有路线与 endpoint 两项都匹配才允许发布。
-为避免针对少数 episode 堆物体级硬规则，默认每条路线生成两个候选 instruction，
-再由独立 visual candidate judge 根据原始 START / ROUTE segments / ENDPOINT / FINAL evidence
-选择更忠实、可执行、终点更准的一版；deterministic QA 只负责格式、数据泄漏、
+为避免针对少数 episode 堆物体级硬规则，默认每条路线保留 grounded draft 和独立 language realization。
+language-realization agent 会按全局 `SEED` 和 `episode_id` 稳定抽取一个高层 discourse intent：
+action-led、context-led、transition-led、orientation-led、progress-led 或 free。它们只提示信息组织重心，
+不提供固定首词或句式；不符合当前视觉事实时允许自然回退。context-led 明确允许 `Start/Begin`，因此该机制
+控制的是大规模语料的表达分布，而不是把某个合法词设为禁词。
+候选在展示给 visual judge 前会随机匿名排序并按展示顺序重新编号，避免候选编号与 agent 职责绑定造成
+选择偏差。language realization 只有在独立 visual candidate judge 根据原始 EARLY ROUTE / ROUTE
+segments / ENDPOINT / FINAL evidence 确认路线与终点都匹配时才发布，否则回退到 grounded draft；
+deterministic QA 只负责格式、数据泄漏、
 空输出、内部数据痕迹和 simulator/GT 提供的通用物理约束。词数、句数、固定词、颜色材质、
 朝向短语和 landmark 词表不作为发布硬门。模型派生 facts 与 instruction 的
 不一致只记为诊断 warning，最终语义发布门由独立视觉 audit 决定。
@@ -388,13 +398,20 @@ endpoint agent 只输出结构化语义事实，不提前起草可发布的 stop
 `instruction_profile` 和可选 `trajectory_id`；contact sheet、raw response、
 repair/audit 结果只在 work dir 中用于恢复
 和人工审查。
+
+Qwen 客户端默认通过请求字段
+`chat_template_kwargs={"enable_thinking": false}` 显式关闭 thinking；prompt 中不再附加
+`/no_think` 文本指令。需要实验 thinking 模式时可传 `--disable-thinking false`。
 GT 和高清图片回放后的逐 episode 硬检查都会自动同时过滤 trajectory、GT、agent
 输入和图片中的失败样本，因此最终规模可以略低于采样规模；质量优先于凑齐精确
 数量。图片阶段只汇总已记录的帧数，不会为报告重新读取数 TB JPEG 计算全量哈希。
-Instruction 断点续跑只使用已成功 episode ID；正式 agent input 和图片树一经发布即视为
+Instruction 断点续跑会复用已成功 episode，也会识别已穷尽生成、修复和复审的质量失败；
+后者是终止状态，不会在下次启动时重试，并从最终 instruction、dataset、GT 和图片集同步剔除。
+API 超时、服务不可用、文件读取异常等运行时失败不会被误判为低质量样本，仍会续跑。
+正式 agent input 和图片树一经发布即视为
 不可变。Qwen 启动前不会遍历图片或计算哈希。实际构建每条
 视觉证据时仍会严格检查 action/frame 数量并读取对应图片。
-过滤后仍有任何 instruction 未通过硬检查时，正式 dataset 都不会发布。
+只要还有运行时失败或其他未完成 episode，正式 dataset 就不会发布；终止质量失败不会阻塞其余高质量数据发布。
 
 ## Instruction 迭代验收
 

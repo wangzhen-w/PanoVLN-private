@@ -22,6 +22,7 @@ from .io_utils import (
     append_jsonl,
     atomic_write_jsonl,
     candidate_is_complete,
+    candidate_is_terminal_failure,
     candidate_paths,
     clean_row_from_candidate,
     episode_key,
@@ -31,7 +32,10 @@ from .io_utils import (
 )
 from .llm import QwenClient
 from .prompts import (
+    ALTERNATIVE_INSTRUCTION_SYSTEM_JSON,
+    FINAL_INSTRUCTION_SYSTEM_JSON,
     SYSTEM_JSON,
+    alternative_realization_prompt,
     audit_prompt,
     endpoint_fact_audit_prompt,
     candidate_judge_prompt,
@@ -43,6 +47,46 @@ from .prompts import (
 )
 from .qa import audit_contract_complete, audit_passed, validate_instruction
 from .trajectory_metadata import enrich_trajectory_metadata
+
+
+REALIZATION_DISCOURSE_INTENTS: Tuple[Tuple[str, str], ...] = (
+    (
+        "action_led",
+        "Make the first useful movement or route decision the grammatical and information focus of the opening clause. Do not front-load a phrase whose main function is to announce the current location; weave initial context into the action only where it helps execute that cue.",
+    ),
+    (
+        "context_led",
+        "A brief route-relevant starting context may lead naturally into the first action. Start or Begin is allowed but not required.",
+    ),
+    (
+        "transition_led",
+        "Make the first supported exit, entry, doorway, or space transition the grammatical and information focus of the opening clause, without front-loading a current-location phrase. If no such early transition exists, use an action-led opening instead.",
+    ),
+    (
+        "orientation_led",
+        "Make a supported facing direction or reliable landmark relation the grammatical and information focus of the opening clause, without front-loading a current-location phrase, then continue with movement. If neither is supported, use an action-led opening.",
+    ),
+    (
+        "progress_led",
+        "Make the opening clause grammatically connect the first movement to an early distinctive progress landmark or next space, without front-loading a current-location phrase. Do not add decorative detail.",
+    ),
+    (
+        "free",
+        "Choose any natural organization that fits this route and is structurally independent of the grounded draft.",
+    ),
+)
+
+
+def realization_discourse_intent(
+    row: Mapping[str, Any], args: argparse.Namespace, realization_rank: int
+) -> Dict[str, str]:
+    rng = random.Random(
+        f"realization-discourse:{args.seed}:{row['episode_id']}:{realization_rank}"
+    )
+    name, guidance = REALIZATION_DISCOURSE_INTENTS[
+        rng.randrange(len(REALIZATION_DISCOURSE_INTENTS))
+    ]
+    return {"name": name, "guidance": guidance}
 
 
 def select_rows(rows: Sequence[Dict[str, Any]], args: argparse.Namespace) -> List[Dict[str, Any]]:
@@ -89,7 +133,7 @@ def stratified_sample(rows: Sequence[Dict[str, Any]], count: int, seed: int) -> 
 
 def images_for_llm(evidence: Any) -> List[Tuple[str, bytes]]:
     return [
-        ("START evidence", evidence.start_sheet),
+        ("EARLY ROUTE evidence", evidence.start_sheet),
         ("ROUTE evidence", evidence.route_sheet),
         ("ENDPOINT evidence", evidence.endpoint_sheet),
         ("FINAL STOP evidence", evidence.final_sheet),
@@ -107,7 +151,7 @@ def images_for_independent_review(evidence: Any) -> List[Tuple[str, bytes]]:
     """Return raw visual evidence without model-derived plans or facts."""
 
     images: List[Tuple[str, bytes]] = [
-        ("START evidence", evidence.start_sheet),
+        ("EARLY ROUTE evidence", evidence.start_sheet),
         ("ROUTE overview evidence", evidence.route_sheet),
     ]
     images.extend(
@@ -495,7 +539,7 @@ def call_plan_write(
         endpoint_facts=endpoint_facts,
     )
     return client.chat_json(
-        system=SYSTEM_JSON,
+        system=FINAL_INSTRUCTION_SYSTEM_JSON,
         prompt=prompt,
         images=images_for_llm(evidence),
         temperature=args.planner_temperature if temperature is None else temperature,
@@ -559,12 +603,58 @@ def call_segmented_merge(
         segment_facts=segment_facts,
     )
     return client.chat_json(
-        system=SYSTEM_JSON,
+        system=FINAL_INSTRUCTION_SYSTEM_JSON,
         prompt=prompt,
         images=images_for_llm(evidence),
         temperature=args.planner_temperature if temperature is None else temperature,
         max_tokens=args.planner_max_tokens,
     )
+
+
+def call_alternative_realization(
+    client: QwenClient,
+    *,
+    row: Mapping[str, Any],
+    source_option: Mapping[str, Any],
+    args: argparse.Namespace,
+    temperature: float,
+    realization_rank: int,
+) -> Tuple[Dict[str, Any], str]:
+    source_plan = source_option.get("plan") or {}
+    content_keys = (
+        "selected_route_facts",
+        "covered_route_events",
+        "covered_decision_boundaries",
+        "endpoint_fact_used",
+        "uncertain_or_avoid",
+    )
+    route_content = {
+        key: source_plan[key]
+        for key in content_keys
+        if key in source_plan and source_plan[key]
+    }
+    discourse_intent = realization_discourse_intent(row, args, realization_rank)
+    prompt = alternative_realization_prompt(
+        episode_id=row["episode_id"],
+        profile=args.instruction_profile,
+        source_instruction=str(source_option.get("instruction") or ""),
+        route_content=route_content,
+        discourse_intent=discourse_intent,
+    )
+    realization, raw = client.chat_json(
+        system=(
+            f"Assigned discourse intent: {discourse_intent['name']}. "
+            f"{discourse_intent['guidance']} This intent sets the information focus, "
+            "not a required word or sentence template. "
+            f"{ALTERNATIVE_INSTRUCTION_SYSTEM_JSON}"
+        ),
+        prompt=prompt,
+        images=[],
+        temperature=temperature,
+        max_tokens=args.planner_max_tokens,
+    )
+    realization["assigned_discourse_intent"] = discourse_intent
+    return realization, raw
 
 
 def call_candidate_judge(
@@ -584,7 +674,7 @@ def call_candidate_judge(
         candidates=candidates,
     )
     return client.chat_json(
-        system=SYSTEM_JSON,
+        system=FINAL_INSTRUCTION_SYSTEM_JSON,
         prompt=prompt,
         images=images_for_independent_review(evidence),
         temperature=args.review_temperature,
@@ -609,7 +699,7 @@ def call_audit(
         instruction=instruction,
     )
     return client.chat_json(
-        system=SYSTEM_JSON,
+        system=FINAL_INSTRUCTION_SYSTEM_JSON,
         prompt=prompt,
         images=images_for_independent_review(evidence),
         temperature=args.review_temperature,
@@ -640,7 +730,7 @@ def call_repair(
         issues=issues,
     )
     return client.chat_json(
-        system=SYSTEM_JSON,
+        system=FINAL_INSTRUCTION_SYSTEM_JSON,
         prompt=prompt,
         images=images_for_llm(evidence),
         temperature=args.temperature,
@@ -712,17 +802,31 @@ def generate_one(
                         if candidate_index == 0
                         else float(getattr(args, "candidate_temperature", args.temperature))
                     )
-                    candidate_plan, raw = call_segmented_merge(
-                        client,
-                        row=row,
-                        evidence=evidence,
-                        action_summary=action_summary,
-                        endpoint_facts=endpoint_facts,
-                        segment_facts=segment_facts,
-                        args=args,
-                        temperature=candidate_temperature,
-                    )
-                    raw_responses[f"segmented_merge_{candidate_index + 1}"] = raw
+                    if candidate_index == 0:
+                        candidate_plan, raw = call_segmented_merge(
+                            client,
+                            row=row,
+                            evidence=evidence,
+                            action_summary=action_summary,
+                            endpoint_facts=endpoint_facts,
+                            segment_facts=segment_facts,
+                            args=args,
+                            temperature=candidate_temperature,
+                        )
+                        raw_responses["segmented_merge_1"] = raw
+                    else:
+                        realization, raw = call_alternative_realization(
+                            client,
+                            row=row,
+                            source_option=candidate_options[0],
+                            args=args,
+                            temperature=candidate_temperature,
+                            realization_rank=candidate_index,
+                        )
+                        candidate_plan = dict(candidate_options[0]["plan"])
+                        candidate_plan["language_realization"] = realization
+                        candidate_plan["final_instruction"] = realization.get("final_instruction", "")
+                        raw_responses[f"alternative_realization_{candidate_index + 1}"] = raw
                     candidate_plan["segment_facts"] = segment_facts
                     candidate_plan["endpoint_facts"] = endpoint_facts
                     candidate_instruction = normalize_instruction(
@@ -731,6 +835,11 @@ def generate_one(
                     candidate_options.append(
                         {
                             "index": candidate_index,
+                            "role": (
+                                "grounded_writer"
+                                if candidate_index == 0
+                                else "language_realizer"
+                            ),
                             "instruction": candidate_instruction,
                             "plan": candidate_plan,
                             "deterministic_qa": validate_instruction(
@@ -749,16 +858,30 @@ def generate_one(
                         if candidate_index == 0
                         else float(getattr(args, "candidate_temperature", args.temperature))
                     )
-                    candidate_plan, raw = call_plan_write(
-                        client,
-                        row=row,
-                        evidence=evidence,
-                        action_summary=action_summary,
-                        endpoint_facts=endpoint_facts,
-                        args=args,
-                        temperature=candidate_temperature,
-                    )
-                    raw_responses[f"plan_write_{candidate_index + 1}"] = raw
+                    if candidate_index == 0:
+                        candidate_plan, raw = call_plan_write(
+                            client,
+                            row=row,
+                            evidence=evidence,
+                            action_summary=action_summary,
+                            endpoint_facts=endpoint_facts,
+                            args=args,
+                            temperature=candidate_temperature,
+                        )
+                        raw_responses["plan_write_1"] = raw
+                    else:
+                        realization, raw = call_alternative_realization(
+                            client,
+                            row=row,
+                            source_option=candidate_options[0],
+                            args=args,
+                            temperature=candidate_temperature,
+                            realization_rank=candidate_index,
+                        )
+                        candidate_plan = dict(candidate_options[0]["plan"])
+                        candidate_plan["language_realization"] = realization
+                        candidate_plan["final_instruction"] = realization.get("final_instruction", "")
+                        raw_responses[f"alternative_realization_{candidate_index + 1}"] = raw
                     candidate_plan["endpoint_facts"] = endpoint_facts
                     candidate_instruction = normalize_instruction(
                         str(candidate_plan.get("final_instruction") or candidate_plan.get("instruction") or "")
@@ -766,6 +889,11 @@ def generate_one(
                     candidate_options.append(
                         {
                             "index": candidate_index,
+                            "role": (
+                                "grounded_writer"
+                                if candidate_index == 0
+                                else "language_realizer"
+                            ),
                             "instruction": candidate_instruction,
                             "plan": candidate_plan,
                             "deterministic_qa": validate_instruction(
@@ -782,6 +910,14 @@ def generate_one(
             judge_has_publishable_candidate = True
             selected_option = candidate_options[0]
             if len(candidate_options) > 1:
+                # Anonymous public indices must match the displayed order.  Shuffling
+                # only the payload while retaining internal indices makes an LLM's
+                # ordinal "first candidate" judgment select a different instruction.
+                random.Random(
+                    f"{args.seed}:{row['episode_id']}:{stage_attempt}"
+                ).shuffle(candidate_options)
+                for public_index, option in enumerate(candidate_options):
+                    option["index"] = public_index
                 judge_candidates = [
                     {
                         "index": option["index"],
@@ -789,9 +925,6 @@ def generate_one(
                     }
                     for option in candidate_options
                 ]
-                random.Random(
-                    f"{args.seed}:{row['episode_id']}:{stage_attempt}"
-                ).shuffle(judge_candidates)
                 judge, raw_responses["candidate_judge"] = call_candidate_judge(
                     client,
                     row=row,
@@ -827,7 +960,28 @@ def generate_one(
                 judge["endpoint_relation_disagreement_diagnostic"] = (
                     judge_relation_disagreement
                 )
-                selected_index = selected_candidate_index(judge, candidate_options)
+                judge_selected_index = selected_candidate_index(judge, candidate_options)
+                publishable_indices = publishable_candidate_indices(judge, candidate_options)
+                publishable_realizers = [
+                    int(option["index"])
+                    for option in candidate_options
+                    if option.get("role") == "language_realizer"
+                    and int(option["index"]) in publishable_indices
+                ]
+                if judge_selected_index in publishable_realizers:
+                    selected_index = judge_selected_index
+                    selection_basis = "judge_selected_language_realization"
+                elif publishable_realizers:
+                    # The grounded writer is the factual drafting stage.  A language
+                    # realization that independently passed the visual judge is the
+                    # intended publication artifact; the grounded draft is its fallback.
+                    selected_index = publishable_realizers[0]
+                    selection_basis = "visually_approved_language_realization"
+                else:
+                    selected_index = judge_selected_index
+                    selection_basis = "judge_selected_grounded_fallback"
+                judge["pipeline_selected_index"] = selected_index
+                judge["pipeline_selection_basis"] = selection_basis
                 judge_has_publishable_candidate = selected_index >= 0
                 selected_option = next(
                     (option for option in candidate_options if int(option["index"]) == selected_index),
@@ -940,6 +1094,8 @@ def generate_one(
             "episode_id": row["episode_id"],
             "trajectory_id": row.get("trajectory_id"),
             "status": "success" if passed else "failed",
+            "terminal_failure": not passed,
+            "failure_kind": None if passed else "quality_gate",
             "mode": args.mode,
             "source_text_blind": args.mode == "generate",
             "old_instruction": "",
@@ -976,6 +1132,7 @@ def generate_one(
             "candidate_options": [
                 {
                     "index": option["index"],
+                    "role": option.get("role"),
                     "instruction": option["instruction"],
                     "deterministic_qa": option["deterministic_qa"],
                     "endpoint_fact_used": (option["plan"] or {}).get("endpoint_fact_used"),
@@ -1000,6 +1157,8 @@ def generate_one(
             "episode_id": row.get("episode_id"),
             "trajectory_id": row.get("trajectory_id"),
             "status": "failed",
+            "terminal_failure": False,
+            "failure_kind": "runtime_error",
             "mode": args.mode,
             "source_text_blind": args.mode == "generate",
             "old_instruction": "",
@@ -1063,7 +1222,32 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     work_dir.mkdir(parents=True, exist_ok=True)
     if args.write_gallery:
         args.save_contact_sheets = True
-    if args.api_preflight:
+    rows = select_rows(read_jsonl(args.input_jsonl, mode=args.mode), args)
+    old_candidates = existing_candidates(work_dir) if args.resume else {}
+    pending: List[Tuple[int, Dict[str, Any]]] = []
+    current_candidates: Dict[str, Dict[str, Any]] = {}
+    terminal_candidates: Dict[str, Dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        existing = old_candidates.get(episode_key(row))
+        if candidate_is_complete(
+            existing,
+            profile=args.instruction_profile,
+        ):
+            current_candidates[episode_key(row)] = existing  # type: ignore[assignment]
+        elif args.drop_failed and candidate_is_terminal_failure(
+            existing,
+            profile=args.instruction_profile,
+        ):
+            terminal_candidates[episode_key(row)] = existing  # type: ignore[assignment]
+        else:
+            pending.append((index, row))
+
+    print(
+        f"[instruction] reused {len(current_candidates)} completed episodes; "
+        f"dropped {len(terminal_candidates)} terminal quality failures; "
+        f"remaining {len(pending)}"
+    )
+    if pending and args.api_preflight:
         QwenClient(
             base_url=args.base_url,
             model=args.model,
@@ -1072,31 +1256,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             retries=1,
             disable_thinking=args.disable_thinking,
         ).preflight()
-    rows = select_rows(read_jsonl(args.input_jsonl, mode=args.mode), args)
-    old_candidates = existing_candidates(work_dir) if args.resume else {}
-    pending: List[Tuple[int, Dict[str, Any]]] = []
-    current_candidates: Dict[str, Dict[str, Any]] = {}
-    for index, row in enumerate(rows):
-        existing = old_candidates.get(episode_key(row))
-        if candidate_is_complete(
-            existing,
-            profile=args.instruction_profile,
-        ):
-            current_candidates[episode_key(row)] = existing  # type: ignore[assignment]
-        else:
-            pending.append((index, row))
-
-    print(
-        f"[instruction] reused {len(current_candidates)} completed episodes; "
-        f"remaining {len(pending)}"
-    )
 
     worker_count = max(1, args.num_workers)
     candidate_files = candidate_paths(work_dir, worker_count)
     failed_files = [work_dir / f"failed_rank{index}.jsonl" for index in range(worker_count)]
     progress = tqdm(
         total=len(rows),
-        initial=len(current_candidates),
+        initial=len(current_candidates) + len(terminal_candidates),
         desc=f"instruction {args.instruction_profile}",
         unit="ep",
     )
@@ -1136,6 +1302,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                     profile=args.instruction_profile,
                 ):
                     current_candidates[episode_key(row)] = candidate
+                elif args.drop_failed and candidate_is_terminal_failure(
+                    candidate,
+                    profile=args.instruction_profile,
+                ):
+                    terminal_candidates[episode_key(row)] = candidate
                 progress.update(1)
                 submit_next()
     except BaseException:
@@ -1150,6 +1321,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     clean_rows: List[Dict[str, Any]] = []
     missing: List[str] = []
+    dropped: List[str] = []
     for row in rows:
         key = episode_key(row)
         candidate = current_candidates.get(key)
@@ -1158,6 +1330,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             profile=args.instruction_profile,
         ):
             clean_rows.append(clean_row_from_candidate(row, candidate or {}))
+        elif key in terminal_candidates:
+            dropped.append(key)
         else:
             missing.append(key)
 
@@ -1170,6 +1344,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "status": "incomplete",
             "selected_rows": len(rows),
             "success_rows": len(clean_rows),
+            "dropped_quality_rows": len(dropped),
+            "dropped_quality_preview": dropped[:30],
             "missing_rows": len(missing),
             "missing_preview": missing[:30],
             "output_partial": partial if clean_rows else None,
@@ -1180,13 +1356,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             write_gallery(rows, current_candidates, args.gallery_path or str(work_dir / "gallery.html"))
         raise RuntimeError(f"Instruction generation incomplete: {len(missing)} missing/failed rows")
 
-    if missing and args.drop_failed:
-        clean_rows = [row for row in clean_rows if episode_key(row) not in set(missing)]
     written = atomic_write_jsonl(args.output_jsonl, clean_rows)
     summary = {
-        "status": "complete" if complete else "partial_allowed",
+        "status": (
+            "complete_with_quality_drops"
+            if complete and dropped
+            else "complete"
+            if complete
+            else "partial_allowed"
+        ),
         "selected_rows": len(rows),
         "written_rows": written,
+        "dropped_quality_rows": len(dropped),
+        "dropped_quality_preview": dropped[:30],
         "missing_rows": len(missing),
         "missing_preview": missing[:30],
         "output_jsonl": args.output_jsonl,

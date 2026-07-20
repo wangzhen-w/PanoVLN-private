@@ -132,13 +132,14 @@ ScaleVLN 旧数据使用不带 split 的 `hm3d/<scene_dir>/<scene_name>.basis.gl
 ScaleVLN trajectory/actions + panoramas
   -> shared source-text-blind evidence / FINAL endpoint facts / segmented-facts generation
   -> endpoint-assisted multi-candidate writing / raw-evidence visual judge / blind audit
-  -> 要求全部 episode 通过质量门
+  -> 已穷尽修复与复审仍未通过的 episode 终止丢弃
   -> 原子发布 REWRITE_OUTPUT
 ```
 
 `REWRITE_OUTPUT` 是唯一正式 rewrite，不生成 candidate、original-baseline 副本或
-pair manifest。脚本使用 `--drop-failed false --allow-incomplete false`：只要还有一条
-失败，就保留 progress 供恢复并拒绝发布不完整 rewrite。
+pair manifest。脚本使用 `--drop-failed true --allow-incomplete false`：质量门已穷尽的
+episode 记为终止失败，续跑时不再调用模型，也不进入正式 rewrite；API 超时、
+服务不可用或文件读取异常等运行时失败仍保留 progress 供续跑，并在完成前拒绝发布。
 
 共享系统包含三类针对 ScaleVLN 脏轨迹/不稳定审核的保护：终点站位语义必须从
 ENDPOINT evidence 保留到最终 instruction，但可自由改写；楼梯上/下方向优先使用 trajectory metadata；

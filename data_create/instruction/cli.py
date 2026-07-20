@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--provider", default="qwen")
     parser.add_argument("--base-url", default="http://127.0.0.1:10420/v1")
-    parser.add_argument("--model", default="Qwen3.6-27B")
+    parser.add_argument("--model", default="Qwen3.6-35B-A3B")
     parser.add_argument("--api-key", default="test")
     parser.add_argument("--request-timeout", type=float, default=300)
     parser.add_argument("--retries", type=int, default=4)
@@ -76,8 +76,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blind-grounding-audit", type=str2bool, default=True)
     parser.add_argument("--route-audit", type=str2bool, default=True)
     parser.add_argument("--spatial-audit", type=str2bool, default=True)
-    parser.add_argument("--drop-failed", type=str2bool, default=False)
-    parser.add_argument("--allow-incomplete", type=str2bool, default=False)
+    parser.add_argument(
+        "--drop-failed",
+        type=str2bool,
+        default=False,
+        help=(
+            "Treat failures that exhausted the quality/repair gates as terminal: "
+            "skip them on resume and omit them from the clean JSONL. Runtime/API "
+            "failures remain retryable."
+        ),
+    )
+    parser.add_argument(
+        "--allow-incomplete",
+        type=str2bool,
+        default=False,
+        help=(
+            "Permit publishing while retryable runtime/incomplete episodes remain. "
+            "Terminal quality drops do not require this option."
+        ),
+    )
     parser.add_argument("--save-failed-contact-sheets", type=str2bool, default=True)
     return parser
 

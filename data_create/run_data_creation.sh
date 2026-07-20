@@ -39,13 +39,13 @@ SEGMENT_MAX_WAYPOINTS=0  # 0 表示分段复用当前 style 的 max-waypoints。
 SEGMENT_ROWS=5  # 每个局部分段 sheet 最多放多少个 waypoint 行。
 SEGMENT_OVERLAP=1  # 相邻分段共享的 waypoint 行数，用于保持上下文连续。
 SEGMENT_FACT_MAX_TOKENS=650  # 单个局部分段 route facts 的最大输出长度。
-CANDIDATE_COUNT=2  # 每条路线生成多个候选后由独立视觉 judge 选择，降低单次采样回归。
-CANDIDATE_TEMPERATURE=0.4  # 非首个候选的采样温度，提供不同自然表述供 judge 比较。
+CANDIDATE_COUNT=2  # 每条路线保留 grounded draft 与独立 language realization，再做视觉验真。
+CANDIDATE_TEMPERATURE=0.4  # language-realization 温度；grounding 与 review 仍保持 0 以稳定事实。
 
 BASE_URL="http://127.0.0.1:10420/v1"  # OpenAI-compatible Qwen API pool 地址。
-MODEL="Qwen3.6-27B"  # 服务中实际加载的模型名称。
+MODEL="Qwen3.6-35B-A3B"  # 服务中实际加载的模型名称。
 API_KEY="test"  # 本地兼容接口的占位 key；按服务要求修改。
-NUM_WORKERS=36  # instruction 并发轨迹数；不要超过 Qwen API pool 的 MAX_CONCURRENCY。
+NUM_WORKERS=40  # instruction 并发轨迹数；不要超过 Qwen API pool 的 MAX_CONCURRENCY。
 
 # 避免系统 HTTP 代理截获本机 Qwen API 请求。
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
@@ -188,7 +188,7 @@ generate_instruction() {
 }
 
 generate_instruction_if_needed() {
-  # dense.jsonl 只在所有 episode 完成后原子发布；中断时由 progress journal 续跑。
+  # dense.jsonl 原子发布；已穷尽修复的质量失败永久剔除，运行时失败由 journal 续跑。
   if [[ -f "${INSTRUCTION_JSONL}" ]]; then
     echo "[full] instruction JSONL already published; skipping ${INSTRUCTION_JSONL}"
     return
@@ -205,7 +205,9 @@ export_dataset() {
     --output "${FINAL_JSON}" \
     --gzip-output "${FINAL_JSON_GZ}" \
     --gt-output "${FINAL_GT_GZ}" \
-    --goal-radius "${GOAL_RADIUS}"
+    --goal-radius "${GOAL_RADIUS}" \
+    --allow-subset \
+    --prune-unselected-images
   # GT 正式发布为压缩文件；清掉旧版本的未压缩副本和失败渲染目录。
   rm -f "${SAVE_ROOT}/train_gt.json"
   rm -rf "${IMAGE_ROOT}.failed"

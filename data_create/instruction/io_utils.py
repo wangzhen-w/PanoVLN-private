@@ -197,6 +197,31 @@ def candidate_is_complete(
     )
 
 
+def candidate_is_terminal_failure(
+    candidate: Optional[Mapping[str, Any]],
+    *,
+    profile: str,
+) -> bool:
+    """Return whether a quality-gated failure should be dropped, not retried.
+
+    Older journals predate the explicit marker.  Their structured QA/audit error
+    identifies the same exhausted quality path, while runtime exceptions carry
+    ``type/message/traceback`` instead and remain retryable.
+    """
+
+    if not candidate or candidate.get("status") != "failed":
+        return False
+    if candidate.get("instruction_profile") != profile:
+        return False
+    marker = candidate.get("terminal_failure")
+    if isinstance(marker, bool):
+        return marker
+    error = candidate.get("error")
+    return isinstance(error, Mapping) and (
+        "deterministic_qa" in error or "blind_grounding_audit" in error
+    )
+
+
 def candidate_paths(work_dir: Path, num_workers: int) -> List[Path]:
     if num_workers <= 0:
         num_workers = 1

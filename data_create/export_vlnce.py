@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -78,7 +79,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Allow the instruction variant files to cover a strict subset of the "
-            "dataset. By default, complete episode coverage is required."
+            "dataset, for example after terminal instruction-quality drops. By "
+            "default, complete episode coverage is required."
+        ),
+    )
+    parser.add_argument(
+        "--prune-unselected-images",
+        action="store_true",
+        help=(
+            "After successful subset publication, remove image directories for "
+            "known source trajectories omitted by the instruction quality gate."
         ),
     )
     return parser.parse_args()
@@ -583,10 +593,13 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
     if extra:
         raise ValueError(f"Variant episode IDs are absent from dataset: {extra[:10]}")
     allow_subset = bool(getattr(args, "allow_subset", False))
+    prune_unselected_images = bool(
+        getattr(args, "prune_unselected_images", False)
+    )
     if missing and not allow_subset:
         raise ValueError(
             f"Variants do not completely cover dataset; missing={missing[:10]}. "
-            "Use --allow-subset only for an explicit partial/ablation export."
+            "Use --allow-subset only for an explicit quality-filtered or ablation export."
         )
 
     source_gt_by_id: Dict[int, Dict[str, Any]] = {}
@@ -627,20 +640,38 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
         )
         for episode_id in selected_ids
     }
+    actual_image_directories = {
+        path.name
+        for path in image_root.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    }
+    expected_image_directories = {
+        str(trajectory_ids[episode_id]) for episode_id in selected_ids
+    }
     if not allow_subset:
-        actual_image_directories = {
-            path.name
-            for path in image_root.iterdir()
-            if path.is_dir() and not path.name.startswith(".")
-        }
-        expected_image_directories = {
-            str(trajectory_ids[episode_id]) for episode_id in selected_ids
-        }
         if actual_image_directories != expected_image_directories:
             raise ValueError(
                 "Image directory set does not match trajectories: "
                 f"missing={sorted(expected_image_directories - actual_image_directories)[:10]}, "
                 f"extra={sorted(actual_image_directories - expected_image_directories)[:10]}"
+            )
+    all_source_image_directories = {
+        str(episode["trajectory_id"]) for episode in source_episodes.values()
+    }
+    unselected_image_directories = (
+        actual_image_directories & all_source_image_directories
+    ) - expected_image_directories
+    unknown_image_directories = (
+        actual_image_directories - all_source_image_directories
+    )
+    if prune_unselected_images:
+        if not allow_subset:
+            raise ValueError("--prune-unselected-images requires --allow-subset")
+        if unknown_image_directories:
+            raise ValueError(
+                "Refusing to prune an image root containing directories that do not "
+                "belong to the source dataset: "
+                f"{sorted(unknown_image_directories)[:10]}"
             )
     variant_actions: Dict[int, Tuple[int, ...] | None] = {}
     for episode_id in selected_ids:
@@ -746,6 +777,9 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
         "exported_episodes": len(output_episodes),
         "allow_subset": allow_subset,
         "is_subset": len(selected_ids) != len(source_episodes),
+        "pruned_image_directories": len(unselected_image_directories)
+        if prune_unselected_images
+        else 0,
         "selected_source_ids_sha256": source_id_sha256(selected_ids),
         "per_style": per_style,
         "goal_radius": args.goal_radius,
@@ -766,6 +800,9 @@ def export(args: argparse.Namespace) -> Dict[str, Any]:
             (gt_output_path, output_gt),
         )
     )
+    if prune_unselected_images:
+        for directory_name in sorted(unselected_image_directories):
+            shutil.rmtree(image_root / directory_name)
     return summary
 
 
