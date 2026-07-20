@@ -10,14 +10,20 @@ import re
 import sys
 import time
 import traceback
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
 from .actions import compact_action_summary
-from .evidence import build_evidence
+from .evidence import EvidencePacket, build_evidence, initialize_evidence_worker
 from .io_utils import (
     append_jsonl,
     atomic_write_jsonl,
@@ -738,23 +744,58 @@ def call_repair(
     )
 
 
+def runtime_failure_candidate(
+    row: Mapping[str, Any],
+    *,
+    args: argparse.Namespace,
+    error: Exception,
+    started_at: float,
+    traceback_text: str,
+) -> Dict[str, Any]:
+    """Build the retryable record shared by preprocessing and API failures."""
+
+    return {
+        "episode_id": row.get("episode_id"),
+        "trajectory_id": row.get("trajectory_id"),
+        "status": "failed",
+        "terminal_failure": False,
+        "failure_kind": "runtime_error",
+        "mode": args.mode,
+        "source_text_blind": args.mode == "generate",
+        "old_instruction": "",
+        "instruction_profile": args.instruction_profile,
+        "completed_at_unix": time.time(),
+        "actions": row.get("actions"),
+        "instruction": "",
+        "error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback_text,
+        },
+        "elapsed_seconds": round(time.time() - started_at, 3),
+    }
+
+
 def generate_one(
     row: Dict[str, Any],
     *,
     args: argparse.Namespace,
+    evidence: Optional[EvidencePacket] = None,
+    started_at: Optional[float] = None,
 ) -> Dict[str, Any]:
-    client = QwenClient(
-        base_url=args.base_url,
-        model=args.model,
-        api_key=args.api_key,
-        timeout=args.request_timeout,
-        retries=args.retries,
-        disable_thinking=args.disable_thinking,
-    )
-    started = time.time()
+    started = time.time() if started_at is None else started_at
     raw_responses: Dict[str, str] = {}
     try:
-        evidence = build_evidence(row, args)
+        if evidence is None:
+            evidence = build_evidence(row, args)
+        client = QwenClient(
+            base_url=args.base_url,
+            model=args.model,
+            api_key=args.api_key,
+            timeout=args.request_timeout,
+            retries=args.retries,
+            disable_thinking=args.disable_thinking,
+        )
         actions = [int(action) for action in row["actions"]]
         action_summary = compact_action_summary(actions, len(evidence.frame_paths))
         trajectory_metadata = row_trajectory_metadata(row)
@@ -1153,26 +1194,13 @@ def generate_one(
             }
         return candidate
     except Exception as error:  # noqa: BLE001 - record per-episode failure
-        return {
-            "episode_id": row.get("episode_id"),
-            "trajectory_id": row.get("trajectory_id"),
-            "status": "failed",
-            "terminal_failure": False,
-            "failure_kind": "runtime_error",
-            "mode": args.mode,
-            "source_text_blind": args.mode == "generate",
-            "old_instruction": "",
-            "instruction_profile": args.instruction_profile,
-            "completed_at_unix": time.time(),
-            "actions": row.get("actions"),
-            "instruction": "",
-            "error": {
-                "type": type(error).__name__,
-                "message": str(error),
-                "traceback": traceback.format_exc(),
-            },
-            "elapsed_seconds": round(time.time() - started, 3),
-        }
+        return runtime_failure_candidate(
+            row,
+            args=args,
+            error=error,
+            started_at=started,
+            traceback_text=traceback.format_exc(),
+        )
 
 
 def write_gallery(rows: Sequence[Dict[str, Any]], candidates: Mapping[str, Dict[str, Any]], path: str) -> None:
@@ -1266,56 +1294,155 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         desc=f"instruction {args.instruction_profile}",
         unit="ep",
     )
-    executor = ThreadPoolExecutor(max_workers=worker_count)
-    futures: Dict[Future[Dict[str, Any]], Tuple[int, Dict[str, Any]]] = {}
-    pending_iter = iter(pending)
+    evidence_worker_count = max(0, int(getattr(args, "evidence_workers", 0)))
 
-    def submit_next() -> bool:
-        try:
-            index, row = next(pending_iter)
-        except StopIteration:
-            return False
-        future = executor.submit(
-            generate_one,
-            row,
-            args=args,
-        )
-        futures[future] = (index, row)
-        return True
+    def record_candidate(
+        index: int,
+        row: Mapping[str, Any],
+        candidate: Dict[str, Any],
+    ) -> None:
+        rank = index % worker_count
+        append_jsonl(candidate_files[rank], candidate)
+        if candidate.get("status") != "success":
+            append_jsonl(failed_files[rank], candidate)
+        if candidate_is_complete(
+            candidate,
+            profile=args.instruction_profile,
+        ):
+            current_candidates[episode_key(row)] = candidate
+        elif args.drop_failed and candidate_is_terminal_failure(
+            candidate,
+            profile=args.instruction_profile,
+        ):
+            terminal_candidates[episode_key(row)] = candidate
+        progress.update(1)
 
     try:
-        for _ in range(worker_count):
-            if not submit_next():
-                break
-        while futures:
-            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in completed:
-                index, row = futures[future]
-                del futures[future]
-                candidate = future.result()
-                rank = index % worker_count
-                append_jsonl(candidate_files[rank], candidate)
-                if candidate.get("status") != "success":
-                    append_jsonl(failed_files[rank], candidate)
-                if candidate_is_complete(
-                    candidate,
-                    profile=args.instruction_profile,
+        if evidence_worker_count <= 0:
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+            futures: Dict[Future[Dict[str, Any]], Tuple[int, Dict[str, Any]]] = {}
+            pending_iter = iter(pending)
+
+            def submit_next() -> bool:
+                try:
+                    index, row = next(pending_iter)
+                except StopIteration:
+                    return False
+                future = executor.submit(generate_one, row, args=args)
+                futures[future] = (index, row)
+                return True
+
+            try:
+                for _ in range(worker_count):
+                    if not submit_next():
+                        break
+                while futures:
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        index, row = futures.pop(future)
+                        record_candidate(index, row, future.result())
+                        submit_next()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
+        else:
+            print(
+                f"[instruction] evidence preprocessing uses "
+                f"{evidence_worker_count} processes; API generation uses "
+                f"{worker_count} threads"
+            )
+            evidence_executor = ProcessPoolExecutor(
+                max_workers=evidence_worker_count,
+                initializer=initialize_evidence_worker,
+            )
+            api_executor = ThreadPoolExecutor(max_workers=worker_count)
+            preprocessing: Dict[
+                Future[EvidencePacket], Tuple[int, Dict[str, Any], float]
+            ] = {}
+            generating: Dict[
+                Future[Dict[str, Any]], Tuple[int, Dict[str, Any]]
+            ] = {}
+            ready: List[Tuple[int, Dict[str, Any], float, EvidencePacket]] = []
+            pending_iter = iter(pending)
+            pending_exhausted = False
+            prefetch_limit = max(
+                evidence_worker_count,
+                min(worker_count, evidence_worker_count * 2),
+            )
+
+            def fill_preprocessing() -> None:
+                nonlocal pending_exhausted
+                while (
+                    not pending_exhausted
+                    and len(preprocessing) + len(ready) < prefetch_limit
                 ):
-                    current_candidates[episode_key(row)] = candidate
-                elif args.drop_failed and candidate_is_terminal_failure(
-                    candidate,
-                    profile=args.instruction_profile,
-                ):
-                    terminal_candidates[episode_key(row)] = candidate
-                progress.update(1)
-                submit_next()
-    except BaseException:
-        for future in futures:
-            future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
-    else:
-        executor.shutdown(wait=True)
+                    try:
+                        index, row = next(pending_iter)
+                    except StopIteration:
+                        pending_exhausted = True
+                        break
+                    started_at = time.time()
+                    future = evidence_executor.submit(build_evidence, row, args)
+                    preprocessing[future] = (index, row, started_at)
+
+            def fill_api_generation() -> None:
+                while ready and len(generating) < worker_count:
+                    index, row, started_at, evidence = ready.pop(0)
+                    future = api_executor.submit(
+                        generate_one,
+                        row,
+                        args=args,
+                        evidence=evidence,
+                        started_at=started_at,
+                    )
+                    generating[future] = (index, row)
+
+            try:
+                fill_preprocessing()
+                while preprocessing or generating or ready or not pending_exhausted:
+                    fill_api_generation()
+                    fill_preprocessing()
+                    active_futures = [*preprocessing, *generating]
+                    if not active_futures:
+                        break
+                    completed, _ = wait(
+                        active_futures,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed:
+                        if future in preprocessing:
+                            index, row, started_at = preprocessing.pop(future)
+                            try:
+                                evidence = future.result()
+                            except Exception as error:  # noqa: BLE001
+                                candidate = runtime_failure_candidate(
+                                    row,
+                                    args=args,
+                                    error=error,
+                                    started_at=started_at,
+                                    traceback_text="".join(
+                                        traceback.format_exception(error)
+                                    ),
+                                )
+                                record_candidate(index, row, candidate)
+                            else:
+                                ready.append((index, row, started_at, evidence))
+                        else:
+                            index, row = generating.pop(future)
+                            record_candidate(index, row, future.result())
+            except BaseException:
+                for future in [*preprocessing, *generating]:
+                    future.cancel()
+                evidence_executor.shutdown(wait=False, cancel_futures=True)
+                api_executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                evidence_executor.shutdown(wait=True)
+                api_executor.shutdown(wait=True)
     finally:
         progress.close()
 

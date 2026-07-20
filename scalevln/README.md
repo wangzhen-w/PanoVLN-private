@@ -106,6 +106,9 @@ forward/side-view 是否串列、前方景物是在 FINAL 相机处还是仍位�
 ScaleVLN 保存的全景已经以 agent 当前朝向为中心，正式脚本不传
 `--use-action-heading`。不要在默认 rewrite 中根据 actions 再做 heading re-rotation，
 否则 FINAL FORWARD 会被转到侧面视图，终点 anchor 会系统性漂移。
+脚本中 `NUM_WORKERS` 控制 Qwen/agent 并发，`EVIDENCE_WORKERS` 控制独立 CPU
+视觉预处理进程。同一 episode 内重叠的 route、segment、endpoint 和 FINAL 视图会复用
+完全相同的解码/投影结果，不改变 VLM 看到的像素、prompt 或 agent 顺序。
 
 正式脚本还会为每条路线生成两个候选 instruction，再由独立 visual candidate judge
 直接读取原始视觉、actions 和几何约束，选择更忠实、可执行、终点更准的一版。judge

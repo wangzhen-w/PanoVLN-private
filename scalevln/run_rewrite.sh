@@ -15,7 +15,8 @@ BASE_URL="http://127.0.0.1:10420/v1"
 MODEL="Qwen3.6-35B-A3B"
 API_KEY="test"
 
-NUM_WORKERS=40
+NUM_WORKERS=96  # 同时进入多 agent/Qwen 阶段的 episode 数。
+EVIDENCE_WORKERS=8  # 视觉 evidence 独立 CPU 进程数，与 Qwen API 并发分开。
 MAX_WAYPOINTS=12
 ROUTE_EVIDENCE_MODE="auto"  # 长路线或多平移、多转向路线自动拆成局部视觉段。
 SEGMENTED_MIN_ACTIONS=80  # 达到该长度必分段；复杂短路线也会由 auto 模式识别。
@@ -59,6 +60,7 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --model "${MODEL}" \
   --api-key "${API_KEY}" \
   --num-workers "${NUM_WORKERS}" \
+  --evidence-workers "${EVIDENCE_WORKERS}" \
   --max-waypoints "${MAX_WAYPOINTS}" \
   --route-evidence-mode "${ROUTE_EVIDENCE_MODE}" \
   --segmented-min-actions "${SEGMENTED_MIN_ACTIONS}" \

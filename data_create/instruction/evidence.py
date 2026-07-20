@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -20,6 +21,14 @@ from .actions import (
     select_route_frames,
     select_start_frames,
 )
+
+
+def initialize_evidence_worker() -> None:
+    """Keep each preprocessing process single-threaded and avoid oversubscription."""
+
+    cv2.setNumThreads(1)
+
+
 @dataclass(frozen=True)
 class SegmentEvidence:
     segment_id: int
@@ -90,17 +99,18 @@ def sorted_frame_paths(image_root: str, row: Mapping[str, Any]) -> Tuple[str, Li
     )
 
 
-def equirect_to_perspective(
-    image: Image.Image,
-    *,
+@lru_cache(maxsize=256)
+def perspective_maps(
+    source_width: int,
+    source_height: int,
     yaw_degrees: float,
-    pitch_degrees: float = 0.0,
-    hfov_degrees: float = 90.0,
+    pitch_degrees: float,
+    hfov_degrees: float,
     width: int,
     height: int,
-) -> Image.Image:
-    source = np.asarray(image.convert("RGB"))
-    source_h, source_w = source.shape[:2]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build reusable equirectangular remap grids for one camera view."""
+
     x = np.linspace(-1.0, 1.0, width, dtype=np.float32)
     y = np.linspace(-height / width, height / width, height, dtype=np.float32)
     grid_x, grid_y = np.meshgrid(x, -y)
@@ -127,16 +137,113 @@ def equirect_to_perspective(
 
     lon = np.arctan2(x_world, z_world)
     lat = np.arcsin(np.clip(y_world, -1.0, 1.0))
-    map_x = ((lon / (2.0 * np.pi)) + 0.5) * source_w
-    map_y = (0.5 - lat / np.pi) * source_h
+    map_x = np.asarray(
+        ((lon / (2.0 * np.pi)) + 0.5) * source_width,
+        dtype=np.float32,
+    )
+    map_y = np.asarray(
+        (0.5 - lat / np.pi) * source_height,
+        dtype=np.float32,
+    )
+    map_x.setflags(write=False)
+    map_y.setflags(write=False)
+    return map_x, map_y
+
+
+def equirect_to_perspective(
+    image: Image.Image | np.ndarray,
+    *,
+    yaw_degrees: float,
+    pitch_degrees: float = 0.0,
+    hfov_degrees: float = 90.0,
+    width: int,
+    height: int,
+) -> Image.Image:
+    if isinstance(image, Image.Image):
+        source = np.asarray(image.convert("RGB"))
+    else:
+        source = np.asarray(image, dtype=np.uint8)
+    source_h, source_w = source.shape[:2]
+    map_x, map_y = perspective_maps(
+        source_w,
+        source_h,
+        float(yaw_degrees),
+        float(pitch_degrees),
+        float(hfov_degrees),
+        int(width),
+        int(height),
+    )
     projected = cv2.remap(
         source,
-        map_x.astype(np.float32),
-        map_y.astype(np.float32),
+        map_x,
+        map_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_WRAP,
     )
     return Image.fromarray(projected, mode="RGB")
+
+
+class EpisodeViewCache:
+    """Decode and project every frame/view combination at most once per episode."""
+
+    def __init__(
+        self,
+        frame_paths: Sequence[Path],
+        heading_by_frame: Sequence[float],
+        *,
+        tile_width: int,
+        tile_height: int,
+    ) -> None:
+        self.frame_paths = frame_paths
+        self.heading_by_frame = heading_by_frame
+        self.tile_width = int(tile_width)
+        self.tile_height = int(tile_height)
+        self._panoramas: Dict[int, np.ndarray] = {}
+        self._views: Dict[Tuple[int, float, float], Image.Image] = {}
+
+    def panorama(self, frame_index: int) -> np.ndarray:
+        panorama = self._panoramas.get(frame_index)
+        if panorama is None:
+            with Image.open(self.frame_paths[frame_index]) as image:
+                panorama = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+            self._panoramas[frame_index] = panorama
+        return panorama
+
+    def view(
+        self,
+        frame_index: int,
+        *,
+        yaw_offset: float,
+        pitch: float,
+    ) -> Image.Image:
+        heading = self.heading_by_frame[
+            min(frame_index, len(self.heading_by_frame) - 1)
+        ]
+        yaw = float(heading + yaw_offset)
+        key = (int(frame_index), yaw, float(pitch))
+        view = self._views.get(key)
+        if view is None:
+            view = equirect_to_perspective(
+                self.panorama(frame_index),
+                yaw_degrees=yaw,
+                pitch_degrees=pitch,
+                width=self.tile_width,
+                height=self.tile_height,
+            )
+            self._views[key] = view
+        return view
+
+
+def encode_jpeg(image: Image.Image, jpeg_quality: int) -> bytes:
+    """Encode without an expensive Huffman optimization pass.
+
+    The optimization flag only changes JPEG entropy coding and file size; it
+    does not change the decoded pixels seen by the VLM.
+    """
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=jpeg_quality, optimize=False)
+    return buffer.getvalue()
 
 
 def draw_label(tile: Image.Image, label: str, label_height: int = 24) -> Image.Image:
@@ -158,24 +265,34 @@ def render_view_sheet(
     tile_height: int,
     jpeg_quality: int,
     final_label: bool,
+    view_cache: Optional[EpisodeViewCache] = None,
 ) -> bytes:
     rows: List[Image.Image] = []
     gap = 4
     final_frame = frames[-1] if frames else -1
     for frame_index in frames:
-        with Image.open(frame_paths[frame_index]) as panorama:
-            heading = heading_by_frame[min(frame_index, len(heading_by_frame) - 1)]
-            tiles = []
-            for label, yaw_offset, pitch in columns:
-                view = equirect_to_perspective(
-                    panorama,
-                    yaw_degrees=heading + yaw_offset,
-                    pitch_degrees=pitch,
-                    width=tile_width,
-                    height=tile_height,
+        tiles = []
+        for label, yaw_offset, pitch in columns:
+            if view_cache is None:
+                with Image.open(frame_paths[frame_index]) as panorama:
+                    heading = heading_by_frame[
+                        min(frame_index, len(heading_by_frame) - 1)
+                    ]
+                    view = equirect_to_perspective(
+                        panorama,
+                        yaw_degrees=heading + yaw_offset,
+                        pitch_degrees=pitch,
+                        width=tile_width,
+                        height=tile_height,
+                    )
+            else:
+                view = view_cache.view(
+                    frame_index,
+                    yaw_offset=yaw_offset,
+                    pitch=pitch,
                 )
-                prefix = "FINAL" if final_label and frame_index == final_frame else "step"
-                tiles.append(draw_label(view, f"{prefix} {frame_index} - {label}"))
+            prefix = "FINAL" if final_label and frame_index == final_frame else "step"
+            tiles.append(draw_label(view, f"{prefix} {frame_index} - {label}"))
         row_width = sum(tile.width for tile in tiles) + gap * (len(tiles) - 1)
         row_height = max(tile.height for tile in tiles)
         row = Image.new("RGB", (row_width, row_height), (255, 255, 255))
@@ -191,9 +308,7 @@ def render_view_sheet(
     for row in rows:
         sheet.paste(row, (0, y))
         y += row.height + gap
-    buffer = io.BytesIO()
-    sheet.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
-    return buffer.getvalue()
+    return encode_jpeg(sheet, jpeg_quality)
 
 
 def render_single_view(
@@ -207,20 +322,26 @@ def render_single_view(
     tile_width: int,
     tile_height: int,
     jpeg_quality: int,
+    view_cache: Optional[EpisodeViewCache] = None,
 ) -> bytes:
-    with Image.open(frame_paths[frame_index]) as panorama:
-        heading = heading_by_frame[min(frame_index, len(heading_by_frame) - 1)]
-        view = equirect_to_perspective(
-            panorama,
-            yaw_degrees=heading + yaw_offset,
-            pitch_degrees=pitch,
-            width=tile_width,
-            height=tile_height,
+    if view_cache is None:
+        with Image.open(frame_paths[frame_index]) as panorama:
+            heading = heading_by_frame[min(frame_index, len(heading_by_frame) - 1)]
+            view = equirect_to_perspective(
+                panorama,
+                yaw_degrees=heading + yaw_offset,
+                pitch_degrees=pitch,
+                width=tile_width,
+                height=tile_height,
+            )
+    else:
+        view = view_cache.view(
+            frame_index,
+            yaw_offset=yaw_offset,
+            pitch=pitch,
         )
     tile = draw_label(view, label, label_height=32)
-    buffer = io.BytesIO()
-    tile.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
-    return buffer.getvalue()
+    return encode_jpeg(tile, jpeg_quality)
 
 
 def split_frame_segments(
@@ -300,6 +421,12 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
         headings = build_heading_by_frame(actions, len(frame_paths))
     else:
         headings = [0.0 for _ in frame_paths]
+    view_cache = EpisodeViewCache(
+        frame_paths,
+        headings,
+        tile_width=args.tile_width,
+        tile_height=args.tile_height,
+    )
     route_columns = [("left", -90.0, 0.0), ("forward", 0.0, 0.0), ("right", 90.0, 0.0), ("back", 180.0, 0.0)]
     endpoint_columns = route_columns + [("forward-down", 0.0, 25.0)]
     final_columns = [
@@ -337,6 +464,7 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
                 tile_height=args.tile_height,
                 jpeg_quality=args.jpeg_quality,
                 final_label=False,
+                view_cache=view_cache,
             )
             segment_sheets.append(
                 SegmentEvidence(
@@ -358,6 +486,7 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
         tile_height=args.tile_height,
         jpeg_quality=args.jpeg_quality,
         final_label=True,
+        view_cache=view_cache,
     )
     start_sheet = render_view_sheet(
         frame_paths,
@@ -368,6 +497,7 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
         tile_height=args.tile_height,
         jpeg_quality=args.jpeg_quality,
         final_label=False,
+        view_cache=view_cache,
     )
     endpoint_sheet = render_view_sheet(
         frame_paths,
@@ -378,6 +508,7 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
         tile_height=args.tile_height,
         jpeg_quality=args.jpeg_quality,
         final_label=True,
+        view_cache=view_cache,
     )
     final_sheet = render_view_sheet(
         frame_paths,
@@ -388,6 +519,7 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
         tile_height=args.tile_height,
         jpeg_quality=args.jpeg_quality,
         final_label=True,
+        view_cache=view_cache,
     )
     final_frame = len(frame_paths) - 1
     final_view_tiles = [
@@ -403,6 +535,7 @@ def build_evidence(row: Mapping[str, Any], args: Any) -> EvidencePacket:
                 tile_width=args.tile_width,
                 tile_height=args.tile_height,
                 jpeg_quality=args.jpeg_quality,
+                view_cache=view_cache,
             ),
         )
         for label, yaw_offset, pitch in final_columns

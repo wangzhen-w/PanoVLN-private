@@ -119,20 +119,24 @@ SEGMENTED_MIN_ACTIONS=80
 SEGMENT_MAX_WAYPOINTS=0
 SEGMENT_ROWS=5
 SEGMENT_OVERLAP=1
-SEGMENT_FACT_MAX_TOKENS=360
+SEGMENT_FACT_MAX_TOKENS=650
 
 BASE_URL="http://127.0.0.1:10420/v1"
 MODEL="Qwen3.6-35B-A3B"
 API_KEY="test"
-NUM_WORKERS=40
+NUM_WORKERS=96
+EVIDENCE_WORKERS=8
 STAGE="full"
 ```
 
 `GPU_DEVICE_IDS` 是逗号分隔的 Habitat GPU 列表，例如 `"0,1,2,3"`。
 collect、GT 与 render 的实际进程上限分别是 GPU 数乘以对应的
-`*_PROCESSES_PER_GPU`。当前 8 卡配置会各启动最多 16 个进程；若需与其他任务共享
+`*_PROCESSES_PER_GPU`。当前 8 卡配置分别启动最多 16、16、40 个进程；若需与其他任务共享
 GPU，直接缩短列表或降低相应阶段的每卡进程数。
-`NUM_WORKERS` 仅表示 instruction API 的并发请求数，与 Habitat 进程数无关。
+`NUM_WORKERS` 表示同时进入多 agent/Qwen 阶段的 episode 数；
+`EVIDENCE_WORKERS` 是独立 CPU 进程数，负责全景图解码、透视投影和 evidence sheet 编码。
+两者与 Habitat 进程数无关。evidence 阶段使用有界预取队列，不会把全部 episode
+一次性读入内存。
 GT 阶段关闭 RGB observations，因此通常主要受 Habitat 路径规划和 CPU 吞吐限制。
 
 `SCENE_ROOT` 是唯一的场景根目录，内部应具有下面的 split-aware 结构：
@@ -241,8 +245,9 @@ input 和 progress journal，不检查 trajectory、GT，也不为输入或图�
 每条 `status=success` 的 journal 记录直接按 `episode_id` 视为完成。因此在任一阶段中断后
 可以直接重新运行正式脚本，从最近一个
 未完成阶段继续。显式选择单独的 `gt`、`images`、`instruction` 等 `STAGE` 仍会执行该
-阶段，便于需要时主动重建。instruction 调度器只保留一个并发窗口，不会把全部 episode
-预先塞入线程池；中断时会取消尚未开始的请求，已经完成的结果仍保留在 journal 中。
+阶段，便于需要时主动重建。instruction 调度器将 CPU evidence 进程池与 API 线程池分开，
+只保留一个有界预取窗口，不会把全部 episode 预先塞入 executor；
+中断时会取消尚未开始的任务，已经完成的结果仍保留在 journal 中。
 恢复时进度条从 journal 中累计成功数开始显示。如果主动更换了 prompt、视觉证据或
 agent 工作流并希望全部重写，应使用新的 `INSTRUCTION_WORK_DIR`，或先删除旧版本的
 progress 目录；同一个 work dir 的语义就是继续同一批生成任务。
@@ -394,6 +399,9 @@ deterministic QA 只负责格式、数据泄漏、
 空输出、内部数据痕迹和 simulator/GT 提供的通用物理约束。词数、句数、固定词、颜色材质、
 朝向短语和 landmark 词表不作为发布硬门。模型派生 facts 与 instruction 的
 不一致只记为诊断 warning，最终语义发布门由独立视觉 audit 决定。
+视觉 evidence 构建会在单个 episode 内复用已解码全景、透视投影和固定相机映射；
+route、segment、endpoint 和 FINAL tiles 中的重叠视图不重复计算。这些是像素等价的性能优化，
+不改变 VLM 实际解码到的图像、prompt 或 agent 调用顺序。
 最终 clean JSONL 只保留 `episode_id`、`instruction`、`actions`、
 `instruction_profile` 和可选 `trajectory_id`；contact sheet、raw response、
 repair/audit 结果只在 work dir 中用于恢复

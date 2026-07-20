@@ -31,6 +31,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-thinking", type=str2bool, default=True)
 
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument(
+        "--evidence-workers",
+        type=int,
+        default=0,
+        help=(
+            "CPU processes that prebuild visual evidence before API generation. "
+            "0 keeps the legacy all-in-one thread execution."
+        ),
+    )
     parser.add_argument("--resume", type=str2bool, default=True)
     parser.add_argument("--max-episodes", type=int, default=0)
     parser.add_argument("--episode-ids", default=None)

@@ -45,7 +45,8 @@ CANDIDATE_TEMPERATURE=0.4  # language-realization 温度；grounding 与 review 
 BASE_URL="http://127.0.0.1:10420/v1"  # OpenAI-compatible Qwen API pool 地址。
 MODEL="Qwen3.6-35B-A3B"  # 服务中实际加载的模型名称。
 API_KEY="test"  # 本地兼容接口的占位 key；按服务要求修改。
-NUM_WORKERS=40  # instruction 并发轨迹数；不要超过 Qwen API pool 的 MAX_CONCURRENCY。
+NUM_WORKERS=96  # 同时进入多 agent/Qwen 阶段的 episode 数。
+EVIDENCE_WORKERS=8  # 独立 CPU 进程数，用于解码全景图、透视投影和制作 evidence sheet。
 
 # 避免系统 HTTP 代理截获本机 Qwen API 请求。
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
@@ -169,7 +170,7 @@ generate_instruction() {
     --work-dir "${INSTRUCTION_WORK_DIR}" \
     --mode generate --instruction-profile dense \
     --provider qwen --base-url "${BASE_URL}" --model "${MODEL}" --api-key "${API_KEY}" \
-    --num-workers "${NUM_WORKERS}" --max-waypoints 18 \
+    --num-workers "${NUM_WORKERS}" --evidence-workers "${EVIDENCE_WORKERS}" --max-waypoints 18 \
     --route-evidence-mode "${ROUTE_EVIDENCE_MODE}" \
     --segmented-min-actions "${SEGMENTED_MIN_ACTIONS}" \
     --segment-max-waypoints "${SEGMENT_MAX_WAYPOINTS}" \
