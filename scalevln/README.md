@@ -136,11 +136,22 @@ ScaleVLN trajectory/actions + panoramas
   -> shared source-text-blind evidence / FINAL endpoint facts / segmented-facts generation
   -> endpoint-assisted multi-candidate writing / raw-evidence visual judge / blind audit
   -> 已穷尽修复与复审仍未通过的 episode 终止丢弃
-  -> 原子发布 REWRITE_OUTPUT
+  -> 原子发布 REWRITE_OUTPUT、去重 generation records 和 summary
 ```
 
-`REWRITE_OUTPUT` 是唯一正式 rewrite，不生成 candidate、original-baseline 副本或
-pair manifest。脚本使用 `--drop-failed true --allow-incomplete false`：质量门已穷尽的
+每次 rewrite 保留三个同名前缀的正式产物：
+
+```text
+<REWRITE_OUTPUT>
+<REWRITE_OUTPUT 去掉 .jsonl>.instruction_records.jsonl.gz
+<REWRITE_OUTPUT 去掉 .jsonl>.instruction_summary.json
+```
+
+第一项是唯一训练用 rewrite，不生成 original-baseline 副本或 pair manifest。压缩的
+generation records 按 episode 去重后保留视觉 facts、route plan、候选、选择、repair、
+audit、最终 instruction 或终止失败原因，供后续质量筛选；summary 保存整批完成和丢弃
+统计。临时 `candidates_rank*.jsonl` 在这两个审计文件原子发布后清理。
+脚本使用 `--drop-failed true --allow-incomplete false`：质量门已穷尽的
 episode 记为终止失败，续跑时不再调用模型，也不进入正式 rewrite；API 超时、
 服务不可用或文件读取异常等运行时失败仍保留 progress 供续跑，并在完成前拒绝发布。
 

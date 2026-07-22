@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import glob
 import json
 import math
@@ -84,6 +85,8 @@ def read_jsonl(path: str, *, mode: str) -> List[Dict[str, Any]]:
 
 
 def atomic_write_jsonl(path: str, rows: Iterable[Mapping[str, Any]]) -> int:
+    """Atomically write JSONL, using gzip when ``path`` ends in ``.gz``."""
+
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent)
@@ -91,14 +94,44 @@ def atomic_write_jsonl(path: str, rows: Iterable[Mapping[str, Any]]) -> int:
     count = 0
     tmp = Path(tmp_name)
     try:
-        with tmp.open("w", encoding="utf-8") as handle:
+        if output.name.endswith(".gz"):
+            handle_context = gzip.open(
+                tmp, "wt", encoding="utf-8", compresslevel=3
+            )
+        else:
+            handle_context = tmp.open("w", encoding="utf-8")
+        with handle_context as handle:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                 count += 1
             handle.flush()
+        # gzip writes its footer only when the stream closes, so fsync the
+        # completed temporary file before making it visible at the final path.
+        with tmp.open("rb") as handle:
             os.fsync(handle.fileno())
         os.replace(tmp, output)
         return count
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
+    """Atomically publish a JSON object."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, allow_nan=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, output)
     finally:
         tmp.unlink(missing_ok=True)
 

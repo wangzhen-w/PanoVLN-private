@@ -26,6 +26,7 @@ from .actions import compact_action_summary
 from .evidence import EvidencePacket, build_evidence, initialize_evidence_worker
 from .io_utils import (
     append_jsonl,
+    atomic_write_json,
     atomic_write_jsonl,
     candidate_is_complete,
     candidate_is_terminal_failure,
@@ -1245,6 +1246,56 @@ def write_gallery(rows: Sequence[Dict[str, Any]], candidates: Mapping[str, Dict[
     output.write_text("\n".join(parts), encoding="utf-8")
 
 
+def publish_run_records_and_summary(
+    *,
+    rows: Sequence[Mapping[str, Any]],
+    latest_candidates: Mapping[str, Dict[str, Any]],
+    work_dir: Path,
+    summary: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    """Publish one latest structured generation record per selected episode.
+
+    Rank journals are append-only resume state and may contain multiple attempts
+    for an episode. ``existing_candidates`` applies the same timestamp-aware
+    conflict resolution used by resume, so the persistent audit never exposes a
+    stale failure after a later successful retry.
+    """
+
+    selected_keys = [episode_key(row) for row in rows]
+    records = [
+        latest_candidates[key] for key in selected_keys if key in latest_candidates
+    ]
+    status_counts: Dict[str, int] = {}
+    for record in records:
+        status = str(record.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    published = dict(summary)
+    records_output = getattr(args, "records_output_jsonl", None)
+    summary_output = getattr(args, "summary_output_json", None)
+    if records_output:
+        published["instruction_records_jsonl"] = str(records_output)
+        published["instruction_record_rows"] = atomic_write_jsonl(
+            str(records_output), records
+        )
+    else:
+        published["instruction_records_jsonl"] = None
+        published["instruction_record_rows"] = len(records)
+    published["instruction_record_status_counts"] = status_counts
+    published["ignored_stale_journal_rows"] = len(
+        set(latest_candidates) - set(selected_keys)
+    )
+    published["summary_json"] = str(summary_output) if summary_output else None
+
+    # Keep the resumable copy until its work directory is deliberately cleaned,
+    # and optionally publish a durable copy outside that directory.
+    atomic_write_json(work_dir / "summary.json", published)
+    if summary_output:
+        atomic_write_json(summary_output, published)
+    return published
+
+
 def run(args: argparse.Namespace) -> Dict[str, Any]:
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1303,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         args.save_contact_sheets = True
     rows = select_rows(read_jsonl(args.input_jsonl, mode=args.mode), args)
     old_candidates = existing_candidates(work_dir) if args.resume else {}
+    latest_candidates = old_candidates
     pending: List[Tuple[int, Dict[str, Any]]] = []
     current_candidates: Dict[str, Dict[str, Any]] = {}
     terminal_candidates: Dict[str, Dict[str, Any]] = {}
@@ -1305,6 +1357,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         append_jsonl(candidate_files[rank], candidate)
         if candidate.get("status") != "success":
             append_jsonl(failed_files[rank], candidate)
+        latest_candidates[episode_key(row)] = candidate
         if candidate_is_complete(
             candidate,
             profile=args.instruction_profile,
@@ -1478,7 +1531,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "output_partial": partial if clean_rows else None,
             "source_text_blind": args.mode == "generate",
         }
-        (work_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        publish_run_records_and_summary(
+            rows=rows,
+            latest_candidates=latest_candidates,
+            work_dir=work_dir,
+            summary=summary,
+            args=args,
+        )
         if args.write_gallery:
             write_gallery(rows, current_candidates, args.gallery_path or str(work_dir / "gallery.html"))
         raise RuntimeError(f"Instruction generation incomplete: {len(missing)} missing/failed rows")
@@ -1504,7 +1563,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "ignored_source_text_count": sum(1 for row in rows if args.mode == "generate"),
         "source_instruction_visible_to_models": args.mode != "generate",
     }
-    (work_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary = publish_run_records_and_summary(
+        rows=rows,
+        latest_candidates=latest_candidates,
+        work_dir=work_dir,
+        summary=summary,
+        args=args,
+    )
     if args.write_gallery:
         write_gallery(rows, current_candidates, args.gallery_path or str(work_dir / "gallery.html"))
     return summary

@@ -13,7 +13,7 @@ HM3D basis.glb + basis.navmesh
   -> ShortestPathFollower expert actions
   -> 轨迹回放与 360°视觉证据采集
   -> 视觉证据抽取、长路线分段理解、结构化路线计划、写作、独立审核和修复
-  -> R2R VLN-CE train.json + train.json.gz + train_gt.json.gz
+  -> R2R VLN-CE dataset/GT + panorama images + instruction generation audit
 ```
 
 ## 目录
@@ -172,7 +172,7 @@ bash data_create/run_data_creation.sh
 - `images`：回放 expert actions 并采集全景视觉证据；
 - `instruction`：为每条 trajectory 生成一条经过候选筛选和审核的 Dense instruction；
 - `export`：发布 `train.json`、同内容的 `train.json.gz` 以及
-  `train_gt.json.gz`，随后清理中间文件；
+  `train_gt.json.gz`；确认 instruction 审计产物存在后清理中间文件；
 - `full`：依次完成全部阶段。
 
 ## 场景覆盖与 trajectory 分配
@@ -240,7 +240,9 @@ episode，并继续显示一个聚合的 `panorama` 进度条；同一个 scene 
 恢复时可以按当时的空闲显存调整并行度。
 在 `full` 阶段中，每个原子发布的阶段产物都会直接作为完成标记：已有 trajectory 时
 跳过采样，同时已有 GT 与 agent input 时跳过 GT 生成和校验，已有正式 `images/` 时跳过
-渲染，已有最终 instruction JSONL 时跳过 instruction。instruction 中断时只读取 agent
+渲染，同时已有最终 instruction JSONL、generation records 和 summary 时跳过 instruction。
+如果 instruction JSONL 已完成但两个审计产物缺失，系统会从 progress journal 快速重建，
+不会重新调用 Qwen。instruction 中断时只读取 agent
 input 和 progress journal，不检查 trajectory、GT，也不为输入或图片计算 fingerprint。
 每条 `status=success` 的 journal 记录直接按 `episode_id` 视为完成。因此在任一阶段中断后
 可以直接重新运行正式脚本，从最近一个
@@ -267,17 +269,27 @@ trajectory 和 sampler 状态事务性地
 
 ## 输出
 
-成功完成 `export` 后，公开产物只有：
+成功完成 `export` 后，正式产物为：
 
 ```text
 SAVE_ROOT/
 ├── images/<trajectory_id>/frame_*.jpg
+├── instruction_records.jsonl.gz
+├── instruction_summary.json
 ├── train.json
 ├── train.json.gz
 └── train_gt.json.gz
 ```
 
-原始 trajectory GT、agent input、instruction JSONL 和生成进度只存在于
+`instruction_records.jsonl.gz` 为每个输入 trajectory 保留最新一次结构化 agent 记录，
+包含视觉 facts、route plan、候选 instruction、选择结果、质量检查、blind audit、最终
+instruction 或终止失败原因。它不是对 `candidates_rank*.jsonl` 的直接拼接：续跑产生
+多次尝试时，使用与恢复逻辑相同的 `completed_at_unix` 版本规则去重，并按输入 episode
+顺序只保留一条最新记录。`instruction_summary.json` 记录输入、成功、质量丢弃和意外缺失
+数量、最多 30 个异常 ID 预览、source-text-blind 状态以及 generation records 的数量和
+状态分布。这两个文件先原子发布，随后才允许清理 instruction progress。
+
+原始 trajectory GT、agent input、中间 instruction JSONL 和 rank journal 只存在于
 `SAVE_ROOT/.work/`。图片渲染中断时，已验证图片和 resume journal 暂存在
 `SAVE_ROOT/images.rendering/`；成功后该目录会原子发布为 `images/`，其中的状态文件
 会在发布前删除。全部检查通过并发布 dataset/GT 文件后，脚本自动删除
@@ -403,9 +415,9 @@ deterministic QA 只负责格式、数据泄漏、
 route、segment、endpoint 和 FINAL tiles 中的重叠视图不重复计算。这些是像素等价的性能优化，
 不改变 VLM 实际解码到的图像、prompt 或 agent 调用顺序。
 最终 clean JSONL 只保留 `episode_id`、`instruction`、`actions`、
-`instruction_profile` 和可选 `trajectory_id`；contact sheet、raw response、
-repair/audit 结果只在 work dir 中用于恢复
-和人工审查。
+`instruction_profile` 和可选 `trajectory_id`；逐 episode 的视觉 facts、候选、
+repair/audit 和诊断信息同时保存在正式 `instruction_records.jsonl.gz` 中，供后续质量筛选
+和人工审查。contact sheet 仅在显式启用相应选项时保存；默认也不保存完整 raw response。
 
 Qwen 客户端默认通过请求字段
 `chat_template_kwargs={"enable_thinking": false}` 显式关闭 thinking；prompt 中不再附加

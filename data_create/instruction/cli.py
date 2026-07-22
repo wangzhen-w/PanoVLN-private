@@ -17,6 +17,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--output-jsonl", required=True)
     parser.add_argument("--work-dir", required=True)
+    parser.add_argument(
+        "--records-output-jsonl",
+        default=None,
+        help=(
+            "Optional canonical per-episode generation record. Candidate journals "
+            "are deduplicated by episode and atomically published here; a .gz "
+            "suffix enables gzip compression."
+        ),
+    )
+    parser.add_argument(
+        "--summary-output-json",
+        default=None,
+        help="Optional persistent copy of the final run summary.",
+    )
     parser.add_argument("--mode", choices=("generate", "rewrite"), default="generate")
     parser.add_argument("--instruction-profile", choices=("concise", "dense"), default="concise")
 

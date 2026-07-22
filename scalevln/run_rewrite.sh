@@ -43,6 +43,8 @@ RETRIES=4
 STAGE_RETRIES=2
 
 WORK_DIR="${REWRITE_OUTPUT%.jsonl}_progress"
+INSTRUCTION_RECORDS_JSONL_GZ="${REWRITE_OUTPUT%.jsonl}.instruction_records.jsonl.gz"
+INSTRUCTION_SUMMARY_JSON="${REWRITE_OUTPUT%.jsonl}.instruction_summary.json"
 
 # 避免系统 HTTP 代理截获本机 Qwen API 请求。
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
@@ -53,6 +55,8 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
   --image-root "${IMAGE_ROOT}" \
   --output-jsonl "${REWRITE_OUTPUT}" \
   --work-dir "${WORK_DIR}" \
+  --records-output-jsonl "${INSTRUCTION_RECORDS_JSONL_GZ}" \
+  --summary-output-json "${INSTRUCTION_SUMMARY_JSON}" \
   --mode generate \
   --instruction-profile dense \
   --provider qwen \
@@ -101,3 +105,5 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost"
 
 rm -rf "${WORK_DIR}"
 echo "Rewrite: ${REWRITE_OUTPUT}"
+echo "Instruction records: ${INSTRUCTION_RECORDS_JSONL_GZ}"
+echo "Instruction summary: ${INSTRUCTION_SUMMARY_JSON}"

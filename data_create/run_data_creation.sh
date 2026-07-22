@@ -62,6 +62,8 @@ AGENT_INPUT_JSONL="${WORK_ROOT}/agent_input.jsonl"  # 中间 agent 输入，不�
 INSTRUCTION_ROOT="${WORK_ROOT}/instructions"  # 中间 instruction 结果和 agent 进度。
 INSTRUCTION_JSONL="${INSTRUCTION_ROOT}/dense.jsonl"  # 中间 Dense instruction 结果。
 INSTRUCTION_WORK_DIR="${INSTRUCTION_ROOT}/dense_progress"  # instruction 断点续跑目录。
+INSTRUCTION_RECORDS_JSONL_GZ="${SAVE_ROOT}/instruction_records.jsonl.gz"  # 正式产物：每条轨迹最新一次完整 agent 制作记录。
+INSTRUCTION_SUMMARY_JSON="${SAVE_ROOT}/instruction_summary.json"  # 正式产物：instruction 生成规模和完成状态摘要。
 FINAL_JSON="${SAVE_ROOT}/train.json"  # 正式产物：未压缩 VLN-CE dataset。
 FINAL_JSON_GZ="${SAVE_ROOT}/train.json.gz"  # 正式产物：同内容压缩 dataset。
 FINAL_GT_GZ="${SAVE_ROOT}/train_gt.json.gz"  # 正式产物：图片对应的 expert actions。
@@ -168,6 +170,8 @@ generate_instruction() {
     --image-root "${IMAGE_ROOT}" \
     --output-jsonl "${INSTRUCTION_JSONL}" \
     --work-dir "${INSTRUCTION_WORK_DIR}" \
+    --records-output-jsonl "${INSTRUCTION_RECORDS_JSONL_GZ}" \
+    --summary-output-json "${INSTRUCTION_SUMMARY_JSON}" \
     --mode generate --instruction-profile dense \
     --provider qwen --base-url "${BASE_URL}" --model "${MODEL}" --api-key "${API_KEY}" \
     --num-workers "${NUM_WORKERS}" --evidence-workers "${EVIDENCE_WORKERS}" --max-waypoints 18 \
@@ -189,15 +193,19 @@ generate_instruction() {
 }
 
 generate_instruction_if_needed() {
-  # dense.jsonl 原子发布；已穷尽修复的质量失败永久剔除，运行时失败由 journal 续跑。
-  if [[ -f "${INSTRUCTION_JSONL}" ]]; then
-    echo "[full] instruction JSONL already published; skipping ${INSTRUCTION_JSONL}"
+  # 三个文件均原子发布；缺少审计产物时会从已有 journal 快速重建，不重复调用 Qwen。
+  if [[ -f "${INSTRUCTION_JSONL}" && -f "${INSTRUCTION_RECORDS_JSONL_GZ}" && -f "${INSTRUCTION_SUMMARY_JSON}" ]]; then
+    echo "[full] instruction outputs already published; skipping generation"
     return
   fi
   generate_instruction
 }
 
 export_dataset() {
+  if [[ ! -f "${INSTRUCTION_JSONL}" || ! -f "${INSTRUCTION_RECORDS_JSONL_GZ}" || ! -f "${INSTRUCTION_SUMMARY_JSON}" ]]; then
+    echo "Instruction output or persistent audit artifacts are missing; run STAGE=instruction before export." >&2
+    return 1
+  fi
   python -m data_create.export_vlnce \
     --dataset "${TRAJECTORY_DATASET}" \
     --source-gt "${TRAJECTORY_GT}" \
