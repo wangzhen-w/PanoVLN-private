@@ -1,0 +1,51 @@
+# @package _global_
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/task: vln_r2r
+  - /habitat/simulator/agents@habitat.simulator.agents.main_agent: agent_base
+  - /habitat/simulator/sim_sensors@habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor: equirect_rgb_sensor
+  - /habitat/dataset: r2rvlnce_v1
+  - /habitat/task/lab_sensors:
+    - gps_sensor
+    - compass_sensor
+  - _self_
+
+habitat:
+  environment:
+    max_episode_steps: 500
+    iterator_options:
+      max_scene_repeat_steps: 50000
+      shuffle: false
+  simulator:
+    agents:
+      main_agent:
+        sim_sensors:
+          rgb_sensor:
+            width: 1600
+            height: 800
+    forward_step_size: 0.25
+    turn_angle: 15
+    habitat_sim_v0:
+      gpu_device_id: 0
+  task:
+    measurements:
+      path_length:
+        type: PathLength
+      distance_to_goal:
+        type: DistanceToGoal
+        distance_to: POINT
+      success:
+        type: Success
+        success_distance: 0.3
+      spl:
+        type: SPL
+      oracle_success:
+        type: OracleSuccess
+      oracle_navigation_error:
+        type: OracleNavigationError
+  dataset:
+    type: R2RVLNCE-v1
+    split: train
+    scenes_dir: /workspace/data2/dataset/general_VLN_data/HM3D
+    data_path: /workspace/data2/dataset/general_VLN_data/PanoVLN/train.json.gz

@@ -30,10 +30,15 @@ DATASET_SPECS = {
         "dataset_label": "scalevln",
     },
     # Instruction-only ablation: reuse the exact ScaleVLN trajectories/images.
-    "PanoVLN": {
+    "scalevln_rewrite": {
         "image_dir": "scalevln",
-        "annotation_name": "PanoVLN.jsonl",
+        "annotation_name": "scalevln_rewrite.jsonl",
         "dataset_label": "scalevln",
+    },
+    "panovln": {
+        "image_dir": "panovln",
+        "annotation_name": "panovln.jsonl",
+        "dataset_label": "panovln",
     },
     "scalevln_150k": {
         "image_dir": "scalevln_150k",
@@ -42,7 +47,9 @@ DATASET_SPECS = {
     "dagger": {"image_dir": "dagger", "annotation_name": "dagger.jsonl"},
 }
 
-INSTRUCTION_ABLATION_VARIANTS = frozenset({"scalevln", "PanoVLN"})
+INSTRUCTION_ABLATION_VARIANTS = frozenset(
+    {"scalevln", "scalevln_rewrite"}
+)
 
 
 def action_id_to_str(action_id: int) -> str:
@@ -116,7 +123,7 @@ def validate_selected_subsets(
         )
     if INSTRUCTION_ABLATION_VARIANTS.issubset(selected_subset_list):
         raise ValueError(
-            "scalevln and PanoVLN are paired instruction variants over the same "
+            "scalevln and scalevln_rewrite are paired instruction variants over the same "
             "trajectories. Generate them in separate runs with the same seed and "
             "sampling parameters; do not mix both into one training JSONL."
         )
@@ -439,7 +446,7 @@ def process_dataset(
                     "action_sequence": list(action_chunk["texts"]),
                     "images": list(user_images),
                     "episode_id": str(episode_id),
-                    # Keep the label identical for the paired ScaleVLN/PanoVLN
+                    # Keep the label identical for paired ScaleVLN rewrite
                     # ablation so the published samples differ only in instruction.
                     "dataset": dataset_label,
                     "step_index": action_chunk["start_step"],
@@ -555,7 +562,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input_root",
         type=str,
-        default="/workspace/code_dir/a_property/dataset/PanoVLN",
+        default="/workspace/data2/dataset/PanoVLN",
     )
     parser.add_argument(
         "--output_path",

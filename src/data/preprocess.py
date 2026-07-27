@@ -36,6 +36,7 @@ from src.data.habitat_shortest_path import (
     silence_external_output,
     validate_gpu_ids,
 )
+from src.data.precomputed_gt import write_precomputed_annotations
 
 QUEUE_POLL_TIMEOUT_SECONDS = 5
 
@@ -454,6 +455,42 @@ def process_dataset(
     output_path = default_output_path(output_root, dataset_name)
     skipped_path = skipped_output_path(output_path)
     progress_dir = progress_dir_path(output_path, temp_root=temp_root)
+    dataset_config = CONFIG[dataset_name]
+
+    precomputed_gt_path = dataset_config.get("precomputed_gt_path")
+    if precomputed_gt_path is not None:
+        episode_path = dataset_config["episode_path"]
+        if (
+            skip_existing_episodes
+            and episode_ids is None
+            and max_episodes is None
+            and os.path.isfile(output_path)
+        ):
+            tqdm.write(
+                f"[preprocess:{dataset_name}] {output_path} already exists; "
+                "skip precomputed GT import"
+            )
+            return
+
+        remove_if_exists(skipped_path)
+        remove_if_exists(progress_dir)
+        tqdm.write(
+            f"[preprocess:{dataset_name}] importing existing GT actions without "
+            "starting Habitat"
+        )
+        stats = write_precomputed_annotations(
+            episode_path=episode_path,
+            gt_path=precomputed_gt_path,
+            output_path=output_path,
+            episode_ids=episode_ids,
+            max_episodes=max_episodes,
+        )
+        tqdm.write(
+            f"[preprocess:{dataset_name}] wrote "
+            f"{stats['written_episodes']}/{stats['source_episodes']} episodes "
+            f"to {output_path}"
+        )
+        return
 
     if not skip_existing_episodes:
         remove_if_exists(output_path)
@@ -723,7 +760,7 @@ def main():
     parser.add_argument(
         "--output_root",
         type=str,
-        default="/workspace/code_dir/a_property/dataset/PanoVLN",
+        default="/workspace/data2/dataset/PanoVLN",
         help="Root directory used to write generated sub_dataset jsonl files.",
     )
     parser.add_argument(

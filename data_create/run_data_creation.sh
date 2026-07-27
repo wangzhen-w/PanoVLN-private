@@ -42,11 +42,11 @@ SEGMENT_FACT_MAX_TOKENS=650  # 单个局部分段 route facts 的最大输出长
 CANDIDATE_COUNT=2  # 每条路线保留 grounded draft 与独立 language realization，再做视觉验真。
 CANDIDATE_TEMPERATURE=0.4  # language-realization 温度；grounding 与 review 仍保持 0 以稳定事实。
 
-BASE_URL="http://127.0.0.1:10420/v1"  # OpenAI-compatible Qwen API pool 地址。
+BASE_URL="http://127.0.0.1:10430/v1"  # 多个 Qwen API 的聚合入口；运行前先启动 /workspace/code/occupy/vllm_api_aggregator.sh。
 MODEL="Qwen3.6-35B-A3B"  # 服务中实际加载的模型名称。
 API_KEY="test"  # 本地兼容接口的占位 key；按服务要求修改。
-NUM_WORKERS=96  # 同时进入多 agent/Qwen 阶段的 episode 数。
-EVIDENCE_WORKERS=8  # 独立 CPU 进程数，用于解码全景图、透视投影和制作 evidence sheet。
+NUM_WORKERS=144  # instruction pipeline 的总并发；聚合器会按各 API 的实际容量自动分流。
+EVIDENCE_WORKERS=16  # 独立 CPU 进程数，用于解码全景图、透视投影和制作 evidence sheet。
 
 # 避免系统 HTTP 代理截获本机 Qwen API 请求。
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"

@@ -9,7 +9,7 @@ echo "Switched to project root: $PROJECT_ROOT"
 export PYTHONPATH="./:${PYTHONPATH:-}"
 export PYTHONWARNINGS="ignore"
 PYTHON_BIN="python"
-OUTPUT_ROOT="/workspace/code_dir/a_property/dataset/PanoVLN"
+OUTPUT_ROOT="/workspace/data2/dataset/PanoVLN"
 DATASET_NAMES=(r2r)
 NUM_WORKERS="60"
 

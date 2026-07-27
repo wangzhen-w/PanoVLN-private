@@ -295,7 +295,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output_root",
-        default="/workspace/code_dir/a_property/dataset/PanoVLN",
+        default="/workspace/data2/dataset/PanoVLN",
     )
     parser.add_argument("--dataset_name", nargs="+", default=["scalevln"])
     parser.add_argument("--num_workers", type=int, default=64)

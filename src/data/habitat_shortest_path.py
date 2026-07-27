@@ -3,6 +3,7 @@ import os
 import sys
 import warnings
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import PIL.Image as Image
@@ -44,6 +45,19 @@ CONFIG = {
         "config_path": "./config/vln_scalevln.yaml",
         "image_dir": "scalevln_150k",
         "annotation_name": "scalevln_150k.jsonl",
+    },
+    "panovln": {
+        "config_path": "./config/vln_panovln.yaml",
+        "image_dir": "panovln",
+        "image_size": (1600, 800),
+        "annotation_name": "panovln.jsonl",
+        "episode_path": (
+            "/workspace/data2/dataset/general_VLN_data/PanoVLN/train.json.gz"
+        ),
+        "precomputed_gt_path": (
+            "/workspace/data2/dataset/general_VLN_data/PanoVLN/train_gt.json.gz"
+        ),
+        "scene_root": "/workspace/data2/dataset/general_VLN_data/HM3D",
     },
 }
 
@@ -261,12 +275,42 @@ def build_env_config(dataset_name: str):
     return get_config(config_path)
 
 
+def resolve_episode_scene_path(scene_root: str, scene_id: str) -> str:
+    """Resolve both raw public IDs and paths pre-expanded by Habitat."""
+
+    from data_create.trajectory.scene_paths import resolve_scene_path
+
+    scene_path = Path(scene_id)
+    if scene_path.is_absolute():
+        if scene_path.is_file():
+            return str(scene_path.resolve())
+        try:
+            scene_id = scene_path.relative_to(
+                Path(scene_root).resolve()
+            ).as_posix()
+        except ValueError as error:
+            raise ValueError(
+                f"Scene path is outside configured root: {scene_path}"
+            ) from error
+    return str(resolve_scene_path(scene_root, scene_id))
+
+
 def load_dataset(dataset_name: str):
     env_config = build_env_config(dataset_name=dataset_name)
     dataset = habitat.datasets.make_dataset(
         id_dataset=env_config.habitat.dataset.type,
         config=env_config.habitat.dataset,
     )
+    scene_root = CONFIG[dataset_name].get("scene_root")
+    if scene_root is not None:
+        resolved_scene_paths = {}
+        for episode in dataset.episodes:
+            original_scene_id = episode.scene_id
+            if original_scene_id not in resolved_scene_paths:
+                resolved_scene_paths[original_scene_id] = (
+                    resolve_episode_scene_path(scene_root, original_scene_id)
+                )
+            episode.scene_id = resolved_scene_paths[original_scene_id]
     dataset.episodes = sorted(
         dataset.episodes, key=lambda episode: int(episode.episode_id)
     )
@@ -516,12 +560,16 @@ def reset_episode_output_dir(episode_image_path: str) -> None:
             os.remove(os.path.join(episode_image_path, file_name))
 
 
-def save_rgb_frame(rgb, output_path: str) -> None:
+def save_rgb_frame(
+    rgb,
+    output_path: str,
+    image_size: Tuple[int, int] = ERP_IMAGE_SIZE,
+) -> None:
     rgb_frame = Image.fromarray(rgb)
     if rgb_frame.mode != "RGB":
         rgb_frame = rgb_frame.convert("RGB")
-    if rgb_frame.size != ERP_IMAGE_SIZE:
-        rgb_frame = rgb_frame.resize(ERP_IMAGE_SIZE)
+    if rgb_frame.size != image_size:
+        rgb_frame = rgb_frame.resize(image_size)
     rgb_frame.save(output_path)
 
 

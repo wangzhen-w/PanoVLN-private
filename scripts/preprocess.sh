@@ -12,10 +12,11 @@ export GLOG_minloglevel="3"
 export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 PYTHON_BIN="python"
-OUTPUT_ROOT="/workspace/code_dir/a_property/dataset/PanoVLN"
-DATASET_NAMES=(scalevln)
-GOAL_RADIUS="0.3"
-GPU_IDS="0,1,3,4,5,6,7"
+OUTPUT_ROOT="/workspace/data2/dataset/PanoVLN"
+DATASET_NAMES=(panovln)
+# panovln directly imports train_gt.json.gz, so it does not need Habitat/GPU replay.
+GOAL_RADIUS="0.3"  # Only used by datasets that still require Habitat replay.
+GPU_IDS=""         # Set e.g. "0,1,2,3" when replaying another dataset.
 PROCESSES_PER_GPU="1"
 SKIP_EXISTING_EPISODES="true"
 MAX_EPISODES=""
@@ -42,11 +43,16 @@ CMD=(
     "${PYTHON_BIN}" src/data/preprocess.py
     --output_root "${OUTPUT_ROOT}"
     --goal_radius "${GOAL_RADIUS}"
-    --gpu_ids "${GPU_IDS}"
-    --num_processes_per_gpu "${PROCESSES_PER_GPU}"
     --skip_existing_episodes "${SKIP_EXISTING_EPISODES}"
     --dataset_name "${DATASET_NAMES[@]}"
 )
+
+if [[ -n "${GPU_IDS}" ]]; then
+    CMD+=(
+        --gpu_ids "${GPU_IDS}"
+        --num_processes_per_gpu "${PROCESSES_PER_GPU}"
+    )
+fi
 
 if [[ -n "${TEMP_ROOT}" ]]; then
     CMD+=(--temp_root "${TEMP_ROOT}")
@@ -61,4 +67,8 @@ if [[ -n "${EPISODE_IDS}" ]]; then
     CMD+=(--episode_ids "${EPISODE_ID_ARRAY[@]}")
 fi
 
-CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${CMD[@]}"
+if [[ -n "${GPU_IDS}" ]]; then
+    CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${CMD[@]}"
+else
+    "${CMD[@]}"
+fi

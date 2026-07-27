@@ -15,6 +15,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.data.habitat_shortest_path import (
+    CONFIG,
+    ERP_IMAGE_SIZE,
     STOP_ACTION,
     build_locality_balanced_episode_splits,
     build_worker_assignments,
@@ -52,12 +54,25 @@ def expected_frame_count(annotation):
     return len(annotation["actions"])
 
 
+def annotation_image_id(annotation):
+    image_id = annotation.get("trajectory_id")
+    if image_id is None:
+        image_id = annotation["episode_id"]
+    return str(image_id)
+
+
 def is_episode_complete(image_path, annotation):
-    episode_image_path = os.path.join(image_path, str(annotation["episode_id"]))
+    episode_image_path = os.path.join(image_path, annotation_image_id(annotation))
     return count_saved_frames(episode_image_path) == expected_frame_count(annotation)
 
 
-def replay_annotation_episode(env, episode, annotation, episode_image_path=None):
+def replay_annotation_episode(
+    env,
+    episode,
+    annotation,
+    episode_image_path=None,
+    image_size=ERP_IMAGE_SIZE,
+):
     env.current_episode = episode
     observation = env.reset()
     actions = [int(action) for action in annotation["actions"]]
@@ -72,7 +87,11 @@ def replay_annotation_episode(env, episode, annotation, episode_image_path=None)
     step_id = 0
     if episode_image_path is not None:
         reset_episode_output_dir(episode_image_path)
-        save_rgb_frame(observation["rgb"], os.path.join(episode_image_path, "frame_0.jpg"))
+        save_rgb_frame(
+            observation["rgb"],
+            os.path.join(episode_image_path, "frame_0.jpg"),
+            image_size=image_size,
+        )
 
     for action_index, action in enumerate(actions):
         if action == STOP_ACTION and action_index != len(actions) - 1:
@@ -89,6 +108,7 @@ def replay_annotation_episode(env, episode, annotation, episode_image_path=None)
             save_rgb_frame(
                 observation["rgb"],
                 os.path.join(episode_image_path, f"frame_{step_id}.jpg"),
+                image_size=image_size,
             )
 
     return {
@@ -180,13 +200,16 @@ def extract_data(
                 current_image_path = None
                 if save_image:
                     current_image_path = os.path.join(
-                        image_path, str(episode.episode_id)
+                        image_path, annotation_image_id(annotation)
                     )
                 replay_result = replay_annotation_episode(
                     env=env,
                     episode=episode,
                     annotation=annotation,
                     episode_image_path=current_image_path,
+                    image_size=CONFIG[dataset_name].get(
+                        "image_size", ERP_IMAGE_SIZE
+                    ),
                 )
                 if replay_result["frame_count"] != expected_frame_count(annotation):
                     raise RuntimeError(
@@ -521,7 +544,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_root",
         type=str,
-        default="/workspace/code_dir/a_property/dataset/PanoVLN",
+        default="/workspace/data2/dataset/PanoVLN",
     )
     parser.add_argument(
         "--gpu_ids",

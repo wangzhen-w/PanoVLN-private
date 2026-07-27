@@ -13,23 +13,19 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="/opt/conda/bin/python"  # 当前训练环境；需迁移时改这一处。
-INPUT_ROOT="/workspace/data1/dataset/PanoVLN"
-OUTPUT_PATH="/workspace/data1/dataset/ablation/instruction_compare/PanoVLN_event060_bg011_tail050_2k_ep.jsonl"
-# Instruction ablation 要分别运行，保持 seed/EBS 参数相同并使用不同 OUTPUT_PATH：
-#   baseline: DATASET_NAMES=(scalevln)
-#   dense:    DATASET_NAMES=(PanoVLN)
-# PanoVLN 会读 sub_dataset/PanoVLN.jsonl，但与 scalevln 共用 images/scalevln/。
-# 不要在同一次运行中同时选择 scalevln 和 PanoVLN。
-DATASET_NAMES=(PanoVLN)
-MAX_EPISODES_PER_SUBSET="2000"  # 随机选取的源episode数量；留空表示使用全部episode。
+INPUT_ROOT="/workspace/data2/dataset/PanoVLN"
+OUTPUT_PATH="/workspace/data2/dataset/ablation/instruction_compare/panovln_event085_bg005_tail100_30k_ep.jsonl"
+# 新数据集使用 panovln；旧 ScaleVLN 指令消融分别使用 scalevln/scalevln_rewrite。
+DATASET_NAMES=(panovln)
+MAX_EPISODES_PER_SUBSET="30000"   # 随机选取的源episode数量；留空表示使用全部episode。
 SUBSET_SEED="42"                # 固定episode随机排列；不同规模取同一排列的前缀。
 PAD_STOP_TO_HORIZON="true"
 SEED="42"                       # EBS action chunk采样seed，与episode抽样相互独立。
 
-EVENT_KEEP_PROB="0.60"       # 保留含转向事件的 body action chunk 的概率。
-BACKGROUND_KEEP_PROB="0.11"  # 保留纯前进 body action chunk 的概率。
+EVENT_KEEP_PROB="0.85"       # 保留含转向事件的 body action chunk 的概率。
+BACKGROUND_KEEP_PROB="0.05"  # 保留纯前进 body action chunk 的概率。
 BODY_KEEP_ADVANCE="4"        # body chunk 被保留后向前跳过的起始步数。
-TAIL_DENSE_KEEP_PROB="0.50"  # 保留轨迹末尾 dense chunk 的概率。
+TAIL_DENSE_KEEP_PROB="1.00"   # 完整保留轨迹末尾4个dense起点。
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
 

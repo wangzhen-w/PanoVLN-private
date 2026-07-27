@@ -13,9 +13,9 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
-OUTPUT_ROOT="/workspace/data1/dataset/PanoVLN"
-REFERENCE_INPUT_ROOT="/workspace/data1/dataset/PanoVLN"
+MODEL_PATH="/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
+OUTPUT_ROOT="/workspace/data2/dataset/PanoVLN"
+REFERENCE_INPUT_ROOT="/workspace/data2/dataset/PanoVLN"
 DAGGER_DATASET_NAME="dagger"
 SOURCE_DATASET_NAMES=(r2r rxr)
 GPU_IDS="0,1,2,3,4,5,6,7"
