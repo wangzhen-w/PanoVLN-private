@@ -16,229 +16,244 @@ PANOVGGT_POINT_HIDDEN_DIM = 1024
 PANOVGGT_FEATURE_SOURCES = {"aggregator", "point_hidden"}
 PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
+ACTION_BEARING_HIDDEN_SIZE = 2048
+ACTION_BEARING_TURN_ANGLE_DEG = 15.0
+ACTION_BEARING_MAX_STEPS = 4
+ACTION_BEARING_SIGMA_STEPS = 0.6
+ACTION_BEARING_LEFT_TOKEN_ID = 2282
+ACTION_BEARING_RIGHT_TOKEN_ID = 1246
+ACTION_BEARING_FRONT_TOKEN_ID = 6735
+ACTION_BEARING_ONE_TOKEN_ID = 799
+ACTION_BEARING_TWO_TOKEN_ID = 1330
+ACTION_BEARING_THREE_TOKEN_ID = 2250
+ACTION_BEARING_FOUR_TOKEN_ID = 2943
+ACTION_BEARING_BIN_TOKEN_IDS = (
+    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
+    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
+    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_TWO_TOKEN_ID),
+    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_ONE_TOKEN_ID),
+    (ACTION_BEARING_FRONT_TOKEN_ID,),
+    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_ONE_TOKEN_ID),
+    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_TWO_TOKEN_ID),
+    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
+    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
+)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
 VENDORED_PANOVGGT_CONFIG_PATH = VENDORED_PANOVGGT_DIR / "training" / "config" / "default.yaml"
-ERP_ANGLE_EPS = 1e-6
-ERP_FOURIER_NUM_HARMONICS = 16
-ERP_FOURIER_ENCODING_DIM = ERP_FOURIER_NUM_HARMONICS * 4
 
 
-def validate_erp_angles(vertical_fov: float, center_latitude: float) -> tuple[float, float]:
-    if not math.isfinite(vertical_fov) or not (0.0 < vertical_fov <= math.pi + ERP_ANGLE_EPS):
-        raise AssertionError(f"Invalid ERP vertical_fov={vertical_fov}")
-    half_pi = 0.5 * math.pi
-    if not math.isfinite(center_latitude) or abs(center_latitude) > half_pi + ERP_ANGLE_EPS:
-        raise AssertionError(f"Invalid ERP center_latitude={center_latitude}")
-    return min(vertical_fov, math.pi), max(-half_pi, min(half_pi, center_latitude))
+def _inverse_sigmoid(value: float) -> float:
+    value = min(max(float(value), 1e-6), 1.0 - 1e-6)
+    return math.log(value / (1.0 - value))
 
 
-def reorder_erp_features_to_qwen_patch_order(
-    features: torch.Tensor,
-    *,
-    num_frames: int,
-    height: int,
-    width: int,
-    spatial_merge_size: int,
-) -> torch.Tensor:
-    num_frames = int(num_frames)
-    height = int(height)
-    width = int(width)
-    spatial_merge_size = int(spatial_merge_size)
-    if num_frames <= 0:
-        raise AssertionError(f"ERP Fourier num_frames must be positive, got {num_frames}")
-    if spatial_merge_size <= 0:
-        raise AssertionError(
-            f"ERP Fourier spatial_merge_size must be positive, got {spatial_merge_size}"
-        )
-    if height % spatial_merge_size != 0 or width % spatial_merge_size != 0:
-        raise AssertionError(
-            "ERP Fourier grid is not divisible by Qwen spatial_merge_size: "
-            f"grid=({height}, {width}), spatial_merge_size={spatial_merge_size}"
-        )
-    if features.ndim != 2 or int(features.shape[0]) != height * width:
-        raise AssertionError(
-            "ERP Fourier row-major feature shape mismatch before Qwen order conversion: "
-            f"features={tuple(features.shape)}, grid=({height}, {width})"
-        )
+def _bounded_raw_alpha(alpha_init: float, alpha_max: float) -> torch.Tensor:
+    alpha_max = float(alpha_max)
+    alpha_init = float(alpha_init)
+    if alpha_max <= 0.0:
+        raise ValueError(f"alpha_max must be positive, got {alpha_max}")
+    alpha_init = min(max(alpha_init, 1e-6), alpha_max * (1.0 - 1e-6))
+    return torch.tensor(_inverse_sigmoid(alpha_init / alpha_max), dtype=torch.float32)
 
-    ordered = features.reshape(
-        height // spatial_merge_size,
-        spatial_merge_size,
-        width // spatial_merge_size,
-        spatial_merge_size,
-        features.shape[-1],
+
+def ensure_action_bearing_config(config) -> None:
+    vision_config = config.vision_config
+    text_config = getattr(config, "text_config", None)
+    text_hidden_size = getattr(
+        text_config,
+        "hidden_size",
+        getattr(vision_config, "out_hidden_size", 3584),
     )
-    ordered = ordered.permute(0, 2, 1, 3, 4).contiguous().reshape(height * width, -1)
-    if num_frames > 1:
-        ordered = ordered.repeat(num_frames, 1)
-    return ordered
-
-
-def build_erp_fourier_features(
-    *,
-    num_frames: int,
-    height: int,
-    width: int,
-    spatial_merge_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    vertical_fov: float,
-    center_latitude: float,
-) -> torch.Tensor:
-    vertical_fov, center_latitude = validate_erp_angles(vertical_fov, center_latitude)
-    ys = torch.arange(height, device=device, dtype=torch.float32) + 0.5
-    xs = torch.arange(width, device=device, dtype=torch.float32) + 0.5
-
-    # image_erp_geometry stores its vertical center in image-row coordinates
-    # (positive down). Convert it here to the physical positive-up pitch used
-    # by the ERP prompt without changing PanoVGGT's validated sampling path.
-    pitch = (0.5 - ys[:, None] / float(height)) * vertical_fov - center_latitude
-    yaw = (xs[None, :] / float(width) - 0.5) * (2.0 * math.pi)
-    pitch = pitch.expand(height, width)
-    yaw = yaw.expand(height, width)
-
-    scales = torch.arange(
-        1,
-        ERP_FOURIER_NUM_HARMONICS + 1,
-        device=device,
-        dtype=torch.float32,
-    )
-    yaw_phase = yaw.reshape(height * width, 1) * scales
-    pitch_phase = pitch.reshape(height * width, 1) * scales
-    yaw_features = torch.stack([yaw_phase.sin(), yaw_phase.cos()], dim=-1).reshape(height * width, -1)
-    pitch_features = torch.stack([pitch_phase.sin(), pitch_phase.cos()], dim=-1).reshape(height * width, -1)
-    embeddings = torch.cat([yaw_features, pitch_features], dim=-1)
-    embeddings = reorder_erp_features_to_qwen_patch_order(
-        embeddings,
-        num_frames=num_frames,
-        height=height,
-        width=width,
-        spatial_merge_size=spatial_merge_size,
-    )
-    return embeddings.to(dtype=dtype)
-
-
-def infer_erp_vertical_fov_radians(height: int, width: int) -> float:
-    if height <= 0 or width <= 0:
-        return 0.0
-    return min(math.pi, 2.0 * math.pi * float(height) / float(width))
-
-
-def ensure_erp_fourier_linear_config(vision_config) -> None:
+    output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
     defaults = {
-        "erp_fourier_linear_enabled": False,
-        "erp_fourier_linear_alpha_value": 0.01,
-        "erp_fourier_linear_apply_to_current_only": True,
+        "action_bearing_enabled": False,
+        "action_bearing_alpha_init": 0.02,
+        "action_bearing_alpha_max": 0.1,
+        "action_bearing_output_dim": output_dim,
     }
     for field_name, default_value in defaults.items():
-        if not hasattr(vision_config, field_name):
-            setattr(vision_config, field_name, default_value)
+        if not hasattr(config, field_name):
+            setattr(config, field_name, default_value)
 
 
-class ERPFourierLinearAdapter(nn.Module):
+class ActionBearingResidual(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        ensure_erp_fourier_linear_config(config)
+        ensure_action_bearing_config(config)
 
-        self.enabled = bool(getattr(config, "erp_fourier_linear_enabled", False))
-        self.output_hidden_size = int(config.hidden_size)
-        self.alpha_init = float(getattr(config, "erp_fourier_linear_alpha_value", 0.01))
-        self.apply_to_current_only = bool(
-            getattr(config, "erp_fourier_linear_apply_to_current_only", True)
+        self.enabled = bool(getattr(config, "action_bearing_enabled", False))
+        self.output_dim = int(
+            getattr(config, "action_bearing_output_dim", config.text_config.hidden_size)
         )
-        self.spatial_merge_size = int(getattr(config, "spatial_merge_size", 2))
-        if self.enabled and self.alpha_init <= 0.0:
+        self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
+        self.alpha_init = float(getattr(config, "action_bearing_alpha_init", 0.02))
+        self.alpha_max = float(getattr(config, "action_bearing_alpha_max", 0.1))
+        self.turn_angle_deg = ACTION_BEARING_TURN_ANGLE_DEG
+        self.max_steps = ACTION_BEARING_MAX_STEPS
+        self.sigma_steps = ACTION_BEARING_SIGMA_STEPS
+        self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
+
+        if self.turn_angle_deg <= 0.0:
             raise ValueError(
-                "erp_fourier_linear_alpha_value must be positive when ERP Fourier linear is enabled; "
-                "use erp_fourier_linear_enabled=false to disable the adapter."
+                f"action_bearing_turn_angle_deg must be positive, got {self.turn_angle_deg}"
+            )
+        if self.max_steps < 1:
+            raise ValueError(
+                f"action_bearing_max_steps must be >= 1, got {self.max_steps}"
+            )
+        if self.sigma_steps <= 0.0:
+            raise ValueError(
+                f"action_bearing_sigma_steps must be positive, got {self.sigma_steps}"
             )
 
-        self.proj = nn.Linear(ERP_FOURIER_ENCODING_DIM, self.output_hidden_size, bias=False)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        init_std = self.alpha_init * math.sqrt(2.0 / float(ERP_FOURIER_ENCODING_DIM))
-        nn.init.normal_(self.proj.weight, mean=0.0, std=init_std)
-
-    def apply_to_patch_tokens(
-        self,
-        patch_tokens: torch.Tensor,
-        grid_thw: torch.Tensor | None,
-        image_apply_mask: torch.Tensor | None = None,
-        image_erp_geometry: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if not self.enabled or grid_thw is None or grid_thw.numel() == 0:
-            return patch_tokens
-        if grid_thw.ndim != 2 or int(grid_thw.shape[-1]) != 3:
-            raise AssertionError(f"Expected image_grid_thw shape [N, 3], got {tuple(grid_thw.shape)}")
-
-        param = self.proj.weight
-        param_device = param.device
-        param_dtype = param.dtype
-        default_center_latitude = 0.0
-
-        num_images = int(grid_thw.shape[0])
-        if image_apply_mask is not None:
-            if image_apply_mask.ndim != 1 or int(image_apply_mask.shape[0]) != num_images:
-                raise AssertionError(
-                    f"Expected image_apply_mask to have shape [{num_images}], got {tuple(image_apply_mask.shape)}"
-                )
-            apply_mask_list = image_apply_mask.detach().to(device="cpu", dtype=torch.bool).tolist()
-        else:
-            apply_mask_list = [True] * num_images
-
-        geometry_list = None
-        if image_erp_geometry is not None:
-            if image_erp_geometry.ndim != 2 or tuple(image_erp_geometry.shape) != (num_images, 2):
-                raise AssertionError(
-                    "Expected image_erp_geometry to have shape "
-                    f"[{num_images}, 2], got {tuple(image_erp_geometry.shape)}"
-                )
-            geometry_list = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32).tolist()
-
-        split_sizes = [
-            int(size)
-            for size in grid_thw.prod(-1).detach().to(device="cpu", dtype=torch.long).tolist()
-        ]
-        if sum(split_sizes) != int(patch_tokens.shape[0]):
+        self.num_bins = 2 * self.max_steps + 1
+        if len(ACTION_BEARING_BIN_TOKEN_IDS) != self.num_bins:
             raise AssertionError(
-                "Patch token count does not match image_grid_thw for ERP Fourier linear: "
-                f"tokens={int(patch_tokens.shape[0])}, expected={sum(split_sizes)}"
+                "ACTION_BEARING_BIN_TOKEN_IDS must match the action-bearing bin count: "
+                f"token_id_rows={len(ACTION_BEARING_BIN_TOKEN_IDS)}, num_bins={self.num_bins}"
             )
+        self.bin_embeddings = nn.Parameter(torch.empty(self.num_bins, self.output_dim))
+        self.input_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.output_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.output_dim),
+        )
+        self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
+        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+        self.reset_parameters(float(getattr(config.vision_config, "initializer_range", 0.02)))
 
-        token_splits = list(patch_tokens.split(split_sizes, dim=0))
-        for image_index, (tokens, (num_frames, height, width)) in enumerate(zip(token_splits, grid_thw.tolist())):
-            if not apply_mask_list[image_index] or int(height) <= 0 or int(width) <= 0:
-                continue
+    @property
+    def alpha(self) -> torch.Tensor:
+        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
 
-            if geometry_list is not None:
-                vertical_fov = float(geometry_list[image_index][0])
-                center_latitude = float(geometry_list[image_index][1])
-            else:
-                vertical_fov = infer_erp_vertical_fov_radians(int(height), int(width))
-                center_latitude = default_center_latitude
+    @property
+    def turn_angle_radians(self) -> float:
+        return math.radians(self.turn_angle_deg)
 
-            fourier_features = build_erp_fourier_features(
-                num_frames=int(num_frames),
-                height=int(height),
-                width=int(width),
-                spatial_merge_size=self.spatial_merge_size,
-                device=param_device,
-                dtype=param_dtype,
-                vertical_fov=vertical_fov,
-                center_latitude=center_latitude,
+    def reset_parameters(self, init_std: float = 0.02) -> None:
+        nn.init.normal_(self.bin_embeddings, mean=0.0, std=float(init_std))
+        self.input_norm.reset_parameters()
+        self.output_norm.reset_parameters()
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=float(init_std))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        with torch.no_grad():
+            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
+
+    def initialize_bin_embeddings_from_text(
+        self,
+        input_embeddings: nn.Embedding | None,
+    ) -> bool:
+        if input_embeddings is None or not hasattr(input_embeddings, "weight"):
+            return False
+        weight = input_embeddings.weight
+        if int(weight.shape[1]) != self.output_dim:
+            return False
+
+        phrase_embeddings = []
+        vocab_size = int(weight.shape[0])
+        for phrase_token_ids in ACTION_BEARING_BIN_TOKEN_IDS:
+            token_ids = [
+                self._valid_token_id(token_id, vocab_size)
+                for token_id in phrase_token_ids
+            ]
+            if any(token_id is None for token_id in token_ids):
+                return False
+            ids = torch.tensor(token_ids, device=weight.device, dtype=torch.long)
+            phrase_embeddings.append(weight.index_select(0, ids).mean(dim=0))
+
+        with torch.no_grad():
+            init_values = torch.stack(phrase_embeddings, dim=0).to(
+                device=self.bin_embeddings.device,
+                dtype=self.bin_embeddings.dtype,
             )
-            if int(fourier_features.shape[0]) != int(tokens.shape[0]):
-                raise AssertionError(
-                    "ERP Fourier linear feature count mismatch: "
-                    f"features={int(fourier_features.shape[0])}, tokens={int(tokens.shape[0])}"
-                )
-            delta = self.proj(fourier_features)
-            token_splits[image_index] = tokens + delta.to(device=tokens.device, dtype=tokens.dtype)
+            self.bin_embeddings.copy_(init_values)
+        return True
 
-        return torch.cat(token_splits, dim=0)
+    @staticmethod
+    def _valid_token_id(token_id, vocab_size: int) -> int | None:
+        if token_id is None:
+            return None
+        token_id = int(token_id)
+        if token_id < 0 or token_id >= vocab_size:
+            return None
+        return token_id
+
+    def compute_soft_action_scores(self, yaw: torch.Tensor) -> torch.Tensor:
+        steps = (yaw.to(dtype=torch.float32) / float(self.turn_angle_radians)).clamp(
+            min=-float(self.max_steps),
+            max=float(self.max_steps),
+        )
+        centers = torch.arange(
+            -self.max_steps,
+            self.max_steps + 1,
+            device=steps.device,
+            dtype=torch.float32,
+        )
+        distances = steps.unsqueeze(-1) - centers
+        scores = torch.exp(-0.5 * (distances / float(self.sigma_steps)).pow(2))
+        return scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    @staticmethod
+    def _build_grid_yaw(target_h: int, target_w: int, device: torch.device) -> torch.Tensor:
+        del target_h
+        xs = torch.arange(target_w, device=device, dtype=torch.float32) + 0.5
+        yaw = (xs / float(target_w) - 0.5) * (2.0 * math.pi)
+        return yaw.unsqueeze(0)
+
+    def _target_grid_hw(
+        self,
+        grid_thw: list[int],
+        target_len: int,
+    ) -> tuple[int, int]:
+        num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
+        if num_frames != 1:
+            raise AssertionError(
+                "Action-Bearing residual expects a single current panorama per Qwen image, "
+                f"got image_grid_thw={grid_thw}"
+            )
+        target_h = max(1, grid_h // self.spatial_merge_size)
+        target_w = max(1, grid_w // self.spatial_merge_size)
+        expected_len = target_h * target_w
+        if expected_len != int(target_len):
+            raise AssertionError(
+                "Cannot map Action-Bearing scores to the Qwen 2D visual-token grid: "
+                f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}, "
+                f"expected_len={expected_len}, qwen_len={int(target_len)}"
+            )
+        return target_h, target_w
+
+    def forward(
+        self,
+        image_tokens: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.enabled or image_tokens.numel() == 0:
+            return image_tokens
+
+        target_h, target_w = self._target_grid_hw(
+            grid_thw.detach().to(device="cpu", dtype=torch.long).tolist(),
+            target_len=int(image_tokens.shape[0]),
+        )
+        param = self.bin_embeddings
+        yaw = self._build_grid_yaw(
+            target_h,
+            target_w,
+            device=param.device,
+        ).expand(target_h, target_w)
+        scores = self.compute_soft_action_scores(yaw.reshape(-1)).to(dtype=param.dtype)
+        action_prior = scores @ self.bin_embeddings
+        delta = self.output_norm(self.mlp(self.input_norm(action_prior)))
+        delta = self.alpha.to(dtype=delta.dtype) * delta
+        return image_tokens + delta.to(
+            device=image_tokens.device,
+            dtype=image_tokens.dtype,
+        )
 
 
 def ensure_panovggt_config(config) -> None:
@@ -842,38 +857,49 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.mlp.2.bias",
         "panovggt_mlp.output_norm.weight",
     )
+    ACTION_BEARING_STATE_KEYS = (
+        "action_bearing_residual.bin_embeddings",
+        "action_bearing_residual.input_norm.weight",
+        "action_bearing_residual.mlp.0.weight",
+        "action_bearing_residual.mlp.0.bias",
+        "action_bearing_residual.mlp.2.weight",
+        "action_bearing_residual.mlp.2.bias",
+        "action_bearing_residual.output_norm.weight",
+        "action_bearing_residual.raw_alpha",
+    )
+
     def __init__(self, config):
-        vision_config = getattr(config, "vision_config", None)
-        erp_fourier_linear_enabled = bool(
-            getattr(
-                vision_config,
-                "erp_fourier_linear_enabled",
-                getattr(config, "erp_fourier_linear_enabled", False),
-            )
-        )
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
-        if erp_fourier_linear_enabled:
-            ensure_erp_fourier_linear_config(config.vision_config)
+        action_bearing_enabled = bool(
+            getattr(config, "action_bearing_enabled", False)
+        )
         if panovggt_enabled:
             ensure_panovggt_config(config)
+        if action_bearing_enabled:
+            ensure_action_bearing_config(config)
         super().__init__(config)
 
-        if erp_fourier_linear_enabled:
-            ensure_erp_fourier_linear_config(self.model.visual.config)
         if panovggt_enabled:
             ensure_panovggt_config(config)
+        if action_bearing_enabled:
+            ensure_action_bearing_config(config)
 
-        self.erp_fourier_linear_adapter = (
-            ERPFourierLinearAdapter(self.model.visual.config)
-            if erp_fourier_linear_enabled
+        self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
+        self.action_bearing_residual = (
+            ActionBearingResidual(config)
+            if action_bearing_enabled
             else None
         )
-        self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
+        if self.action_bearing_residual is not None:
+            self.action_bearing_residual.initialize_bin_embeddings_from_text(
+                self.get_input_embeddings()
+            )
         self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
         self._panovggt_device = None
         self._panovggt_mlp_load_was_incompatible = False
+        self._action_bearing_initialized_after_load = False
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
@@ -881,16 +907,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_panovggt_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
-        self._install_pano_patch_embed_hook()
         self._install_pano_merger_hook()
         self._install_image_feature_hook()
         self.register_load_state_dict_pre_hook(self._drop_incompatible_panovggt_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
 
-    def _erp_fourier_linear_enabled(self) -> bool:
+    def _action_bearing_enabled(self) -> bool:
         return (
-            self.erp_fourier_linear_adapter is not None
-            and bool(getattr(self.erp_fourier_linear_adapter, "enabled", False))
+            self.action_bearing_residual is not None
+            and bool(getattr(self.action_bearing_residual, "enabled", False))
         )
 
     def _panovggt_enabled(self) -> bool:
@@ -916,49 +941,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return grid_thw.data_ptr() == runtime_grid.data_ptr()
         return False
 
-    def _current_image_apply_mask(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        image_apply_mask = torch.zeros(
-            int(grid_thw.shape[0]),
-            device=grid_thw.device,
-            dtype=torch.bool,
-        )
-        for _, image_index in self._current_image_flat_indices(grid_thw):
-            if 0 <= image_index < int(image_apply_mask.shape[0]):
-                image_apply_mask[image_index] = True
-        return image_apply_mask
-
-    def _install_pano_patch_embed_hook(self) -> None:
-        if not self._erp_fourier_linear_enabled():
-            return
-        visual = self.model.visual
-        if hasattr(visual.patch_embed, "_pano_origin_forward"):
-            return
-
-        visual.patch_embed._pano_origin_forward = visual.patch_embed.forward
-        owner = self
-
-        def patch_embed_with_pano_adapters(this, hidden_states):
-            outputs = this._pano_origin_forward(hidden_states)
-            grid_thw = owner._pano_runtime_grid_thw
-            if grid_thw is None or outputs.numel() == 0:
-                return outputs
-
-            if owner._erp_fourier_linear_enabled():
-                image_apply_mask = None
-                if owner.erp_fourier_linear_adapter.apply_to_current_only:
-                    image_apply_mask = owner._current_image_apply_mask(grid_thw)
-                outputs = owner.erp_fourier_linear_adapter.apply_to_patch_tokens(
-                    patch_tokens=outputs,
-                    grid_thw=grid_thw,
-                    image_apply_mask=image_apply_mask,
-                    image_erp_geometry=owner._pano_runtime_image_geometry,
-                )
-
-            return outputs
-
-        visual.patch_embed.forward = MethodType(patch_embed_with_pano_adapters, visual.patch_embed)
-
-    def _select_panovggt_current_items(
+    def _select_current_items(
         self,
         image_grid_thw: torch.Tensor,
         num_image_outputs: int | None = None,
@@ -1008,7 +991,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return vision_output
 
         image_embeds = list(vision_output.pooler_output)
-        current_items = self._select_panovggt_current_items(image_grid_thw, num_image_outputs=len(image_embeds))
+        current_items = self._select_current_items(
+            image_grid_thw,
+            num_image_outputs=len(image_embeds),
+        )
         if not current_items:
             return vision_output
 
@@ -1048,6 +1034,28 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         vision_output.pooler_output = tuple(image_embeds)
         return vision_output
 
+    def _apply_action_bearing_residual(self, vision_output, image_grid_thw: torch.Tensor):
+        action_bearing_residual = self.action_bearing_residual
+        if (
+            action_bearing_residual is None
+            or image_grid_thw is None
+            or vision_output.pooler_output is None
+        ):
+            return vision_output
+
+        image_embeds = list(vision_output.pooler_output)
+        current_items = self._select_current_items(
+            image_grid_thw,
+            num_image_outputs=len(image_embeds),
+        )
+        for _, image_index in current_items:
+            image_embeds[image_index] = action_bearing_residual(
+                image_embeds[image_index],
+                image_grid_thw[image_index],
+            )
+        vision_output.pooler_output = tuple(image_embeds)
+        return vision_output
+
     def _apply_pre_merger_panovggt_residual(
         self,
         hidden_states: torch.Tensor,
@@ -1056,7 +1064,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if image_grid_thw is None or hidden_states.numel() == 0:
             return hidden_states
 
-        current_items = self._select_panovggt_current_items(image_grid_thw)
+        current_items = self._select_current_items(image_grid_thw)
         if not current_items:
             return hidden_states
 
@@ -1141,7 +1149,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         visual.merger.forward = MethodType(merger_with_pano_pre_merger_residual, visual.merger)
 
     def _install_image_feature_hook(self) -> None:
-        if not self._panovggt_enabled():
+        if not (self._panovggt_enabled() or self._action_bearing_enabled()):
             return
         if hasattr(self.model, "_pano_origin_get_image_features"):
             return
@@ -1166,9 +1174,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 owner._pano_runtime_visual_grid_thw = previous_visual_grid
             if not is_image_visual_call:
                 return vision_output
-            if owner._panovggt_injection_stage() == "pre_merger":
-                return vision_output
-            vision_output = owner._apply_post_merger_panovggt_residual(vision_output, image_grid_thw)
+            if (
+                owner._panovggt_enabled()
+                and owner._panovggt_injection_stage() == "post_merger"
+            ):
+                vision_output = owner._apply_post_merger_panovggt_residual(
+                    vision_output,
+                    image_grid_thw,
+                )
+            if owner._action_bearing_enabled():
+                vision_output = owner._apply_action_bearing_residual(
+                    vision_output,
+                    image_grid_thw,
+                )
             return vision_output
 
         self.model.get_image_features = MethodType(get_image_features_with_pano_residuals, self.model)
@@ -1425,10 +1443,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
-        if (
-            self._erp_fourier_linear_enabled()
-            or self._panovggt_enabled()
-        ):
+        if self._panovggt_enabled() or self._action_bearing_enabled():
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
@@ -1459,13 +1474,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         del module
         missing_keys = set(incompatible_keys.missing_keys)
 
-        erp_fourier_linear_module = self.erp_fourier_linear_adapter
+        action_bearing_module = self.action_bearing_residual
         if (
-            erp_fourier_linear_module is not None
-            and erp_fourier_linear_module.enabled
-            and any(key.startswith("erp_fourier_linear_adapter.") for key in missing_keys)
+            action_bearing_module is not None
+            and action_bearing_module.enabled
+            and any(key.startswith("action_bearing_residual.") for key in missing_keys)
         ):
-            erp_fourier_linear_module.reset_parameters()
+            action_bearing_module.reset_parameters(
+                float(getattr(self.config.vision_config, "initializer_range", 0.02))
+            )
+            action_bearing_module.initialize_bin_embeddings_from_text(
+                self.get_input_embeddings()
+            )
+            self._action_bearing_initialized_after_load = True
 
         panovggt_module = self.panovggt_mlp
         if (
@@ -1484,9 +1505,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             else:
                 self._mark_panovggt_weights_ready()
 
-    def _reset_erp_fourier_linear_parameters_after_pretrained_load(self) -> None:
-        if self._erp_fourier_linear_enabled() and self.erp_fourier_linear_adapter is not None:
-            self.erp_fourier_linear_adapter.reset_parameters()
+    def _reset_action_bearing_parameters_after_pretrained_load(self) -> None:
+        if self._action_bearing_enabled() and self.action_bearing_residual is not None:
+            self.action_bearing_residual.reset_parameters(
+                float(getattr(self.config.vision_config, "initializer_range", 0.02))
+            )
+            self.action_bearing_residual.initialize_bin_embeddings_from_text(
+                self.get_input_embeddings()
+            )
+            self._action_bearing_initialized_after_load = True
 
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
         if self._panovggt_enabled() and self.panovggt_mlp is not None:
@@ -1496,14 +1523,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
         return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.PANOVGGT_STATE_KEYS)
 
-    def _checkpoint_has_erp_fourier_linear_weights(self, pretrained_model_name_or_path) -> bool | None:
-        if self.erp_fourier_linear_adapter is None:
-            return None
-        state_keys = tuple(
-            f"erp_fourier_linear_adapter.{key}"
-            for key in self.erp_fourier_linear_adapter.state_dict().keys()
+    @classmethod
+    def _checkpoint_has_action_bearing_weights(
+        cls,
+        pretrained_model_name_or_path,
+    ) -> bool | None:
+        return cls._checkpoint_has_any_weights(
+            pretrained_model_name_or_path,
+            cls.ACTION_BEARING_STATE_KEYS,
         )
-        return self._checkpoint_has_any_weights(pretrained_model_name_or_path, state_keys)
 
     @classmethod
     def _checkpoint_has_any_weights(cls, pretrained_model_name_or_path, state_keys) -> bool | None:
@@ -1552,11 +1580,15 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        has_erp_fourier_linear_weights = model._checkpoint_has_erp_fourier_linear_weights(
+        has_action_bearing_weights = cls._checkpoint_has_action_bearing_weights(
             pretrained_model_name_or_path
         )
-        if has_erp_fourier_linear_weights is False:
-            model._reset_erp_fourier_linear_parameters_after_pretrained_load()
+        if (
+            model._action_bearing_enabled()
+            and has_action_bearing_weights is not True
+            and not model._action_bearing_initialized_after_load
+        ):
+            model._reset_action_bearing_parameters_after_pretrained_load()
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()

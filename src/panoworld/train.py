@@ -42,6 +42,18 @@ RANK = int(os.environ.get("RANK", "0"))
 
 
 class PanoWorldSFTTrainer(Trainer):
+    NO_WEIGHT_DECAY_SUFFIXES = (
+        "action_bearing_residual.raw_alpha",
+    )
+
+    def get_decay_parameter_names(self, model):
+        decay_parameters = set(super().get_decay_parameter_names(model))
+        return [
+            name
+            for name in decay_parameters
+            if not name.endswith(self.NO_WEIGHT_DECAY_SUFFIXES)
+        ]
+
     def __init__(self, *args, module_learning_rates=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.module_learning_rates = {
@@ -55,8 +67,8 @@ class PanoWorldSFTTrainer(Trainer):
         return name == module_name or name.startswith(f"{module_name}.") or f".{module_name}." in name
 
     def _module_lr_key_for_parameter(self, name: str) -> Optional[str]:
-        if self._name_has_module(name, "erp_fourier_linear_adapter"):
-            return "erp_fourier_linear_adapter"
+        if self._name_has_module(name, "action_bearing_residual"):
+            return "action_bearing_residual"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -186,16 +198,13 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
-    rank0_print(RANK, f"erp_fourier_linear_enabled: {_config_value(cfg.model.erp_fourier_linear_enabled)}")
-    rank0_print(RANK, f"erp_fourier_linear_alpha_value: {_config_value(cfg.model.erp_fourier_linear_alpha_value)}")
-    rank0_print(
-        RANK,
-        "erp_fourier_linear_apply_to_current_only: "
-        f"{_config_value(cfg.model.erp_fourier_linear_apply_to_current_only)}",
-    )
+    rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
+    rank0_print(RANK, f"action_bearing_alpha_init: {_config_value(cfg.model.action_bearing_alpha_init)}")
+    rank0_print(RANK, f"action_bearing_alpha_max: {_config_value(cfg.model.action_bearing_alpha_max)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
+    rank0_print(RANK, f"panovggt_injection_stage: {_config_value(cfg.model.panovggt_injection_stage)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
@@ -203,7 +212,11 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"language_model_lr: {_config_value(cfg.training.language_model_lr)}")
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
-    rank0_print(RANK, f"erp_fourier_linear_lr: {_config_value(cfg.training.erp_fourier_linear_lr)}")
+    rank0_print(
+        RANK,
+        "action_bearing_residual_lr: "
+        f"{_config_value(cfg.training.action_bearing_residual_lr)}",
+    )
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, "============================")
 
@@ -379,22 +392,22 @@ def main() -> None:
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
         rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
+        rank0_print(RANK, f"panovggt_injection_stage: {_config_value(getattr(model_config, 'panovggt_injection_stage', None))}")
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
-        vision_config = getattr(model_config, "vision_config", None)
         rank0_print(
             RANK,
-            "erp_fourier_linear_enabled: "
-            f"{_config_value(getattr(vision_config, 'erp_fourier_linear_enabled', None))}",
+            "action_bearing_enabled: "
+            f"{_config_value(getattr(model_config, 'action_bearing_enabled', None))}",
         )
         rank0_print(
             RANK,
-            "erp_fourier_linear_alpha_value: "
-            f"{_config_value(getattr(vision_config, 'erp_fourier_linear_alpha_value', None))}",
+            "action_bearing_alpha_init: "
+            f"{_config_value(getattr(model_config, 'action_bearing_alpha_init', None))}",
         )
         rank0_print(
             RANK,
-            "erp_fourier_linear_apply_to_current_only: "
-            f"{_config_value(getattr(vision_config, 'erp_fourier_linear_apply_to_current_only', None))}",
+            "action_bearing_alpha_max: "
+            f"{_config_value(getattr(model_config, 'action_bearing_alpha_max', None))}",
         )
         rank0_print(RANK, "==================================")
         print_model_parameters(model)
@@ -412,7 +425,7 @@ def main() -> None:
             "language_model": cfg.training.language_model_lr,
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
-            "erp_fourier_linear_adapter": cfg.training.erp_fourier_linear_lr,
+            "action_bearing_residual": cfg.training.action_bearing_residual_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
         },
     )

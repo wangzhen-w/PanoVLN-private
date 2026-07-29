@@ -10,17 +10,18 @@ model:
     visual: true
     visual_merger: true
     language_model: true
-    erp_fourier_linear_adapter: true
-    panovggt_mlp: false
+    action_bearing_residual: true
+    panovggt_mlp: true
   erp_top_crop_degrees: 0.0
   erp_bottom_crop_degrees: 0.0
-  erp_fourier_linear_enabled: true
-  erp_fourier_linear_alpha_value: 0.01
-  erp_fourier_linear_apply_to_current_only: true
-  panovggt_enabled: false
+  action_bearing_enabled: true
+  action_bearing_alpha_init: 0.02
+  action_bearing_alpha_max: 0.1
+  panovggt_enabled: true
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.05
   panovggt_feature_source: "aggregator"
+  panovggt_injection_stage: "post_merger"
   panovggt_sampling_mode: "grouping"
   panovggt_force_fp32: false
 
@@ -45,7 +46,7 @@ data:
       longest_edge: 460800
 
 training:
-  output_dir: "/workspace/data1/model/panoworld/panovln_fourier_alpha001_fixed"
+  output_dir: "/workspace/data1/model/panoworld/panovln_panovggt_action_bearing"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -54,7 +55,7 @@ training:
   language_model_lr: 1.0e-6
   visual_lr: 1.0e-6
   visual_merger_lr: 1.0e-6
-  erp_fourier_linear_lr: 1.0e-6
+  action_bearing_residual_lr: 1.0e-6
   panovggt_mlp_lr: 1.0e-6
   weight_decay: 0.01
   num_train_epochs: 1

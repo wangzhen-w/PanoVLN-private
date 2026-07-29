@@ -17,13 +17,14 @@ class ModelConfig:
     trainable_modules: Optional[Dict[str, bool]] = None
     erp_top_crop_degrees: float = 0.0
     erp_bottom_crop_degrees: float = 0.0
-    erp_fourier_linear_enabled: bool = False
-    erp_fourier_linear_alpha_value: float = 0.01
-    erp_fourier_linear_apply_to_current_only: bool = True
+    action_bearing_enabled: bool = False
+    action_bearing_alpha_init: float = 0.02
+    action_bearing_alpha_max: float = 0.1
     panovggt_enabled: bool = True
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.05
     panovggt_feature_source: str = "aggregator"
+    panovggt_injection_stage: str = "post_merger"
     panovggt_sampling_mode: str = "grouping"
     panovggt_force_fp32: bool = False
 
@@ -55,7 +56,7 @@ class TrainingConfig:
     language_model_lr: Optional[float] = 1.0e-6
     visual_lr: Optional[float] = 1.0e-6
     visual_merger_lr: Optional[float] = 1.0e-6
-    erp_fourier_linear_lr: Optional[float] = 1.0e-6
+    action_bearing_residual_lr: Optional[float] = 1.0e-6
     panovggt_mlp_lr: Optional[float] = 1.0e-6
     weight_decay: float = 0.01
     num_train_epochs: float = 1.0
