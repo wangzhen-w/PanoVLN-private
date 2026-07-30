@@ -1,5 +1,8 @@
 import argparse
+from dataclasses import asdict
+import json
 import os
+from pathlib import Path
 import shutil
 
 from transformers import Trainer, TrainingArguments
@@ -23,6 +26,7 @@ from utils import (
     set_model,
     set_seed,
     sync_model_special_tokens,
+    validate_paqr_tokenizer,
 )
 
 RANK = int(os.environ.get("RANK", "0"))
@@ -31,12 +35,17 @@ RANK = int(os.environ.get("RANK", "0"))
 class PanoVLNTrainer(Trainer):
     NO_WEIGHT_DECAY_SUFFIXES = (
         "action_bearing_residual.raw_alpha",
+        "paqr.raw_gate",
+        "paqr.raw_turn_cos",
+        "paqr.raw_turn_sin",
+        "paqr.raw_forward_cos",
     )
     MODULE_LR_KEYS = (
         "language_model",
         "visual",
         "visual_merger",
         "action_bearing_residual",
+        "paqr",
         "panovggt_mlp",
     )
 
@@ -68,6 +77,8 @@ class PanoVLNTrainer(Trainer):
     def _module_lr_key_for_parameter(self, name: str):
         if self._name_has_module(name, "action_bearing_residual"):
             return "action_bearing_residual"
+        if self._name_has_module(name, "paqr"):
+            return "paqr"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -107,6 +118,49 @@ class PanoVLNTrainer(Trainer):
                 grouped_parameters[group_key] = group
             grouped_parameters[group_key]["params"].append(param)
 
+        # Preserve the Pano-only optimizer grouping exactly. DeepSpeed ZeRO-2
+        # 0.18.0 fails on ranks that own no value from a four-scalar group, so
+        # merge PAQR into an existing no-decay group only when LR and dtype are
+        # identical. load_model() aligns PAQR with the live LM-head dtype while
+        # ZeRO keeps its optimizer master copy in FP32.
+        world_size = max(1, int(getattr(self.args, "world_size", 1)))
+        paqr_group_keys = [
+            key for key in grouped_parameters if key[0] == "paqr"
+        ]
+        for paqr_key in paqr_group_keys:
+            paqr_group = grouped_parameters[paqr_key]
+            paqr_numel = sum(
+                parameter.numel() for parameter in paqr_group["params"]
+            )
+            if paqr_numel >= world_size:
+                continue
+            paqr_dtypes = {
+                parameter.dtype for parameter in paqr_group["params"]
+            }
+            compatible_keys = [
+                key
+                for key, group in grouped_parameters.items()
+                if key != paqr_key
+                and key[1:] == paqr_key[1:]
+                and sum(parameter.numel() for parameter in group["params"])
+                >= world_size
+                and {
+                    parameter.dtype for parameter in group["params"]
+                }
+                == paqr_dtypes
+            ]
+            if not compatible_keys:
+                raise ValueError(
+                    "The PAQR optimizer group has fewer scalar values than the "
+                    f"data-parallel world size ({paqr_numel} < {world_size}) and "
+                    "no existing group has the same LR, weight decay, and dtype. "
+                    "For this eight-card run, keep paqr_lr equal to "
+                    "language_model_lr and PAQR aligned to the LM-head dtype."
+                )
+            target_key = compatible_keys[0]
+            grouped_parameters[target_key]["params"].extend(paqr_group["params"])
+            del grouped_parameters[paqr_key]
+
         optimizer_grouped_parameters = list(grouped_parameters.values())
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
@@ -127,7 +181,6 @@ class PanoVLNTrainer(Trainer):
                 drop_last=self.args.dataloader_drop_last,
             )
         return super()._get_train_sampler(train_dataset)
-
 
 def copy_chat_template_files(source_dir: str, output_dir: str):
     for template_name in ("chat_template.json", "chat_template.jinja"):
@@ -172,7 +225,106 @@ def load_optional_text(path):
         return handle.read().strip()
 
 
+def save_resolved_experiment_config(cfg, overrides) -> None:
+    output_dir = Path(cfg.training.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "resolved_config.yaml").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        yaml.safe_dump(
+            asdict(cfg),
+            handle,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    with (output_dir / "config_overrides.json").open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(list(overrides or []), handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
 def validate_training_config(cfg) -> None:
+    trainable_modules = cfg.model.trainable_modules or {}
+    paqr_trainable = bool(trainable_modules.get("paqr", False))
+    if paqr_trainable and not cfg.model.paqr_enabled:
+        raise ValueError(
+            "trainable_modules.paqr=true requires model.paqr_enabled=true"
+        )
+
+    if cfg.model.paqr_enabled:
+        if not cfg.model.panovggt_enabled:
+            raise ValueError(
+                "The controlled PAQR comparison requires panovggt_enabled=true"
+            )
+        if cfg.model.action_bearing_enabled:
+            raise ValueError(
+                "PAQR requires action_bearing_enabled=false; the legacy residual "
+                "must not modify the same action experiment"
+            )
+        if bool(trainable_modules.get("action_bearing_residual", False)):
+            raise ValueError(
+                "The controlled PAQR experiment must keep "
+                "trainable_modules.action_bearing_residual=false"
+            )
+        if not bool(trainable_modules.get("panovggt_mlp", False)):
+            raise ValueError(
+                "The controlled PAQR run keeps the original panovggt_mlp "
+                "trainable, matching the Pano-only baseline"
+            )
+        if not paqr_trainable:
+            raise ValueError(
+                "PAQR requires trainable_modules.paqr=true"
+            )
+        if (
+            cfg.training.paqr_lr is None
+            or float(cfg.training.paqr_lr) <= 0.0
+        ):
+            raise ValueError("PAQR requires a positive training.paqr_lr")
+        action_token_ids = [
+            int(token_id) for token_id in cfg.model.paqr_action_token_ids
+        ]
+        if len(action_token_ids) != 3 or len(set(action_token_ids)) != 3:
+            raise ValueError(
+                "model.paqr_action_token_ids must contain three distinct ids in "
+                "[left, forward, right] order"
+            )
+        if int(cfg.model.paqr_stop_token_id) in action_token_ids:
+            raise ValueError("model.paqr_stop_token_id must differ from movement ids")
+        if float(cfg.model.paqr_temperature) <= 0.0:
+            raise ValueError("model.paqr_temperature must be positive")
+        if not (
+            0.0
+            <= float(cfg.model.paqr_prior_init)
+            < float(cfg.model.paqr_prior_max)
+        ):
+            raise ValueError(
+                "model.paqr_prior_init must satisfy 0 <= init < prior_max"
+            )
+        if float(cfg.model.paqr_logit_scale_max) <= 0.0:
+            raise ValueError("model.paqr_logit_scale_max must be positive")
+        if not bool(cfg.model.paqr_first_action_only):
+            raise ValueError(
+                "The controlled PAQR experiment requires paqr_first_action_only=true"
+            )
+        if cfg.model.panovggt_feature_source != "aggregator":
+            raise ValueError(
+                "The controlled PAQR comparison keeps "
+                "panovggt_feature_source='aggregator'"
+            )
+        if cfg.model.panovggt_injection_stage != "pre_merger":
+            raise ValueError(
+                "The controlled PAQR comparison requires "
+                "panovggt_injection_stage='pre_merger'"
+            )
+        if cfg.model.panovggt_sampling_mode != "singlepoint":
+            raise ValueError(
+                "The controlled PAQR comparison requires "
+                "panovggt_sampling_mode='singlepoint'"
+            )
+
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
         return
@@ -215,6 +367,20 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_alpha_init: {_config_value(cfg.model.action_bearing_alpha_init)}")
     rank0_print(RANK, f"action_bearing_alpha_max: {_config_value(cfg.model.action_bearing_alpha_max)}")
+    rank0_print(RANK, f"paqr_enabled: {_config_value(cfg.model.paqr_enabled)}")
+    rank0_print(RANK, f"paqr_action_token_ids: {cfg.model.paqr_action_token_ids}")
+    rank0_print(RANK, f"paqr_stop_token_id: {cfg.model.paqr_stop_token_id}")
+    rank0_print(RANK, f"paqr_temperature: {cfg.model.paqr_temperature}")
+    rank0_print(RANK, f"paqr_prior_init: {cfg.model.paqr_prior_init}")
+    rank0_print(RANK, f"paqr_prior_max: {cfg.model.paqr_prior_max}")
+    rank0_print(
+        RANK,
+        f"paqr_logit_scale_max: {cfg.model.paqr_logit_scale_max}",
+    )
+    rank0_print(
+        RANK,
+        f"paqr_first_action_only: {_config_value(cfg.model.paqr_first_action_only)}",
+    )
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
@@ -239,6 +405,7 @@ def print_training_config(cfg) -> None:
         "action_bearing_residual_lr: "
         f"{_config_value(cfg.training.action_bearing_residual_lr)}",
     )
+    rank0_print(RANK, f"paqr_lr: {_config_value(cfg.training.paqr_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
@@ -286,10 +453,12 @@ def main():
     apply_config_overrides(cfg, args.set)
     validate_training_config(cfg)
     if RANK == 0:
+        save_resolved_experiment_config(cfg, args.set)
         print_training_config(cfg)
     set_seed(cfg.training.seed)
 
     processor, tokenizer = load_processor_and_tokenizer(cfg)
+    validate_paqr_tokenizer(cfg, tokenizer)
     model = load_model(cfg)
     model_config = model.config
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
@@ -306,6 +475,37 @@ def main():
         rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
         rank0_print(RANK, f"panovggt_injection_stage: {_config_value(getattr(model_config, 'panovggt_injection_stage', None))}")
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
+        rank0_print(
+            RANK,
+            "paqr_enabled: "
+            f"{_config_value(getattr(model_config, 'paqr_enabled', None))}",
+        )
+        rank0_print(
+            RANK,
+            "paqr_action_token_ids: "
+            f"{getattr(model_config, 'paqr_action_token_ids', None)}",
+        )
+        rank0_print(
+            RANK,
+            "paqr_stop_token_id: "
+            f"{getattr(model_config, 'paqr_stop_token_id', None)}",
+        )
+        rank0_print(
+            RANK,
+            "paqr_temperature: "
+            f"{getattr(model_config, 'paqr_temperature', None)}",
+        )
+        rank0_print(
+            RANK,
+            "paqr_prior_init/max: "
+            f"{getattr(model_config, 'paqr_prior_init', None)}/"
+            f"{getattr(model_config, 'paqr_prior_max', None)}",
+        )
+        rank0_print(
+            RANK,
+            "paqr_logit_scale_max: "
+            f"{getattr(model_config, 'paqr_logit_scale_max', None)}",
+        )
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(
@@ -439,6 +639,19 @@ def main():
     set_model(cfg, model)
 
     if RANK == 0:
+        if cfg.model.paqr_enabled:
+            paqr_parameters = {
+                name: parameter
+                for name, parameter in model.paqr.named_parameters()
+            }
+            rank0_print(
+                RANK,
+                "PAQR: "
+                f"parameters={list(paqr_parameters)}, "
+                f"numel={sum(parameter.numel() for parameter in paqr_parameters.values())}, "
+                f"all_trainable={all(parameter.requires_grad for parameter in paqr_parameters.values())}, "
+                f"optimizer_lr_key=paqr, lr={cfg.training.paqr_lr}",
+            )
         print_model_parameters(model)
 
     init_wandb(cfg.wandb, training_args, RANK)
@@ -455,6 +668,7 @@ def main():
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "action_bearing_residual": cfg.training.action_bearing_residual_lr,
+            "paqr": cfg.training.paqr_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
         },
         compute_metrics=(

@@ -371,6 +371,7 @@ def evaluate_agent(
             info = env.get_metrics()
             agent.finalize_episode()
             result_row = _result_row(episode.scene_id, episode.episode_id, info)
+            result_row["executed_action_history"] = list(agent.executed_action_history)
             result_row["model_generated_actions"] = list(agent.model_generated_actions)
             result_row["model_parsed_action_sequences"] = list(agent.model_parsed_action_sequences)
             _append_result_row(result_path, split_id, result_row)
