@@ -111,12 +111,12 @@ def _load_model_config(cfg):
     )
     paqr_fields = (
         "paqr_enabled",
+        "paqr_variant",
         "paqr_action_token_ids",
         "paqr_stop_token_id",
-        "paqr_temperature",
+        "paqr_reader_dim",
         "paqr_prior_init",
         "paqr_prior_max",
-        "paqr_logit_scale_max",
         "paqr_first_action_only",
     )
     erp_crop_fields = (
@@ -174,10 +174,8 @@ def load_model(cfg):
 
     paqr = getattr(model, "paqr", None)
     if paqr is not None and bool(getattr(paqr, "enabled", False)):
-        # ZeRO-2 keeps an FP32 optimizer master copy, so PAQR still accumulates
-        # precise updates. Matching the live LM-head dtype here prevents the
-        # four tiny PAQR parameters from promoting a coalesced BF16 group to
-        # FP32 when the group is flattened by DeepSpeed.
+        # Run the lightweight reader projections in the live LM-head dtype;
+        # its small attention matrix is accumulated in FP32 inside PAQR.
         paqr.to(dtype=model.lm_head.weight.dtype)
 
     if cfg.training.gradient_checkpointing:

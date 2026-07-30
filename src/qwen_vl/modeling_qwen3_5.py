@@ -268,14 +268,26 @@ class ActionBearingResidual(nn.Module):
 
 
 def ensure_paqr_config(config) -> None:
+    if (
+        bool(getattr(config, "paqr_enabled", False))
+        and not hasattr(config, "paqr_variant")
+        and any(
+            hasattr(config, field_name)
+            for field_name in ("paqr_temperature", "paqr_logit_scale_max")
+        )
+    ):
+        raise ValueError(
+            "This checkpoint uses the legacy minimal PAQR configuration. "
+            "Full PAQR must be trained or loaded from its own checkpoint."
+        )
     defaults = {
         "paqr_enabled": False,
+        "paqr_variant": "full",
         "paqr_action_token_ids": list(PAQR_DEFAULT_ACTION_TOKEN_IDS),
         "paqr_stop_token_id": PAQR_DEFAULT_STOP_TOKEN_ID,
-        "paqr_temperature": 0.1,
+        "paqr_reader_dim": 256,
         "paqr_prior_init": 0.02,
         "paqr_prior_max": 0.25,
-        "paqr_logit_scale_max": 0.5,
         "paqr_first_action_only": True,
     }
     for field_name, default_value in defaults.items():
@@ -284,7 +296,7 @@ def ensure_paqr_config(config) -> None:
 
 
 class PanoramicActionQueryReadout(nn.Module):
-    """Read directional evidence from current-panorama tokens with LM-head queries."""
+    """Read action-conditioned evidence from the current panorama."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -300,30 +312,26 @@ class PanoramicActionQueryReadout(nn.Module):
             )
 
         self.enabled = bool(getattr(config, "paqr_enabled", False))
-        self.temperature = float(getattr(config, "paqr_temperature", 0.1))
+        self.variant = str(getattr(config, "paqr_variant", "full"))
+        if self.variant != "full":
+            raise ValueError(
+                f"This implementation requires paqr_variant='full', got {self.variant!r}"
+            )
+        self.hidden_size = int(config.text_config.hidden_size)
+        self.reader_dim = int(getattr(config, "paqr_reader_dim", 256))
         self.prior_init = float(getattr(config, "paqr_prior_init", 0.02))
         self.prior_max = float(getattr(config, "paqr_prior_max", 0.25))
-        self.logit_scale_max = float(
-            getattr(config, "paqr_logit_scale_max", 0.5)
-        )
         self.first_action_only = bool(
             getattr(config, "paqr_first_action_only", True)
         )
-        if self.temperature <= 0.0:
-            raise ValueError(
-                f"paqr_temperature must be positive, got {self.temperature}"
-            )
+        if self.reader_dim <= 0:
+            raise ValueError(f"paqr_reader_dim must be positive, got {self.reader_dim}")
         if self.prior_max <= 0.0:
             raise ValueError(f"paqr_prior_max must be positive, got {self.prior_max}")
         if not 0.0 <= self.prior_init < self.prior_max:
             raise ValueError(
                 "paqr_prior_init must satisfy 0 <= init < max, got "
                 f"init={self.prior_init}, max={self.prior_max}"
-            )
-        if self.logit_scale_max <= 0.0:
-            raise ValueError(
-                "paqr_logit_scale_max must be positive, got "
-                f"{self.logit_scale_max}"
             )
         if not self.first_action_only:
             raise ValueError(
@@ -334,72 +342,120 @@ class PanoramicActionQueryReadout(nn.Module):
         # Keep vocabulary ids as immutable Python metadata. Tiny non-persistent
         # integer buffers can be coalesced incorrectly by some ZeRO setups.
         self.action_token_id_values = action_token_ids
-        self.raw_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
-        self.raw_turn_cos = nn.Parameter(torch.zeros((), dtype=torch.float32))
-        self.raw_turn_sin = nn.Parameter(torch.zeros((), dtype=torch.float32))
-        self.raw_forward_cos = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.state_proj = nn.Linear(
+            self.hidden_size,
+            self.reader_dim,
+            bias=False,
+        )
+        self.action_proj = nn.Linear(
+            self.hidden_size,
+            self.reader_dim,
+            bias=False,
+        )
+        self.key_proj = nn.Linear(
+            self.hidden_size,
+            self.reader_dim,
+            bias=False,
+        )
+        self.value_proj = nn.Linear(
+            self.hidden_size,
+            self.reader_dim,
+            bias=False,
+        )
+        self.query_norm = nn.LayerNorm(self.reader_dim)
+        self.output_proj = nn.Linear(self.reader_dim, 1, bias=False)
+        self.raw_prior_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.initializer_range = float(
+            getattr(config.text_config, "initializer_range", 0.02)
+        )
         self.reset_parameters()
 
     @property
-    def gate(self) -> torch.Tensor:
-        return float(self.logit_scale_max) * torch.tanh(self.raw_gate.float())
+    def prior_scale(self) -> torch.Tensor:
+        return float(self.prior_max) * torch.tanh(self.raw_prior_scale.float())
 
     @property
     def action_token_ids(self) -> torch.Tensor:
         return torch.tensor(self.action_token_id_values, dtype=torch.long)
 
     def reset_parameters(self) -> None:
-        # The physical first-harmonic initialization is a fixed center; the
-        # trainable values are zero-centered residuals. Besides making the
-        # prior easy to interpret, this preserves small updates when the rest
-        # of the model is loaded in bf16.
         with torch.no_grad():
-            self.raw_gate.zero_()
-            self.raw_turn_cos.zero_()
-            self.raw_turn_sin.zero_()
-            self.raw_forward_cos.zero_()
+            for projection in (
+                self.state_proj,
+                self.action_proj,
+                self.key_proj,
+                self.value_proj,
+            ):
+                nn.init.normal_(
+                    projection.weight,
+                    mean=0.0,
+                    std=self.initializer_range,
+                )
+            self.query_norm.weight.fill_(1.0)
+            self.query_norm.bias.zero_()
+            # W_o=0 makes the complete reader an exact identity adapter before
+            # training, while still giving W_o a non-zero first-step gradient.
+            self.output_proj.weight.zero_()
+            initial_fraction = self.prior_init / self.prior_max
+            self.raw_prior_scale.fill_(_inverse_tanh(initial_fraction))
+
+    @staticmethod
+    def _unit_rms(hidden: torch.Tensor) -> torch.Tensor:
+        hidden_float = hidden.float()
+        inverse_rms = torch.rsqrt(
+            hidden_float.square().mean(dim=-1, keepdim=True) + 1e-6
+        )
+        return hidden_float * inverse_rms
 
     def circular_prior(self, yaw: torch.Tensor) -> torch.Tensor:
-        """Return bounded first-harmonic priors in [left, forward, right] order."""
-        yaw = yaw.to(device=self.raw_gate.device, dtype=torch.float32)
-        cos_yaw = torch.cos(yaw)
-        sin_yaw = torch.sin(yaw)
-        base_amplitude = _inverse_tanh(self.prior_init / self.prior_max)
+        """Return beta_a b_a(phi_i) in [left, forward, right] order."""
+        yaw = yaw.to(device=self.raw_prior_scale.device, dtype=torch.float32)
         turn_angle = math.radians(ACTION_BEARING_TURN_ANGLE_DEG)
-        turn_cos = (
-            base_amplitude * math.cos(turn_angle) + self.raw_turn_cos.float()
+        centers = yaw.new_tensor(
+            [-turn_angle, 0.0, turn_angle],
         )
-        turn_sin = (
-            base_amplitude * math.sin(turn_angle) + self.raw_turn_sin.float()
-        )
-        forward_cos = base_amplitude + self.raw_forward_cos.float()
-        left_raw = turn_cos * cos_yaw - turn_sin * sin_yaw
-        forward_raw = forward_cos * cos_yaw
-        right_raw = turn_cos * cos_yaw + turn_sin * sin_yaw
-        return float(self.prior_max) * torch.tanh(
-            torch.stack((left_raw, forward_raw, right_raw), dim=0)
-        )
+        basis = torch.cos(yaw.unsqueeze(0) - centers.unsqueeze(1))
+        return self.prior_scale.unsqueeze(1) * basis
 
     def compute_evidence(
         self,
         panorama_hidden: torch.Tensor,
+        decision_hidden: torch.Tensor,
         yaw: torch.Tensor,
         lm_head_weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if panorama_hidden.ndim != 2:
             raise ValueError(
                 "panorama_hidden must have shape [num_tokens, hidden_size], got "
                 f"{tuple(panorama_hidden.shape)}"
+            )
+        if decision_hidden.ndim != 1:
+            raise ValueError(
+                "decision_hidden must have shape [hidden_size], got "
+                f"{tuple(decision_hidden.shape)}"
             )
         if int(panorama_hidden.shape[0]) != int(yaw.numel()):
             raise ValueError(
                 "PAQR yaw/token length mismatch: "
                 f"tokens={panorama_hidden.shape[0]}, yaw={yaw.numel()}"
             )
-        if int(panorama_hidden.shape[1]) != int(lm_head_weight.shape[1]):
+        if (
+            int(panorama_hidden.shape[1]) != self.hidden_size
+            or int(decision_hidden.shape[0]) != self.hidden_size
+            or int(lm_head_weight.shape[1]) != self.hidden_size
+        ):
             raise ValueError(
-                "PAQR hidden size does not match lm_head: "
-                f"hidden={panorama_hidden.shape[1]}, lm_head={lm_head_weight.shape[1]}"
+                "PAQR hidden sizes do not match the configured text hidden size: "
+                f"panorama={panorama_hidden.shape[1]}, "
+                f"decision={decision_hidden.shape[0]}, "
+                f"lm_head={lm_head_weight.shape[1]}, "
+                f"configured={self.hidden_size}"
             )
 
         action_token_ids = self.action_token_ids.to(device=lm_head_weight.device)
@@ -409,58 +465,73 @@ class PanoramicActionQueryReadout(nn.Module):
                 f"ids={action_token_ids.tolist()}, vocab={lm_head_weight.shape[0]}"
             )
 
-        # These are the exact live LM-head rows. Detaching only this auxiliary
-        # query path prevents PAQR from learning by distorting the tied token
-        # embeddings; the normal language-model loss still trains lm_head.
-        action_queries = lm_head_weight.index_select(0, action_token_ids).detach()
-        action_queries = F.normalize(action_queries.float(), dim=-1, eps=1e-6)
-        panorama_tokens = F.normalize(
-            panorama_hidden.float(),
-            dim=-1,
-            eps=1e-6,
+        projection_dtype = self.state_proj.weight.dtype
+        # The tied LM-head rows have a much smaller raw RMS than final hidden
+        # states. Parameter-free RMS calibration prevents W_h h from drowning
+        # out W_u u_a before the learned projections have a chance to adapt.
+        action_semantics = self._unit_rms(
+            lm_head_weight.index_select(0, action_token_ids).detach()
+        ).to(dtype=projection_dtype)
+        decision_input = self._unit_rms(decision_hidden).to(
+            dtype=projection_dtype
         )
-        content_scores = action_queries @ panorama_tokens.transpose(0, 1)
-        prior = self.circular_prior(yaw).to(device=content_scores.device)
-        attention = torch.softmax(
-            content_scores / float(self.temperature) + prior,
-            dim=-1,
+        panorama_input = self._unit_rms(panorama_hidden).to(
+            dtype=projection_dtype
         )
-        evidence = (attention * content_scores).sum(dim=-1)
-        return evidence, attention, content_scores, prior
+
+        state_query = self.state_proj(decision_input).unsqueeze(0)
+        action_query = self.action_proj(action_semantics)
+        queries = self.query_norm(state_query + action_query)
+        keys = self.key_proj(panorama_input)
+        values = self.value_proj(panorama_input)
+
+        # Accumulate the very small 3 x N attention matrix in FP32. The
+        # projections themselves remain in the model dtype for efficient
+        # ZeRO-2 training.
+        content_scores = (
+            queries.float() @ keys.float().transpose(0, 1)
+        ) / math.sqrt(float(self.reader_dim))
+        prior = self.circular_prior(yaw).to(
+            device=content_scores.device,
+            dtype=content_scores.dtype,
+        )
+        attention = torch.softmax(content_scores + prior, dim=-1)
+        evidence = attention.to(dtype=values.dtype) @ values
+        return queries, evidence, attention, content_scores, prior
 
     def forward(
         self,
         panorama_hidden: torch.Tensor,
+        decision_hidden: torch.Tensor,
         yaw: torch.Tensor,
         lm_head_weight: torch.Tensor,
     ) -> torch.Tensor:
         if not self.enabled or panorama_hidden.numel() == 0:
-            return panorama_hidden.new_zeros((3,), dtype=torch.float32)
+            return panorama_hidden.new_zeros((3,))
 
-        evidence, _, _, _ = self.compute_evidence(
+        queries, evidence, _, _, _ = self.compute_evidence(
             panorama_hidden=panorama_hidden,
+            decision_hidden=decision_hidden,
             yaw=yaw,
             lm_head_weight=lm_head_weight,
         )
-        # Remove evidence common to all three bearings: PAQR should express
-        # which movement direction the panorama supports, not add a shared
-        # "move" bias. The stop logit itself is never written; as with any
-        # directional-logit change, its normalized probability can still move.
-        centered_evidence = evidence - evidence.mean()
-        return self.gate.to(device=evidence.device) * centered_evidence
+        interaction = queries * evidence
+        return self.output_proj(interaction).squeeze(-1)
 
     def diagnostics(self) -> dict[str, float]:
         with torch.no_grad():
             return {
-                "paqr/gate": float(self.gate.detach().float().cpu().item()),
-                "paqr/prior_turn_cos_raw": float(
-                    self.raw_turn_cos.detach().float().cpu().item()
+                "paqr/output_norm": float(
+                    self.output_proj.weight.detach().float().norm().cpu().item()
                 ),
-                "paqr/prior_turn_sin_raw": float(
-                    self.raw_turn_sin.detach().float().cpu().item()
+                "paqr/prior_left": float(
+                    self.prior_scale[0].detach().cpu().item()
                 ),
-                "paqr/prior_forward_cos_raw": float(
-                    self.raw_forward_cos.detach().float().cpu().item()
+                "paqr/prior_forward": float(
+                    self.prior_scale[1].detach().cpu().item()
+                ),
+                "paqr/prior_right": float(
+                    self.prior_scale[2].detach().cpu().item()
                 ),
             }
 
@@ -1077,10 +1148,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "action_bearing_residual.raw_alpha",
     )
     PAQR_STATE_KEYS = (
-        "paqr.raw_gate",
-        "paqr.raw_turn_cos",
-        "paqr.raw_turn_sin",
-        "paqr.raw_forward_cos",
+        "paqr.state_proj.weight",
+        "paqr.action_proj.weight",
+        "paqr.key_proj.weight",
+        "paqr.value_proj.weight",
+        "paqr.query_norm.weight",
+        "paqr.query_norm.bias",
+        "paqr.output_proj.weight",
+        "paqr.raw_prior_scale",
     )
 
     def __init__(self, config):
@@ -1917,6 +1992,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             logit_position = int(matching_logit_positions[0].item())
             delta = self.paqr(
                 panorama_hidden=panorama_hidden,
+                decision_hidden=hidden_states[
+                    batch_index,
+                    decision_position,
+                ],
                 yaw=yaw,
                 lm_head_weight=self.lm_head.weight,
             ).to(device=logits.device, dtype=logits.dtype)

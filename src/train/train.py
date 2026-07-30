@@ -35,10 +35,7 @@ RANK = int(os.environ.get("RANK", "0"))
 class PanoVLNTrainer(Trainer):
     NO_WEIGHT_DECAY_SUFFIXES = (
         "action_bearing_residual.raw_alpha",
-        "paqr.raw_gate",
-        "paqr.raw_turn_cos",
-        "paqr.raw_turn_sin",
-        "paqr.raw_forward_cos",
+        "paqr.raw_prior_scale",
     )
     MODULE_LR_KEYS = (
         "language_model",
@@ -117,49 +114,6 @@ class PanoVLNTrainer(Trainer):
                 }
                 grouped_parameters[group_key] = group
             grouped_parameters[group_key]["params"].append(param)
-
-        # Preserve the Pano-only optimizer grouping exactly. DeepSpeed ZeRO-2
-        # 0.18.0 fails on ranks that own no value from a four-scalar group, so
-        # merge PAQR into an existing no-decay group only when LR and dtype are
-        # identical. load_model() aligns PAQR with the live LM-head dtype while
-        # ZeRO keeps its optimizer master copy in FP32.
-        world_size = max(1, int(getattr(self.args, "world_size", 1)))
-        paqr_group_keys = [
-            key for key in grouped_parameters if key[0] == "paqr"
-        ]
-        for paqr_key in paqr_group_keys:
-            paqr_group = grouped_parameters[paqr_key]
-            paqr_numel = sum(
-                parameter.numel() for parameter in paqr_group["params"]
-            )
-            if paqr_numel >= world_size:
-                continue
-            paqr_dtypes = {
-                parameter.dtype for parameter in paqr_group["params"]
-            }
-            compatible_keys = [
-                key
-                for key, group in grouped_parameters.items()
-                if key != paqr_key
-                and key[1:] == paqr_key[1:]
-                and sum(parameter.numel() for parameter in group["params"])
-                >= world_size
-                and {
-                    parameter.dtype for parameter in group["params"]
-                }
-                == paqr_dtypes
-            ]
-            if not compatible_keys:
-                raise ValueError(
-                    "The PAQR optimizer group has fewer scalar values than the "
-                    f"data-parallel world size ({paqr_numel} < {world_size}) and "
-                    "no existing group has the same LR, weight decay, and dtype. "
-                    "For this eight-card run, keep paqr_lr equal to "
-                    "language_model_lr and PAQR aligned to the LM-head dtype."
-                )
-            target_key = compatible_keys[0]
-            grouped_parameters[target_key]["params"].extend(paqr_group["params"])
-            del grouped_parameters[paqr_key]
 
         optimizer_grouped_parameters = list(grouped_parameters.values())
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
@@ -255,6 +209,11 @@ def validate_training_config(cfg) -> None:
         )
 
     if cfg.model.paqr_enabled:
+        if str(cfg.model.paqr_variant) != "full":
+            raise ValueError(
+                "The controlled PAQR experiment requires "
+                "model.paqr_variant='full'"
+            )
         if not cfg.model.panovggt_enabled:
             raise ValueError(
                 "The controlled PAQR comparison requires panovggt_enabled=true"
@@ -293,8 +252,8 @@ def validate_training_config(cfg) -> None:
             )
         if int(cfg.model.paqr_stop_token_id) in action_token_ids:
             raise ValueError("model.paqr_stop_token_id must differ from movement ids")
-        if float(cfg.model.paqr_temperature) <= 0.0:
-            raise ValueError("model.paqr_temperature must be positive")
+        if int(cfg.model.paqr_reader_dim) <= 0:
+            raise ValueError("model.paqr_reader_dim must be positive")
         if not (
             0.0
             <= float(cfg.model.paqr_prior_init)
@@ -303,8 +262,6 @@ def validate_training_config(cfg) -> None:
             raise ValueError(
                 "model.paqr_prior_init must satisfy 0 <= init < prior_max"
             )
-        if float(cfg.model.paqr_logit_scale_max) <= 0.0:
-            raise ValueError("model.paqr_logit_scale_max must be positive")
         if not bool(cfg.model.paqr_first_action_only):
             raise ValueError(
                 "The controlled PAQR experiment requires paqr_first_action_only=true"
@@ -368,15 +325,12 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"action_bearing_alpha_init: {_config_value(cfg.model.action_bearing_alpha_init)}")
     rank0_print(RANK, f"action_bearing_alpha_max: {_config_value(cfg.model.action_bearing_alpha_max)}")
     rank0_print(RANK, f"paqr_enabled: {_config_value(cfg.model.paqr_enabled)}")
+    rank0_print(RANK, f"paqr_variant: {cfg.model.paqr_variant}")
     rank0_print(RANK, f"paqr_action_token_ids: {cfg.model.paqr_action_token_ids}")
     rank0_print(RANK, f"paqr_stop_token_id: {cfg.model.paqr_stop_token_id}")
-    rank0_print(RANK, f"paqr_temperature: {cfg.model.paqr_temperature}")
+    rank0_print(RANK, f"paqr_reader_dim: {cfg.model.paqr_reader_dim}")
     rank0_print(RANK, f"paqr_prior_init: {cfg.model.paqr_prior_init}")
     rank0_print(RANK, f"paqr_prior_max: {cfg.model.paqr_prior_max}")
-    rank0_print(
-        RANK,
-        f"paqr_logit_scale_max: {cfg.model.paqr_logit_scale_max}",
-    )
     rank0_print(
         RANK,
         f"paqr_first_action_only: {_config_value(cfg.model.paqr_first_action_only)}",
@@ -482,6 +436,11 @@ def main():
         )
         rank0_print(
             RANK,
+            "paqr_variant: "
+            f"{getattr(model_config, 'paqr_variant', None)}",
+        )
+        rank0_print(
+            RANK,
             "paqr_action_token_ids: "
             f"{getattr(model_config, 'paqr_action_token_ids', None)}",
         )
@@ -492,19 +451,14 @@ def main():
         )
         rank0_print(
             RANK,
-            "paqr_temperature: "
-            f"{getattr(model_config, 'paqr_temperature', None)}",
+            "paqr_reader_dim: "
+            f"{getattr(model_config, 'paqr_reader_dim', None)}",
         )
         rank0_print(
             RANK,
             "paqr_prior_init/max: "
             f"{getattr(model_config, 'paqr_prior_init', None)}/"
             f"{getattr(model_config, 'paqr_prior_max', None)}",
-        )
-        rank0_print(
-            RANK,
-            "paqr_logit_scale_max: "
-            f"{getattr(model_config, 'paqr_logit_scale_max', None)}",
         )
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")

@@ -20,14 +20,14 @@ class ModelConfig:
     action_bearing_alpha_init: float = 0.02
     action_bearing_alpha_max: float = 0.1
     paqr_enabled: bool = False
+    paqr_variant: str = "full"
     paqr_action_token_ids: List[int] = field(
         default_factory=lambda: [2282, 13048, 1246]
     )
     paqr_stop_token_id: int = 9215
-    paqr_temperature: float = 0.1
+    paqr_reader_dim: int = 256
     paqr_prior_init: float = 0.02
     paqr_prior_max: float = 0.25
-    paqr_logit_scale_max: float = 0.5
     paqr_first_action_only: bool = True
     panovggt_enabled: bool = False
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
