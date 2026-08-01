@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import threading
 import time
 from dataclasses import asdict
@@ -23,6 +24,10 @@ class PredictJsonRequest(BaseModel):
     images: list[str] = Field(
         ...,
         description="Base64-encoded JPEG/PNG images ordered from older to newer.",
+    )
+    interframe_actions: list[list[str]] | None = Field(
+        default=None,
+        description="Executed action spans between consecutive uploaded images.",
     )
 
 
@@ -66,6 +71,16 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
                 image_bytes.append(await upload.read())
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Upload at least one image file")
+        interframe_actions = None
+        raw_interframe_actions = form.get("interframe_actions")
+        if raw_interframe_actions is not None:
+            try:
+                interframe_actions = json.loads(str(raw_interframe_actions))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="interframe_actions must be a JSON array of action arrays",
+                ) from exc
         _log_stage(
             "/predict received "
             f"images={len(image_bytes)} instruction_chars={len(instruction)}"
@@ -73,7 +88,11 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
 
         try:
             with app.state.model_lock:
-                result = app.state.predictor.predict(instruction=instruction, images=image_bytes)
+                result = app.state.predictor.predict(
+                    instruction=instruction,
+                    images=image_bytes,
+                    interframe_actions=interframe_actions,
+                )
         except Exception as exc:
             _log_stage(
                 "/predict failed "
@@ -110,7 +129,11 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
         try:
             image_bytes = [base64.b64decode(image) for image in payload.images]
             with app.state.model_lock:
-                result = app.state.predictor.predict(instruction=payload.instruction, images=image_bytes)
+                result = app.state.predictor.predict(
+                    instruction=payload.instruction,
+                    images=image_bytes,
+                    interframe_actions=payload.interframe_actions,
+                )
         except Exception as exc:
             _log_stage(
                 "/predict_json failed "

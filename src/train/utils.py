@@ -27,7 +27,6 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "action_bearing_residual": True,
-    "paqr": False,
     "panovggt_mlp": True,
 }
 def set_seed(seed: int):
@@ -75,7 +74,6 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "action_bearing_residual": getattr(model, "action_bearing_residual", None),
-        "paqr": getattr(model, "paqr", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
         "language_model": language_model,
     }
@@ -108,16 +106,6 @@ def _load_model_config(cfg):
         "action_bearing_enabled",
         "action_bearing_alpha_init",
         "action_bearing_alpha_max",
-    )
-    paqr_fields = (
-        "paqr_enabled",
-        "paqr_variant",
-        "paqr_action_token_ids",
-        "paqr_stop_token_id",
-        "paqr_reader_dim",
-        "paqr_prior_init",
-        "paqr_prior_max",
-        "paqr_first_action_only",
     )
     erp_crop_fields = (
         "erp_top_crop_degrees",
@@ -155,9 +143,13 @@ def _load_model_config(cfg):
         apply_module_fields(False, field_names)
 
     apply_module_fields(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
-    apply_module_fields(bool(cfg.model.paqr_enabled), paqr_fields)
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
+    setattr(
+        config,
+        "interframe_action_text_enabled",
+        bool(cfg.model.interframe_action_text_enabled),
+    )
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     return config
 
@@ -171,12 +163,6 @@ def load_model(cfg):
         cache_dir=cfg.model.cache_dir,
         attn_implementation=cfg.model.attn_implementation,
     )
-
-    paqr = getattr(model, "paqr", None)
-    if paqr is not None and bool(getattr(paqr, "enabled", False)):
-        # Run the lightweight reader projections in the live LM-head dtype;
-        # its small attention matrix is accumulated in FP32 inside PAQR.
-        paqr.to(dtype=model.lm_head.weight.dtype)
 
     if cfg.training.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
@@ -233,37 +219,6 @@ def load_processor_and_tokenizer(cfg):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return processor, tokenizer
-
-
-def validate_paqr_tokenizer(cfg, tokenizer) -> None:
-    if not bool(getattr(cfg.model, "paqr_enabled", False)):
-        return
-
-    action_words = ("left", "forward", "right")
-    configured_ids = tuple(int(value) for value in cfg.model.paqr_action_token_ids)
-    if len(configured_ids) != len(action_words):
-        raise ValueError(
-            "model.paqr_action_token_ids must contain [left, forward, right]"
-        )
-    expected = dict(zip(action_words, configured_ids))
-    expected["stop"] = int(cfg.model.paqr_stop_token_id)
-
-    for word, expected_id in expected.items():
-        token_ids = tokenizer.encode(word, add_special_tokens=False)
-        if token_ids != [expected_id]:
-            raise ValueError(
-                "PAQR tokenizer contract changed: "
-                f"{word!r} encoded as {token_ids}, expected [{expected_id}]"
-            )
-        sequence_ids = tokenizer.encode(
-            f"{word} stop stop stop",
-            add_special_tokens=False,
-        )
-        if not sequence_ids or int(sequence_ids[0]) != expected_id:
-            raise ValueError(
-                "PAQR first-action tokenizer contract changed for "
-                f"{word!r}: sequence ids={sequence_ids}, expected first={expected_id}"
-            )
 
 
 def load_wandb_module(required: bool = False):

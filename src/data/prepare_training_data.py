@@ -373,6 +373,28 @@ def build_vln_images(
     return episode_image_list[:current_frame_index + 1]
 
 
+def resolve_executed_action_history(
+    episode_item: Dict[str, Any],
+    expert_actions: List[int],
+) -> List[int]:
+    executed_actions = [
+        int(action_id)
+        for action_id in episode_item.get("executed_actions", expert_actions)
+    ]
+    if len(executed_actions) != len(expert_actions):
+        raise ValueError(
+            "DAgger expert/executed action histories must have equal length, got "
+            f"episode_id={episode_item.get('episode_id')}, "
+            f"expert={len(expert_actions)}, executed={len(executed_actions)}"
+        )
+    if not executed_actions or executed_actions[-1] != STOP_ACTION_ID:
+        raise ValueError(
+            "Executed action history must end in stop for episode "
+            f"{episode_item.get('episode_id')}"
+        )
+    return executed_actions
+
+
 def process_dataset(
     selected_subset_list: List[str],
     dataset_config: Dict[str, Dict[str, str]],
@@ -403,8 +425,12 @@ def process_dataset(
         for episode_item in progress:
             episode_id = episode_item["episode_id"]
             instruction = episode_item["instruction"]
-            actions = episode_item["actions"]
+            actions = [int(action_id) for action_id in episode_item["actions"]]
             assert actions[-1] == 0
+            executed_actions = resolve_executed_action_history(
+                episode_item=episode_item,
+                expert_actions=actions,
+            )
 
             episode_image_dir = annotation_image_id(episode_item)
             episode_image_path = os.path.join(image_path, episode_image_dir)
@@ -445,6 +471,10 @@ def process_dataset(
                     "instruction": instruction,
                     "action_sequence": list(action_chunk["texts"]),
                     "images": list(user_images),
+                    "history_actions": [
+                        action_id_to_str(action_id)
+                        for action_id in executed_actions[:action_chunk["start_step"]]
+                    ],
                     "episode_id": str(episode_id),
                     # Keep the label identical for paired ScaleVLN rewrite
                     # ablation so the published samples differ only in instruction.

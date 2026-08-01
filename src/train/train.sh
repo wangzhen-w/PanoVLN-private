@@ -7,19 +7,19 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/data2/model/ablation_new/action_new/panovggt_0.20_lr2e-5_singlepoint_fullpaqr_lr2e-5_8card"
+OUTPUT_DIR="/workspace/data2/model/ablation_new/memory/panovggt_0.20_lr2e-5_singlepoint_interframe_motion_summary_8card"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT="29520"
 
 if (( $# != 0 )); then
-    echo "The controlled PanoVGGT + PAQR launcher does not accept overrides: $*" >&2
+    echo "The controlled PanoVGGT + inter-frame action-text launcher does not accept overrides: $*" >&2
     exit 1
 fi
 
 if [[ -d "$OUTPUT_DIR" ]] && [[ -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-    echo "Refusing to reuse non-empty PAQR output directory: $OUTPUT_DIR" >&2
+    echo "Refusing to reuse non-empty experiment output directory: $OUTPUT_DIR" >&2
     exit 1
 fi
 

@@ -213,6 +213,34 @@ def selected_history(
     return [history[index] for index in indices]
 
 
+def selected_history_with_action_spans(
+    history: Sequence[bytes],
+    action_history: Sequence[str],
+    *,
+    max_memory_images: int,
+    memory_pool_window_frames: int,
+) -> tuple[list[bytes], list[list[str]]]:
+    if len(action_history) != max(0, len(history) - 1):
+        raise ValueError(
+            "Action history is not aligned with captured frames: "
+            f"actions={len(action_history)}, frames={len(history)}"
+        )
+    if not history:
+        return [], []
+    indices = build_vln_image_selection(
+        current_step=len(history) - 1,
+        last_frame_index=len(history) - 1,
+        max_memory_images=max_memory_images,
+        memory_pool_window_frames=memory_pool_window_frames,
+    )
+    selected_images = [history[index] for index in indices]
+    action_spans = [
+        list(action_history[start_index:end_index])
+        for start_index, end_index in zip(indices, indices[1:])
+    ]
+    return selected_images, action_spans
+
+
 def prepare_upload_images(
     images: Sequence[bytes],
     *,
@@ -949,12 +977,16 @@ class VLNHttpClient:
         *,
         instruction: str,
         images: Sequence[bytes],
+        interframe_actions: Sequence[Sequence[str]],
     ) -> dict:
         files = [
             ("images", (f"frame_{index:03d}.jpg", image, "image/jpeg"))
             for index, image in enumerate(images)
         ]
-        data = {"instruction": instruction}
+        data = {
+            "instruction": instruction,
+            "interframe_actions": json.dumps(list(interframe_actions)),
+        }
         response = self.session.post(
             self.predict_url,
             data=data,
@@ -982,14 +1014,16 @@ def request_prediction(
     *,
     instruction: str,
     history_snapshot: Sequence[bytes],
+    action_history_snapshot: Sequence[str],
     max_memory_images: int,
     memory_pool_window_frames: int,
     upload_image_mode: str,
     jpeg_quality: int,
     upload_size: tuple[int, int],
 ) -> PredictionResult:
-    selected_images = selected_history(
-        history_snapshot,
+    selected_images, interframe_actions = selected_history_with_action_spans(
+        history=history_snapshot,
+        action_history=action_history_snapshot,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
     )
@@ -1004,6 +1038,7 @@ def request_prediction(
     result = client.predict(
         instruction=instruction,
         images=request_images,
+        interframe_actions=interframe_actions,
     )
     return PredictionResult(
         actions=normalize_actions(result.get("executable_actions") or result.get("actions") or []),
@@ -1265,6 +1300,7 @@ def main() -> None:
     backend = build_backend(args)
     client = VLNHttpClient(args.server_base_url, timeout_s=args.request_timeout)
     history: deque[bytes] = deque(maxlen=max(1, args.history_limit))
+    action_history: deque[str] = deque(maxlen=max(0, args.history_limit - 1))
     video_recorder = (
         NavigationVideoRecorder(
             camera,
@@ -1359,6 +1395,7 @@ def main() -> None:
                     client,
                     instruction=instruction,
                     history_snapshot=list(history),
+                    action_history_snapshot=list(action_history),
                     max_memory_images=args.upload_max_memory_images,
                     memory_pool_window_frames=args.upload_memory_pool_window_frames,
                     upload_image_mode=args.upload_image_mode,
@@ -1427,6 +1464,7 @@ def main() -> None:
                     break
                 time.sleep(max(0.0, motion.settle_time_s))
                 captured_frame = camera.read_jpeg(flush_frames=args.capture_flush_frames)
+                action_history.append(action)
                 history.append(captured_frame)
                 saved_path = save_navigation_frame(
                     save_image_dir,
@@ -1458,6 +1496,7 @@ def main() -> None:
                             "client": client,
                             "instruction": instruction,
                             "history_snapshot": list(history),
+                            "action_history_snapshot": list(action_history),
                             "max_memory_images": args.upload_max_memory_images,
                             "memory_pool_window_frames": args.upload_memory_pool_window_frames,
                             "upload_image_mode": args.upload_image_mode,

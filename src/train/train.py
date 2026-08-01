@@ -26,7 +26,6 @@ from utils import (
     set_model,
     set_seed,
     sync_model_special_tokens,
-    validate_paqr_tokenizer,
 )
 
 RANK = int(os.environ.get("RANK", "0"))
@@ -35,14 +34,12 @@ RANK = int(os.environ.get("RANK", "0"))
 class PanoVLNTrainer(Trainer):
     NO_WEIGHT_DECAY_SUFFIXES = (
         "action_bearing_residual.raw_alpha",
-        "paqr.raw_prior_scale",
     )
     MODULE_LR_KEYS = (
         "language_model",
         "visual",
         "visual_merger",
         "action_bearing_residual",
-        "paqr",
         "panovggt_mlp",
     )
 
@@ -74,8 +71,6 @@ class PanoVLNTrainer(Trainer):
     def _module_lr_key_for_parameter(self, name: str):
         if self._name_has_module(name, "action_bearing_residual"):
             return "action_bearing_residual"
-        if self._name_has_module(name, "paqr"):
-            return "paqr"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -201,87 +196,6 @@ def save_resolved_experiment_config(cfg, overrides) -> None:
 
 
 def validate_training_config(cfg) -> None:
-    trainable_modules = cfg.model.trainable_modules or {}
-    paqr_trainable = bool(trainable_modules.get("paqr", False))
-    if paqr_trainable and not cfg.model.paqr_enabled:
-        raise ValueError(
-            "trainable_modules.paqr=true requires model.paqr_enabled=true"
-        )
-
-    if cfg.model.paqr_enabled:
-        if str(cfg.model.paqr_variant) != "full":
-            raise ValueError(
-                "The controlled PAQR experiment requires "
-                "model.paqr_variant='full'"
-            )
-        if not cfg.model.panovggt_enabled:
-            raise ValueError(
-                "The controlled PAQR comparison requires panovggt_enabled=true"
-            )
-        if cfg.model.action_bearing_enabled:
-            raise ValueError(
-                "PAQR requires action_bearing_enabled=false; the legacy residual "
-                "must not modify the same action experiment"
-            )
-        if bool(trainable_modules.get("action_bearing_residual", False)):
-            raise ValueError(
-                "The controlled PAQR experiment must keep "
-                "trainable_modules.action_bearing_residual=false"
-            )
-        if not bool(trainable_modules.get("panovggt_mlp", False)):
-            raise ValueError(
-                "The controlled PAQR run keeps the original panovggt_mlp "
-                "trainable, matching the Pano-only baseline"
-            )
-        if not paqr_trainable:
-            raise ValueError(
-                "PAQR requires trainable_modules.paqr=true"
-            )
-        if (
-            cfg.training.paqr_lr is None
-            or float(cfg.training.paqr_lr) <= 0.0
-        ):
-            raise ValueError("PAQR requires a positive training.paqr_lr")
-        action_token_ids = [
-            int(token_id) for token_id in cfg.model.paqr_action_token_ids
-        ]
-        if len(action_token_ids) != 3 or len(set(action_token_ids)) != 3:
-            raise ValueError(
-                "model.paqr_action_token_ids must contain three distinct ids in "
-                "[left, forward, right] order"
-            )
-        if int(cfg.model.paqr_stop_token_id) in action_token_ids:
-            raise ValueError("model.paqr_stop_token_id must differ from movement ids")
-        if int(cfg.model.paqr_reader_dim) <= 0:
-            raise ValueError("model.paqr_reader_dim must be positive")
-        if not (
-            0.0
-            <= float(cfg.model.paqr_prior_init)
-            < float(cfg.model.paqr_prior_max)
-        ):
-            raise ValueError(
-                "model.paqr_prior_init must satisfy 0 <= init < prior_max"
-            )
-        if not bool(cfg.model.paqr_first_action_only):
-            raise ValueError(
-                "The controlled PAQR experiment requires paqr_first_action_only=true"
-            )
-        if cfg.model.panovggt_feature_source != "aggregator":
-            raise ValueError(
-                "The controlled PAQR comparison keeps "
-                "panovggt_feature_source='aggregator'"
-            )
-        if cfg.model.panovggt_injection_stage != "pre_merger":
-            raise ValueError(
-                "The controlled PAQR comparison requires "
-                "panovggt_injection_stage='pre_merger'"
-            )
-        if cfg.model.panovggt_sampling_mode != "singlepoint":
-            raise ValueError(
-                "The controlled PAQR comparison requires "
-                "panovggt_sampling_mode='singlepoint'"
-            )
-
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
         return
@@ -321,20 +235,14 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
+    rank0_print(
+        RANK,
+        "interframe_action_text_enabled: "
+        f"{_config_value(cfg.model.interframe_action_text_enabled)}",
+    )
     rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
     rank0_print(RANK, f"action_bearing_alpha_init: {_config_value(cfg.model.action_bearing_alpha_init)}")
     rank0_print(RANK, f"action_bearing_alpha_max: {_config_value(cfg.model.action_bearing_alpha_max)}")
-    rank0_print(RANK, f"paqr_enabled: {_config_value(cfg.model.paqr_enabled)}")
-    rank0_print(RANK, f"paqr_variant: {cfg.model.paqr_variant}")
-    rank0_print(RANK, f"paqr_action_token_ids: {cfg.model.paqr_action_token_ids}")
-    rank0_print(RANK, f"paqr_stop_token_id: {cfg.model.paqr_stop_token_id}")
-    rank0_print(RANK, f"paqr_reader_dim: {cfg.model.paqr_reader_dim}")
-    rank0_print(RANK, f"paqr_prior_init: {cfg.model.paqr_prior_init}")
-    rank0_print(RANK, f"paqr_prior_max: {cfg.model.paqr_prior_max}")
-    rank0_print(
-        RANK,
-        f"paqr_first_action_only: {_config_value(cfg.model.paqr_first_action_only)}",
-    )
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
@@ -359,7 +267,6 @@ def print_training_config(cfg) -> None:
         "action_bearing_residual_lr: "
         f"{_config_value(cfg.training.action_bearing_residual_lr)}",
     )
-    rank0_print(RANK, f"paqr_lr: {_config_value(cfg.training.paqr_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
@@ -412,7 +319,6 @@ def main():
     set_seed(cfg.training.seed)
 
     processor, tokenizer = load_processor_and_tokenizer(cfg)
-    validate_paqr_tokenizer(cfg, tokenizer)
     model = load_model(cfg)
     model_config = model.config
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
@@ -422,6 +328,13 @@ def main():
     effective_erp_bottom_crop_degrees = float(
         getattr(model_config, "erp_bottom_crop_degrees", cfg.model.erp_bottom_crop_degrees)
     )
+    effective_interframe_action_text_enabled = bool(
+        getattr(
+            model_config,
+            "interframe_action_text_enabled",
+            cfg.model.interframe_action_text_enabled,
+        )
+    )
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
@@ -429,39 +342,13 @@ def main():
         rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
         rank0_print(RANK, f"panovggt_injection_stage: {_config_value(getattr(model_config, 'panovggt_injection_stage', None))}")
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
-        rank0_print(
-            RANK,
-            "paqr_enabled: "
-            f"{_config_value(getattr(model_config, 'paqr_enabled', None))}",
-        )
-        rank0_print(
-            RANK,
-            "paqr_variant: "
-            f"{getattr(model_config, 'paqr_variant', None)}",
-        )
-        rank0_print(
-            RANK,
-            "paqr_action_token_ids: "
-            f"{getattr(model_config, 'paqr_action_token_ids', None)}",
-        )
-        rank0_print(
-            RANK,
-            "paqr_stop_token_id: "
-            f"{getattr(model_config, 'paqr_stop_token_id', None)}",
-        )
-        rank0_print(
-            RANK,
-            "paqr_reader_dim: "
-            f"{getattr(model_config, 'paqr_reader_dim', None)}",
-        )
-        rank0_print(
-            RANK,
-            "paqr_prior_init/max: "
-            f"{getattr(model_config, 'paqr_prior_init', None)}/"
-            f"{getattr(model_config, 'paqr_prior_max', None)}",
-        )
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
+        rank0_print(
+            RANK,
+            "interframe_action_text_enabled: "
+            f"{_config_value(effective_interframe_action_text_enabled)}",
+        )
         rank0_print(
             RANK,
             f"action_bearing_enabled: "
@@ -492,6 +379,7 @@ def main():
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
+        interframe_action_text_enabled=effective_interframe_action_text_enabled,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
         prompt_format=cfg.data.prompt_format,
@@ -547,6 +435,7 @@ def main():
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,
+            interframe_action_text_enabled=effective_interframe_action_text_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
@@ -593,19 +482,6 @@ def main():
     set_model(cfg, model)
 
     if RANK == 0:
-        if cfg.model.paqr_enabled:
-            paqr_parameters = {
-                name: parameter
-                for name, parameter in model.paqr.named_parameters()
-            }
-            rank0_print(
-                RANK,
-                "PAQR: "
-                f"parameters={list(paqr_parameters)}, "
-                f"numel={sum(parameter.numel() for parameter in paqr_parameters.values())}, "
-                f"all_trainable={all(parameter.requires_grad for parameter in paqr_parameters.values())}, "
-                f"optimizer_lr_key=paqr, lr={cfg.training.paqr_lr}",
-            )
         print_model_parameters(model)
 
     init_wandb(cfg.wandb, training_args, RANK)
@@ -622,7 +498,6 @@ def main():
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "action_bearing_residual": cfg.training.action_bearing_residual_lr,
-            "paqr": cfg.training.paqr_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
         },
         compute_metrics=(

@@ -31,6 +31,7 @@ from src.train.data.data import (
     build_erp_image_geometry_batch,
     build_vln_image_selection,
     build_vln_user_content,
+    format_vln_interframe_actions,
     preprocess_panovggt_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
@@ -111,18 +112,47 @@ def _select_images(
     *,
     max_memory_images: int,
     memory_pool_window_frames: int,
-) -> list[Image.Image]:
+) -> tuple[list[Image.Image], list[int]]:
     if not images:
         raise ValueError("At least one image is required")
     if max_memory_images <= 0:
-        return [images[-1]]
+        selected_indices = [len(images) - 1]
+        return [images[-1]], selected_indices
     selected_indices = build_vln_image_selection(
         current_step=len(images) - 1,
         last_frame_index=len(images) - 1,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
     )
-    return [images[index] for index in selected_indices]
+    return [images[index] for index in selected_indices], selected_indices
+
+
+def _select_interframe_action_texts(
+    interframe_actions: Sequence[Sequence[str]],
+    selected_indices: Sequence[int],
+    num_input_images: int,
+) -> list[str]:
+    if isinstance(interframe_actions, (str, bytes)) or not isinstance(
+        interframe_actions,
+        Sequence,
+    ):
+        raise ValueError("interframe_actions must be a sequence of action spans")
+    expected_num_edges = num_input_images - 1
+    if len(interframe_actions) != expected_num_edges:
+        raise ValueError(
+            "interframe_actions must contain one action span per input-image edge, got "
+            f"{len(interframe_actions)} vs {expected_num_edges}"
+        )
+
+    selected_texts = []
+    for start_index, end_index in zip(selected_indices, selected_indices[1:]):
+        flattened_actions = []
+        for edge_actions in interframe_actions[start_index:end_index]:
+            if isinstance(edge_actions, (str, bytes)) or not isinstance(edge_actions, Sequence):
+                raise ValueError("Each interframe_actions entry must be a sequence of actions")
+            flattened_actions.extend(edge_actions)
+        selected_texts.append(format_vln_interframe_actions(flattened_actions))
+    return selected_texts
 
 
 def parse_action_sequence(text: str, max_actions: int = ACTION_SEQUENCE_LENGTH) -> list[str]:
@@ -391,6 +421,7 @@ class PanoVLNPredictor:
         self,
         instruction: str,
         images: Sequence[Image.Image | bytes | bytearray | str | os.PathLike[str]],
+        interframe_actions: Optional[Sequence[Sequence[str]]] = None,
     ) -> PredictionResult:
         instruction = instruction.strip()
         if not instruction:
@@ -399,12 +430,26 @@ class PanoVLNPredictor:
         _log_stage(f"predict started raw_images={len(images)} instruction_chars={len(instruction)}")
 
         loaded_images = [_load_image(image) for image in images]
-        selected_images = _select_images(
+        selected_images, selected_indices = _select_images(
             loaded_images,
             max_memory_images=self.config.max_memory_images,
             memory_pool_window_frames=self.config.memory_pool_window_frames,
         )
         _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
+        interframe_action_texts = None
+        if bool(getattr(self.model.config, "interframe_action_text_enabled", False)):
+            if interframe_actions is None:
+                if len(loaded_images) == 1:
+                    interframe_actions = []
+                else:
+                    raise ValueError(
+                        "This checkpoint requires interframe_actions for multi-image inference"
+                    )
+            interframe_action_texts = _select_interframe_action_texts(
+                interframe_actions=interframe_actions,
+                selected_indices=selected_indices,
+                num_input_images=len(loaded_images),
+            )
         processed_images, panovggt_pixel_values = self._prepare_images(selected_images)
         _log_stage(
             "images preprocessed "
@@ -422,6 +467,7 @@ class PanoVLNPredictor:
                 "content": build_vln_user_content(
                     instruction=instruction,
                     num_images=len(processed_images),
+                    interframe_action_texts=interframe_action_texts,
                 ),
             },
         ]

@@ -578,6 +578,7 @@ def model_predict_action_sequence(agent: PanoVLN_Agent, instruction: str):
     return agent._predict_action_sequence_from_images(
         instruction=instruction,
         selected_images=selected_images,
+        selected_indices=selected_indices,
     )
 
 
@@ -591,6 +592,7 @@ def execute_and_record_one_action(
     observation = env.step(int(action_id))
     if int(action_id) == STOP_ACTION:
         return observation, frame_index
+    agent.interframe_action_history.append(int(action_id))
     save_episode_frame(episode_image_dir, frame_index, observation["rgb"])
     append_history_image(agent, observation)
     return observation, frame_index + 1
@@ -795,6 +797,7 @@ def collect_raw_dagger_episode(
         "episode_id": int(dagger_id),
         "instruction": instruction,
         "actions": expert_actions,
+        "executed_actions": executed_actions,
     }
     summary = {
         "episode_id": int(dagger_id),

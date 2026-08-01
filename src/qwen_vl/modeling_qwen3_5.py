@@ -7,11 +7,7 @@ from types import MethodType
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5CausalLMOutputWithPast,
-    Qwen3_5ForConditionalGeneration,
-)
-from transformers.utils import can_return_tuple
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
 
 PANOVGGT_AGGREGATOR_LAYER = -1
@@ -42,8 +38,6 @@ ACTION_BEARING_BIN_TOKEN_IDS = (
     (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
     (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
 )
-PAQR_DEFAULT_ACTION_TOKEN_IDS = (2282, 13048, 1246)  # left, forward, right
-PAQR_DEFAULT_STOP_TOKEN_ID = 9215
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
@@ -53,11 +47,6 @@ VENDORED_PANOVGGT_CONFIG_PATH = VENDORED_PANOVGGT_DIR / "training" / "config" / 
 def _inverse_sigmoid(value: float) -> float:
     value = min(max(float(value), 1e-6), 1.0 - 1e-6)
     return math.log(value / (1.0 - value))
-
-
-def _inverse_tanh(value: float) -> float:
-    value = min(max(float(value), -1.0 + 1e-6), 1.0 - 1e-6)
-    return 0.5 * math.log((1.0 + value) / (1.0 - value))
 
 
 def _bounded_raw_alpha(alpha_init: float, alpha_max: float) -> torch.Tensor:
@@ -265,275 +254,6 @@ class ActionBearingResidual(nn.Module):
             device=image_tokens.device,
             dtype=image_tokens.dtype,
         )
-
-
-def ensure_paqr_config(config) -> None:
-    if (
-        bool(getattr(config, "paqr_enabled", False))
-        and not hasattr(config, "paqr_variant")
-        and any(
-            hasattr(config, field_name)
-            for field_name in ("paqr_temperature", "paqr_logit_scale_max")
-        )
-    ):
-        raise ValueError(
-            "This checkpoint uses the legacy minimal PAQR configuration. "
-            "Full PAQR must be trained or loaded from its own checkpoint."
-        )
-    defaults = {
-        "paqr_enabled": False,
-        "paqr_variant": "full",
-        "paqr_action_token_ids": list(PAQR_DEFAULT_ACTION_TOKEN_IDS),
-        "paqr_stop_token_id": PAQR_DEFAULT_STOP_TOKEN_ID,
-        "paqr_reader_dim": 256,
-        "paqr_prior_init": 0.02,
-        "paqr_prior_max": 0.25,
-        "paqr_first_action_only": True,
-    }
-    for field_name, default_value in defaults.items():
-        if not hasattr(config, field_name):
-            setattr(config, field_name, default_value)
-
-
-class PanoramicActionQueryReadout(nn.Module):
-    """Read action-conditioned evidence from the current panorama."""
-
-    def __init__(self, config) -> None:
-        super().__init__()
-        ensure_paqr_config(config)
-
-        action_token_ids = tuple(
-            int(token_id) for token_id in getattr(config, "paqr_action_token_ids")
-        )
-        if len(action_token_ids) != 3 or len(set(action_token_ids)) != 3:
-            raise ValueError(
-                "paqr_action_token_ids must contain three distinct ids in "
-                f"[left, forward, right] order, got {action_token_ids}"
-            )
-
-        self.enabled = bool(getattr(config, "paqr_enabled", False))
-        self.variant = str(getattr(config, "paqr_variant", "full"))
-        if self.variant != "full":
-            raise ValueError(
-                f"This implementation requires paqr_variant='full', got {self.variant!r}"
-            )
-        self.hidden_size = int(config.text_config.hidden_size)
-        self.reader_dim = int(getattr(config, "paqr_reader_dim", 256))
-        self.prior_init = float(getattr(config, "paqr_prior_init", 0.02))
-        self.prior_max = float(getattr(config, "paqr_prior_max", 0.25))
-        self.first_action_only = bool(
-            getattr(config, "paqr_first_action_only", True)
-        )
-        if self.reader_dim <= 0:
-            raise ValueError(f"paqr_reader_dim must be positive, got {self.reader_dim}")
-        if self.prior_max <= 0.0:
-            raise ValueError(f"paqr_prior_max must be positive, got {self.prior_max}")
-        if not 0.0 <= self.prior_init < self.prior_max:
-            raise ValueError(
-                "paqr_prior_init must satisfy 0 <= init < max, got "
-                f"init={self.prior_init}, max={self.prior_max}"
-            )
-        if not self.first_action_only:
-            raise ValueError(
-                "This PAQR implementation is deliberately restricted to the first "
-                "action token; set paqr_first_action_only=true"
-            )
-
-        # Keep vocabulary ids as immutable Python metadata. Tiny non-persistent
-        # integer buffers can be coalesced incorrectly by some ZeRO setups.
-        self.action_token_id_values = action_token_ids
-        self.state_proj = nn.Linear(
-            self.hidden_size,
-            self.reader_dim,
-            bias=False,
-        )
-        self.action_proj = nn.Linear(
-            self.hidden_size,
-            self.reader_dim,
-            bias=False,
-        )
-        self.key_proj = nn.Linear(
-            self.hidden_size,
-            self.reader_dim,
-            bias=False,
-        )
-        self.value_proj = nn.Linear(
-            self.hidden_size,
-            self.reader_dim,
-            bias=False,
-        )
-        self.query_norm = nn.LayerNorm(self.reader_dim)
-        self.output_proj = nn.Linear(self.reader_dim, 1, bias=False)
-        self.raw_prior_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-        self.initializer_range = float(
-            getattr(config.text_config, "initializer_range", 0.02)
-        )
-        self.reset_parameters()
-
-    @property
-    def prior_scale(self) -> torch.Tensor:
-        return float(self.prior_max) * torch.tanh(self.raw_prior_scale.float())
-
-    @property
-    def action_token_ids(self) -> torch.Tensor:
-        return torch.tensor(self.action_token_id_values, dtype=torch.long)
-
-    def reset_parameters(self) -> None:
-        with torch.no_grad():
-            for projection in (
-                self.state_proj,
-                self.action_proj,
-                self.key_proj,
-                self.value_proj,
-            ):
-                nn.init.normal_(
-                    projection.weight,
-                    mean=0.0,
-                    std=self.initializer_range,
-                )
-            self.query_norm.weight.fill_(1.0)
-            self.query_norm.bias.zero_()
-            # W_o=0 makes the complete reader an exact identity adapter before
-            # training, while still giving W_o a non-zero first-step gradient.
-            self.output_proj.weight.zero_()
-            initial_fraction = self.prior_init / self.prior_max
-            self.raw_prior_scale.fill_(_inverse_tanh(initial_fraction))
-
-    @staticmethod
-    def _unit_rms(hidden: torch.Tensor) -> torch.Tensor:
-        hidden_float = hidden.float()
-        inverse_rms = torch.rsqrt(
-            hidden_float.square().mean(dim=-1, keepdim=True) + 1e-6
-        )
-        return hidden_float * inverse_rms
-
-    def circular_prior(self, yaw: torch.Tensor) -> torch.Tensor:
-        """Return beta_a b_a(phi_i) in [left, forward, right] order."""
-        yaw = yaw.to(device=self.raw_prior_scale.device, dtype=torch.float32)
-        turn_angle = math.radians(ACTION_BEARING_TURN_ANGLE_DEG)
-        centers = yaw.new_tensor(
-            [-turn_angle, 0.0, turn_angle],
-        )
-        basis = torch.cos(yaw.unsqueeze(0) - centers.unsqueeze(1))
-        return self.prior_scale.unsqueeze(1) * basis
-
-    def compute_evidence(
-        self,
-        panorama_hidden: torch.Tensor,
-        decision_hidden: torch.Tensor,
-        yaw: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        if panorama_hidden.ndim != 2:
-            raise ValueError(
-                "panorama_hidden must have shape [num_tokens, hidden_size], got "
-                f"{tuple(panorama_hidden.shape)}"
-            )
-        if decision_hidden.ndim != 1:
-            raise ValueError(
-                "decision_hidden must have shape [hidden_size], got "
-                f"{tuple(decision_hidden.shape)}"
-            )
-        if int(panorama_hidden.shape[0]) != int(yaw.numel()):
-            raise ValueError(
-                "PAQR yaw/token length mismatch: "
-                f"tokens={panorama_hidden.shape[0]}, yaw={yaw.numel()}"
-            )
-        if (
-            int(panorama_hidden.shape[1]) != self.hidden_size
-            or int(decision_hidden.shape[0]) != self.hidden_size
-            or int(lm_head_weight.shape[1]) != self.hidden_size
-        ):
-            raise ValueError(
-                "PAQR hidden sizes do not match the configured text hidden size: "
-                f"panorama={panorama_hidden.shape[1]}, "
-                f"decision={decision_hidden.shape[0]}, "
-                f"lm_head={lm_head_weight.shape[1]}, "
-                f"configured={self.hidden_size}"
-            )
-
-        action_token_ids = self.action_token_ids.to(device=lm_head_weight.device)
-        if int(action_token_ids.max().item()) >= int(lm_head_weight.shape[0]):
-            raise ValueError(
-                "PAQR action token id exceeds lm_head vocabulary size: "
-                f"ids={action_token_ids.tolist()}, vocab={lm_head_weight.shape[0]}"
-            )
-
-        projection_dtype = self.state_proj.weight.dtype
-        # The tied LM-head rows have a much smaller raw RMS than final hidden
-        # states. Parameter-free RMS calibration prevents W_h h from drowning
-        # out W_u u_a before the learned projections have a chance to adapt.
-        action_semantics = self._unit_rms(
-            lm_head_weight.index_select(0, action_token_ids).detach()
-        ).to(dtype=projection_dtype)
-        decision_input = self._unit_rms(decision_hidden).to(
-            dtype=projection_dtype
-        )
-        panorama_input = self._unit_rms(panorama_hidden).to(
-            dtype=projection_dtype
-        )
-
-        state_query = self.state_proj(decision_input).unsqueeze(0)
-        action_query = self.action_proj(action_semantics)
-        queries = self.query_norm(state_query + action_query)
-        keys = self.key_proj(panorama_input)
-        values = self.value_proj(panorama_input)
-
-        # Accumulate the very small 3 x N attention matrix in FP32. The
-        # projections themselves remain in the model dtype for efficient
-        # ZeRO-2 training.
-        content_scores = (
-            queries.float() @ keys.float().transpose(0, 1)
-        ) / math.sqrt(float(self.reader_dim))
-        prior = self.circular_prior(yaw).to(
-            device=content_scores.device,
-            dtype=content_scores.dtype,
-        )
-        attention = torch.softmax(content_scores + prior, dim=-1)
-        evidence = attention.to(dtype=values.dtype) @ values
-        return queries, evidence, attention, content_scores, prior
-
-    def forward(
-        self,
-        panorama_hidden: torch.Tensor,
-        decision_hidden: torch.Tensor,
-        yaw: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self.enabled or panorama_hidden.numel() == 0:
-            return panorama_hidden.new_zeros((3,))
-
-        queries, evidence, _, _, _ = self.compute_evidence(
-            panorama_hidden=panorama_hidden,
-            decision_hidden=decision_hidden,
-            yaw=yaw,
-            lm_head_weight=lm_head_weight,
-        )
-        interaction = queries * evidence
-        return self.output_proj(interaction).squeeze(-1)
-
-    def diagnostics(self) -> dict[str, float]:
-        with torch.no_grad():
-            return {
-                "paqr/output_norm": float(
-                    self.output_proj.weight.detach().float().norm().cpu().item()
-                ),
-                "paqr/prior_left": float(
-                    self.prior_scale[0].detach().cpu().item()
-                ),
-                "paqr/prior_forward": float(
-                    self.prior_scale[1].detach().cpu().item()
-                ),
-                "paqr/prior_right": float(
-                    self.prior_scale[2].detach().cpu().item()
-                ),
-            }
 
 
 def ensure_panovggt_config(config) -> None:
@@ -1126,7 +846,7 @@ class PanoVGGTGeometryMLP(nn.Module):
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
     _keys_to_ignore_on_load_unexpected = list(
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
-    ) + [r"panovggt\..*", r"paqr\..*"]
+    ) + [r"panovggt\..*"]
 
     PANOVGGT_STATE_KEYS = (
         "panovggt_mlp.alpha_value",
@@ -1147,41 +867,22 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "action_bearing_residual.output_norm.weight",
         "action_bearing_residual.raw_alpha",
     )
-    PAQR_STATE_KEYS = (
-        "paqr.state_proj.weight",
-        "paqr.action_proj.weight",
-        "paqr.key_proj.weight",
-        "paqr.value_proj.weight",
-        "paqr.query_norm.weight",
-        "paqr.query_norm.bias",
-        "paqr.output_proj.weight",
-        "paqr.raw_prior_scale",
-    )
 
     def __init__(self, config):
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
         action_bearing_enabled = bool(
             getattr(config, "action_bearing_enabled", False)
         )
-        paqr_enabled = bool(getattr(config, "paqr_enabled", False))
-        if action_bearing_enabled and paqr_enabled:
-            raise ValueError(
-                "action_bearing_enabled and paqr_enabled cannot both be true"
-            )
         if panovggt_enabled:
             ensure_panovggt_config(config)
         if action_bearing_enabled:
             ensure_action_bearing_config(config)
-        if paqr_enabled:
-            ensure_paqr_config(config)
         super().__init__(config)
 
         if panovggt_enabled:
             ensure_panovggt_config(config)
         if action_bearing_enabled:
             ensure_action_bearing_config(config)
-        if paqr_enabled:
-            ensure_paqr_config(config)
 
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
         self.action_bearing_residual = (
@@ -1189,7 +890,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if action_bearing_enabled
             else None
         )
-        self.paqr = PanoramicActionQueryReadout(config) if paqr_enabled else None
         if self.action_bearing_residual is not None:
             self.action_bearing_residual.initialize_bin_embeddings_from_text(
                 self.get_input_embeddings()
@@ -1200,7 +900,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._panovggt_device = None
         self._panovggt_mlp_load_was_incompatible = False
         self._action_bearing_initialized_after_load = False
-        self._paqr_initialized_after_load = False
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
@@ -1218,9 +917,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             self.action_bearing_residual is not None
             and bool(getattr(self.action_bearing_residual, "enabled", False))
         )
-
-    def _paqr_enabled(self) -> bool:
-        return self.paqr is not None and bool(getattr(self.paqr, "enabled", False))
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
@@ -1727,290 +1423,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if bool(valid[batch_index].item())
         ]
 
-    def _merged_image_grid_shape(
-        self,
-        grid_thw: torch.Tensor,
-        *,
-        require_single_frame: bool = False,
-    ) -> tuple[int, int, int]:
-        num_frames, grid_h, grid_w = [
-            int(value)
-            for value in grid_thw.detach().to(device="cpu", dtype=torch.long).tolist()
-        ]
-        merge_size = int(getattr(self.config.vision_config, "spatial_merge_size", 2))
-        if num_frames < 1 or grid_h < 1 or grid_w < 1:
-            raise AssertionError(
-                f"Invalid image_grid_thw row for PAQR: {[num_frames, grid_h, grid_w]}"
-            )
-        if require_single_frame and num_frames != 1:
-            raise AssertionError(
-                "PAQR expects the current panorama to be one image frame, got "
-                f"image_grid_thw={[num_frames, grid_h, grid_w]}"
-            )
-        if grid_h % merge_size != 0 or grid_w % merge_size != 0:
-            raise AssertionError(
-                "PAQR image grid is not divisible by spatial_merge_size: "
-                f"image_grid_thw={[num_frames, grid_h, grid_w]}, "
-                f"spatial_merge_size={merge_size}"
-            )
-        target_h = grid_h // merge_size
-        target_w = grid_w // merge_size
-        return num_frames * target_h * target_w, target_h, target_w
-
-    def _current_panorama_hidden_tokens(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        input_ids: torch.LongTensor | None,
-        image_grid_thw: torch.LongTensor | None,
-    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-        if input_ids is None:
-            raise AssertionError("PAQR requires input_ids to locate current-panorama tokens")
-        if image_grid_thw is None or image_grid_thw.numel() == 0:
-            raise AssertionError("PAQR requires image_grid_thw")
-        if input_ids.ndim != 2 or hidden_states.ndim != 3:
-            raise AssertionError(
-                "Unexpected PAQR input shapes: "
-                f"input_ids={tuple(input_ids.shape)}, hidden={tuple(hidden_states.shape)}"
-            )
-        if tuple(input_ids.shape) != tuple(hidden_states.shape[:2]):
-            raise AssertionError(
-                "PAQR input_ids/hidden sequence mismatch: "
-                f"input_ids={tuple(input_ids.shape)}, hidden={tuple(hidden_states.shape)}"
-            )
-
-        num_images = int(image_grid_thw.shape[0])
-        image_num_images = self._pano_runtime_image_num_images
-        if image_num_images is None:
-            image_num_images = torch.tensor(
-                [num_images],
-                device=image_grid_thw.device,
-                dtype=torch.long,
-            )
-        else:
-            image_num_images = image_num_images.to(
-                device=image_grid_thw.device,
-                dtype=torch.long,
-            )
-        if int(image_num_images.numel()) != int(input_ids.shape[0]):
-            raise AssertionError(
-                "PAQR image_num_images batch mismatch: "
-                f"counts={image_num_images.tolist()}, batch={input_ids.shape[0]}"
-            )
-        if int(image_num_images.sum().item()) != num_images:
-            raise AssertionError(
-                "PAQR image_num_images does not sum to image_grid_thw rows: "
-                f"counts={image_num_images.tolist()}, grids={num_images}"
-            )
-
-        current_by_batch = dict(self._current_image_flat_indices(image_grid_thw))
-        image_token_id = int(getattr(self.config, "image_token_id"))
-        panorama_tokens: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        grid_offset = 0
-        for batch_index, count_tensor in enumerate(image_num_images):
-            image_count = int(count_tensor.item())
-            if image_count <= 0:
-                continue
-            sample_grids = image_grid_thw[grid_offset : grid_offset + image_count]
-            image_lengths = [
-                self._merged_image_grid_shape(grid_row)[0]
-                for grid_row in sample_grids
-            ]
-            image_positions = torch.nonzero(
-                input_ids[batch_index].eq(image_token_id),
-                as_tuple=False,
-            ).flatten()
-            expected_positions = sum(image_lengths)
-            if int(image_positions.numel()) != expected_positions:
-                raise AssertionError(
-                    "PAQR image placeholder count does not match merged image grids: "
-                    f"sample={batch_index}, placeholders={image_positions.numel()}, "
-                    f"expected={expected_positions}, image_lengths={image_lengths}"
-                )
-
-            current_flat_index = current_by_batch.get(batch_index)
-            if current_flat_index is None:
-                grid_offset += image_count
-                continue
-            current_local_index = current_flat_index - grid_offset
-            token_start = sum(image_lengths[:current_local_index])
-            token_end = token_start + image_lengths[current_local_index]
-            current_positions = image_positions[token_start:token_end]
-            current_hidden = hidden_states[batch_index].index_select(
-                0,
-                current_positions.to(device=hidden_states.device),
-            )
-
-            _, target_h, target_w = self._merged_image_grid_shape(
-                sample_grids[current_local_index],
-                require_single_frame=True,
-            )
-            yaw_columns = (
-                (
-                    torch.arange(
-                        target_w,
-                        device=current_hidden.device,
-                        dtype=torch.float32,
-                    )
-                    + 0.5
-                )
-                / float(target_w)
-                - 0.5
-            ) * (2.0 * math.pi)
-            yaw = yaw_columns.unsqueeze(0).expand(target_h, target_w).reshape(-1)
-            if int(yaw.numel()) != int(current_hidden.shape[0]):
-                raise AssertionError(
-                    "PAQR current panorama yaw/token mismatch: "
-                    f"yaw={yaw.numel()}, tokens={current_hidden.shape[0]}"
-                )
-            panorama_tokens[batch_index] = (current_hidden, yaw)
-            grid_offset += image_count
-
-        return panorama_tokens
-
-    def _paqr_decision_positions(
-        self,
-        *,
-        input_ids: torch.LongTensor,
-        labels: torch.LongTensor | None,
-        attention_mask: torch.Tensor | None,
-    ) -> dict[int, int]:
-        decision_positions: dict[int, int] = {}
-        if labels is not None:
-            allowed_targets = set(
-                int(token_id)
-                for token_id in self.paqr.action_token_ids.detach().cpu().tolist()
-            )
-            allowed_targets.add(int(getattr(self.config, "paqr_stop_token_id")))
-            for batch_index in range(int(labels.shape[0])):
-                supervised_positions = torch.nonzero(
-                    labels[batch_index].ne(-100),
-                    as_tuple=False,
-                ).flatten()
-                if supervised_positions.numel() == 0:
-                    continue
-                first_target_position = int(supervised_positions[0].item())
-                if first_target_position <= 0:
-                    raise AssertionError(
-                        "PAQR first supervised token has no preceding decision position"
-                    )
-                first_target_id = int(
-                    labels[batch_index, first_target_position].item()
-                )
-                if first_target_id not in allowed_targets:
-                    raise AssertionError(
-                        "PAQR expects the first target token to be one of "
-                        f"{sorted(allowed_targets)}, got {first_target_id} "
-                        f"for sample {batch_index}"
-                    )
-                decision_positions[batch_index] = first_target_position - 1
-            return decision_positions
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        for batch_index in range(int(input_ids.shape[0])):
-            active_positions = torch.nonzero(
-                attention_mask[batch_index].ne(0),
-                as_tuple=False,
-            ).flatten()
-            if active_positions.numel() > 0:
-                decision_positions[batch_index] = int(active_positions[-1].item())
-        return decision_positions
-
-    @staticmethod
-    def _logit_source_positions(
-        sequence_length: int,
-        logits_to_keep: int | torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if isinstance(logits_to_keep, int):
-            if logits_to_keep < 0:
-                raise ValueError(
-                    f"logits_to_keep must be non-negative, got {logits_to_keep}"
-                )
-            start = (
-                0
-                if logits_to_keep == 0
-                else max(0, sequence_length - logits_to_keep)
-            )
-            return torch.arange(start, sequence_length, device=device)
-
-        positions = logits_to_keep.to(device=device, dtype=torch.long).flatten()
-        positions = torch.where(
-            positions < 0,
-            positions + int(sequence_length),
-            positions,
-        )
-        if torch.any((positions < 0) | (positions >= int(sequence_length))):
-            raise IndexError(
-                "logits_to_keep contains a position outside the hidden sequence"
-            )
-        return positions
-
-    def _apply_paqr_to_logits(
-        self,
-        *,
-        logits: torch.Tensor,
-        hidden_states: torch.Tensor,
-        input_ids: torch.LongTensor,
-        labels: torch.LongTensor | None,
-        attention_mask: torch.Tensor | None,
-        image_grid_thw: torch.LongTensor,
-        logits_to_keep: int | torch.Tensor,
-    ) -> torch.Tensor:
-        panorama_by_batch = self._current_panorama_hidden_tokens(
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-        )
-        decision_by_batch = self._paqr_decision_positions(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
-        )
-        source_positions = self._logit_source_positions(
-            sequence_length=int(hidden_states.shape[1]),
-            logits_to_keep=logits_to_keep,
-            device=hidden_states.device,
-        )
-        action_token_ids = self.paqr.action_token_ids.to(device=logits.device)
-
-        for batch_index, (panorama_hidden, yaw) in panorama_by_batch.items():
-            decision_position = decision_by_batch.get(batch_index)
-            if decision_position is None:
-                continue
-            matching_logit_positions = torch.nonzero(
-                source_positions.eq(decision_position),
-                as_tuple=False,
-            ).flatten()
-            if matching_logit_positions.numel() != 1:
-                raise AssertionError(
-                    "PAQR decision position is absent or duplicated in logits_to_keep: "
-                    f"decision={decision_position}, source_positions="
-                    f"{source_positions.detach().cpu().tolist()}"
-                )
-            logit_position = int(matching_logit_positions[0].item())
-            delta = self.paqr(
-                panorama_hidden=panorama_hidden,
-                decision_hidden=hidden_states[
-                    batch_index,
-                    decision_position,
-                ],
-                yaw=yaw,
-                lm_head_weight=self.lm_head.weight,
-            ).to(device=logits.device, dtype=logits.dtype)
-            current_action_logits = logits[
-                batch_index,
-                logit_position,
-            ].index_select(0, action_token_ids)
-            logits[batch_index, logit_position].index_copy_(
-                0,
-                action_token_ids,
-                current_action_logits + delta,
-            )
-        return logits
-
-    @can_return_tuple
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -2029,15 +1441,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images: torch.LongTensor | None = None,
         image_current_index: torch.LongTensor | None = None,
         panovggt_pixel_values: torch.Tensor | None = None,
-        paqr_apply_s1: bool | None = None,
         **kwargs,
-    ) -> Qwen3_5CausalLMOutputWithPast:
-        runtime_context_needed = (
-            self._panovggt_enabled()
-            or self._action_bearing_enabled()
-            or self._paqr_enabled()
-        )
-        if runtime_context_needed:
+    ):
+        if self._panovggt_enabled() or self._action_bearing_enabled():
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
@@ -2046,60 +1452,20 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 panovggt_pixel_values=panovggt_pixel_values,
             )
         try:
-            outputs = self.model(
+            return super().forward(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
                 mm_token_type_ids=mm_token_type_ids,
+                logits_to_keep=logits_to_keep,
                 **kwargs,
-            )
-            hidden_states = outputs[0]
-            slice_indices = (
-                slice(-logits_to_keep, None)
-                if isinstance(logits_to_keep, int)
-                else logits_to_keep
-            )
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-            should_apply_paqr = self._paqr_enabled() and (
-                labels is not None or bool(paqr_apply_s1)
-            )
-            if should_apply_paqr:
-                if input_ids is None or image_grid_thw is None:
-                    raise AssertionError(
-                        "PAQR first-action readout requires input_ids and image_grid_thw"
-                    )
-                logits = self._apply_paqr_to_logits(
-                    logits=logits,
-                    hidden_states=hidden_states,
-                    input_ids=input_ids,
-                    labels=labels,
-                    attention_mask=attention_mask,
-                    image_grid_thw=image_grid_thw,
-                    logits_to_keep=logits_to_keep,
-                )
-
-            loss = None
-            if labels is not None:
-                loss = self.loss_function(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.text_config.vocab_size,
-                )
-
-            return Qwen3_5CausalLMOutputWithPast(
-                loss=loss,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-                rope_deltas=outputs.rope_deltas,
             )
         finally:
             self._clear_runtime_pano_context()
@@ -2107,15 +1473,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     def _load_missing_pano_parameters_post_hook(self, module, incompatible_keys) -> None:
         del module
         missing_keys = set(incompatible_keys.missing_keys)
-
-        paqr_module = self.paqr
-        if (
-            paqr_module is not None
-            and paqr_module.enabled
-            and any(key.startswith("paqr.") for key in missing_keys)
-        ):
-            paqr_module.reset_parameters()
-            self._paqr_initialized_after_load = True
 
         action_bearing_module = self.action_bearing_residual
         if (
@@ -2158,11 +1515,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             )
             self._action_bearing_initialized_after_load = True
 
-    def _reset_paqr_parameters_after_pretrained_load(self) -> None:
-        if self._paqr_enabled() and self.paqr is not None:
-            self.paqr.reset_parameters()
-            self._paqr_initialized_after_load = True
-
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
         if self._panovggt_enabled() and self.panovggt_mlp is not None:
             self.panovggt_mlp.reset_parameters()
@@ -2179,16 +1531,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         return cls._checkpoint_has_any_weights(
             pretrained_model_name_or_path,
             cls.ACTION_BEARING_STATE_KEYS,
-        )
-
-    @classmethod
-    def _checkpoint_has_paqr_weights(
-        cls,
-        pretrained_model_name_or_path,
-    ) -> bool | None:
-        return cls._checkpoint_has_any_weights(
-            pretrained_model_name_or_path,
-            cls.PAQR_STATE_KEYS,
         )
 
     @classmethod
@@ -2238,15 +1580,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        has_paqr_weights = cls._checkpoint_has_paqr_weights(
-            pretrained_model_name_or_path
-        )
-        if (
-            model._paqr_enabled()
-            and has_paqr_weights is not True
-            and not model._paqr_initialized_after_load
-        ):
-            model._reset_paqr_parameters_after_pretrained_load()
         has_action_bearing_weights = cls._checkpoint_has_action_bearing_weights(
             pretrained_model_name_or_path
         )
@@ -2306,8 +1639,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             panovggt_pixel_values=panovggt_pixel_values,
             **kwargs,
         )
-        if self._paqr_enabled():
-            model_inputs["paqr_apply_s1"] = bool(is_first_iteration)
         if not is_first_iteration and use_cache:
             model_inputs["image_erp_geometry"] = None
             model_inputs["image_num_images"] = None
