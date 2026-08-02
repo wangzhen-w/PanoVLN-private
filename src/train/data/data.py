@@ -2,7 +2,7 @@ import json
 import math
 import os
 import random
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
@@ -10,10 +10,8 @@ from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
 try:
-    from src.train.data.tct import replace_qwen_pixel_values_with_tct
     from src.train.utils import build_prompt_and_target
 except ModuleNotFoundError:
-    from data.tct import replace_qwen_pixel_values_with_tct
     from utils import build_prompt_and_target
 
 
@@ -206,149 +204,20 @@ def image_content() -> Dict[str, str]:
     return {"type": "image"}
 
 
-VLN_TURN_DEGREES_PER_ACTION = 15
-VLN_FORWARD_METERS_PER_ACTION = 0.25
-
-
-def format_vln_interframe_actions(actions: Sequence[Any]) -> str:
-    """Summarize an action span by endpoint heading and total forward travel.
-
-    The prompt only exposes the observations at the two ends of a selected
-    memory edge. Intermediate action order is therefore intentionally removed:
-    turns are reduced to the final yaw change (modulo one full rotation), while
-    forward actions are accumulated as travelled path length rather than
-    claimed as straight-line displacement.
-    """
-
-    normalized_actions = []
-    for action_index, action in enumerate(actions):
-        normalized_action = _normalize_vln_action(action)
-        if normalized_action is None or normalized_action == "stop":
-            raise ValueError(
-                "Historical actions between observations must contain only "
-                f"left/right/forward, got {action!r} at index {action_index}"
-            )
-        normalized_actions.append(normalized_action)
-    if not normalized_actions:
-        raise ValueError("Each pair of distinct selected observations requires an action span")
-
-    if 360 % VLN_TURN_DEGREES_PER_ACTION != 0:
-        raise ValueError(
-            "VLN turn angle must evenly divide a full rotation, got "
-            f"{VLN_TURN_DEGREES_PER_ACTION} degrees"
-        )
-    turn_steps_per_rotation = 360 // VLN_TURN_DEGREES_PER_ACTION
-    half_rotation_steps = turn_steps_per_rotation // 2
-    raw_signed_turn_steps = (
-        normalized_actions.count("right") - normalized_actions.count("left")
-    )
-    signed_turn_steps = (
-        (raw_signed_turn_steps + half_rotation_steps) % turn_steps_per_rotation
-        - half_rotation_steps
-    )
-    if signed_turn_steps == -half_rotation_steps and raw_signed_turn_steps > 0:
-        signed_turn_steps = half_rotation_steps
-    forward_count = normalized_actions.count("forward")
-
-    summary_parts = []
-    if signed_turn_steps:
-        turn_direction = "right" if signed_turn_steps > 0 else "left"
-        angle_degrees = abs(signed_turn_steps) * VLN_TURN_DEGREES_PER_ACTION
-        summary_parts.append(f"{turn_direction} {angle_degrees} degrees")
-
-    if forward_count:
-        distance_meters = forward_count * VLN_FORWARD_METERS_PER_ACTION
-        unit = "meter" if distance_meters == 1.0 else "meters"
-        summary_parts.append(f"forward {distance_meters:g} {unit}")
-
-    if not summary_parts:
-        return "no net change"
-    return "; ".join(summary_parts)
-
-
-def build_vln_interframe_action_texts(
-    history_actions: Sequence[Any],
-    selected_frame_indices: Sequence[int],
-) -> List[str]:
-    """Describe the executed actions on every selected frame-to-frame edge."""
-
-    selected_frame_indices = [int(index) for index in selected_frame_indices]
-    if not selected_frame_indices:
-        return []
-    if selected_frame_indices[0] < 0:
-        raise ValueError("Selected VLN frame indices must be non-negative")
-    if any(
-        earlier >= later
-        for earlier, later in zip(selected_frame_indices, selected_frame_indices[1:])
-    ):
-        raise ValueError("Selected VLN frame indices must be strictly increasing")
-    if selected_frame_indices[-1] > len(history_actions):
-        raise ValueError(
-            "Selected VLN frame index exceeds the available executed-action history: "
-            f"last_index={selected_frame_indices[-1]}, actions={len(history_actions)}"
-        )
-    if selected_frame_indices[-1] != len(history_actions):
-        raise ValueError(
-            "The final selected VLN frame must be the current observation reached by "
-            "the complete executed-action history: "
-            f"last_index={selected_frame_indices[-1]}, actions={len(history_actions)}"
-        )
-
-    return [
-        format_vln_interframe_actions(history_actions[start_index:end_index])
-        for start_index, end_index in zip(
-            selected_frame_indices,
-            selected_frame_indices[1:],
-        )
-    ]
-
-
-def build_vln_user_content(
-    instruction: str,
-    num_images: int,
-    interframe_action_texts: Optional[Sequence[str]] = None,
-) -> List[Dict[str, str]]:
+def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, str]]:
     if num_images <= 0:
         raise ValueError("VLN samples require at least one image")
-
-    include_interframe_actions = interframe_action_texts is not None
-    if include_interframe_actions:
-        interframe_action_texts = list(interframe_action_texts)
-        expected_num_transitions = num_images - 1
-        if len(interframe_action_texts) != expected_num_transitions:
-            raise ValueError(
-                "VLN inter-frame action text count must equal num_images - 1, got "
-                f"{len(interframe_action_texts)} vs {expected_num_transitions}"
-            )
 
     num_memory_images = max(0, num_images - 1)
     content = [text_content(f"Instruction: {instruction.strip()}")]
 
     if num_memory_images > 0:
-        if not include_interframe_actions:
-            content.append(
-                text_content(
-                    "\nHistory memory observations are panoramic views ordered from older to newer:"
-                )
+        content.append(
+            text_content(
+                "\nHistory memory observations are panoramic views ordered from older to newer:"
             )
-            content.extend(image_content() for _ in range(num_memory_images))
-        else:
-            content.append(
-                text_content(
-                    "\nHistory memory observations are panoramic views ordered from older to newer. "
-                    "Motion between consecutive shown observations summarizes net turn and "
-                    "total forward travel:"
-                )
-            )
-            for memory_index in range(num_memory_images):
-                content.extend(
-                    [
-                        image_content(),
-                        text_content(
-                            f"\nMotion: {interframe_action_texts[memory_index]}."
-                        ),
-                    ]
-                )
+        )
+        content.extend(image_content() for _ in range(num_memory_images))
 
     content.extend(
         [
@@ -453,46 +322,7 @@ def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
     return normalized_actions
 
 
-def _extract_vln_history_actions(
-    example: Dict[str, Any],
-    num_images: int,
-) -> List[str]:
-    history_actions = example.get("history_actions")
-    if not isinstance(history_actions, list):
-        raise ValueError("VLN example field 'history_actions' must be a list")
-    expected_num_actions = num_images - 1
-    if len(history_actions) != expected_num_actions:
-        raise ValueError(
-            "VLN example must have exactly one historical action between consecutive "
-            f"images, got images={num_images}, history_actions={len(history_actions)}"
-        )
-    step_index = example.get("step_index")
-    if (
-        isinstance(step_index, bool)
-        or not isinstance(step_index, int)
-        or step_index != expected_num_actions
-    ):
-        raise ValueError(
-            "VLN example step_index must equal len(history_actions), got "
-            f"step_index={step_index!r}, history_actions={len(history_actions)}"
-        )
-
-    normalized_actions = []
-    for action_index, action in enumerate(history_actions):
-        normalized_action = _normalize_vln_action(action)
-        if normalized_action is None or normalized_action == "stop":
-            raise ValueError(
-                "VLN history_actions must contain only left/right/forward, got "
-                f"{action!r} at index {action_index}"
-            )
-        normalized_actions.append(normalized_action)
-    return normalized_actions
-
-
-def apply_vln_memory_policy(
-    example: Dict[str, Any],
-    interframe_action_text_enabled: bool = False,
-) -> Dict[str, Any]:
+def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
         raise ValueError("VLN example field 'images' must contain the full image history")
@@ -500,18 +330,7 @@ def apply_vln_memory_policy(
         if not isinstance(image_path, str) or not image_path:
             raise ValueError("VLN example field 'images' must contain non-empty string paths")
 
-    selected_indices = build_vln_image_selection(
-        current_step=len(raw_images) - 1,
-        last_frame_index=len(raw_images) - 1,
-    )
-    selected_images = [raw_images[index] for index in selected_indices]
-    interframe_action_texts = None
-    if interframe_action_text_enabled:
-        history_actions = _extract_vln_history_actions(example, num_images=len(raw_images))
-        interframe_action_texts = build_vln_interframe_action_texts(
-            history_actions=history_actions,
-            selected_frame_indices=selected_indices,
-        )
+    selected_images = select_vln_image_paths(raw_images)
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example)
 
@@ -527,7 +346,6 @@ def apply_vln_memory_policy(
             "content": build_vln_user_content(
                 instruction=instruction,
                 num_images=len(selected_images),
-                interframe_action_texts=interframe_action_texts,
             ),
         },
         {
@@ -602,9 +420,7 @@ class SupervisedDataset(Dataset):
         model_max_length: Optional[int],
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
-        tct_enabled: bool = False,
         panovggt_enabled: bool = False,
-        interframe_action_text_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -621,9 +437,7 @@ class SupervisedDataset(Dataset):
         self.model_max_length = model_max_length
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
-        self.tct_enabled = bool(tct_enabled)
         self.panovggt_enabled = bool(panovggt_enabled)
-        self.interframe_action_text_enabled = bool(interframe_action_text_enabled)
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -688,10 +502,7 @@ class SupervisedDataset(Dataset):
         return processed_images, raw_images
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        example = apply_vln_memory_policy(
-            self._load_example(index),
-            interframe_action_text_enabled=self.interframe_action_text_enabled,
-        )
+        example = apply_vln_memory_policy(self._load_example(index))
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
             image_root=self.image_root,
@@ -751,14 +562,6 @@ class SupervisedDataset(Dataset):
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
-        if self.tct_enabled and vision_paths:
-            replace_qwen_pixel_values_with_tct(
-                encoded,
-                raw_erp_images=raw_images,
-                image_erp_geometry=image_erp_geometry,
-                image_processor=self.processor.image_processor,
-            )
-
         item = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,

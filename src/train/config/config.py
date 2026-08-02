@@ -16,8 +16,8 @@ class ModelConfig:
     trainable_modules: Optional[Dict[str, bool]] = None
     erp_top_crop_degrees: float = 20.0
     erp_bottom_crop_degrees: float = 20.0
-    tct_enabled: bool = False
-    interframe_action_text_enabled: bool = False
+    panorama_rope_enabled: bool = False
+    panorama_rope_variant: str = "headwise_rolling"
     panovggt_enabled: bool = False
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.1

@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
+from .panorama_rope import ensure_panorama_rope_config, install_headwise_panorama_rope
+
 
 PANOVGGT_AGGREGATOR_LAYER = -1
 PANOVGGT_AGGREGATOR_CONTEXT_DIM = 2048
@@ -623,10 +625,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.output_norm.weight",
     )
     def __init__(self, config):
+        ensure_panorama_rope_config(config)
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
         if panovggt_enabled:
             ensure_panovggt_config(config)
         super().__init__(config)
+
+        if bool(getattr(config, "panorama_rope_enabled", False)):
+            install_headwise_panorama_rope(self.model.visual)
 
         if panovggt_enabled:
             ensure_panovggt_config(config)
@@ -651,6 +657,9 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
+
+    def _panorama_rope_enabled(self) -> bool:
+        return bool(getattr(self.config, "panorama_rope_enabled", False))
 
     def _panovggt_feature_source(self) -> str:
         if self.panovggt_mlp is not None:
@@ -1147,6 +1156,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
+        if self._panorama_rope_enabled() and pixel_values_videos is not None:
+            raise ValueError(
+                "panorama_rope_enabled currently applies to the ERP image stream only; "
+                "perspective/video inputs must not be mixed into this PanoVLN model"
+            )
         if self._panovggt_enabled():
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,

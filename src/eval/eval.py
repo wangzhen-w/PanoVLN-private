@@ -32,14 +32,12 @@ from src.train.data.data import (
     VLN_SYSTEM_PROMPT,
     build_erp_image_geometry_batch,
     build_vln_image_selection,
-    build_vln_interframe_action_texts,
     build_vln_user_content,
     preprocess_panovggt_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
 )
-from src.train.data.tct import replace_qwen_pixel_values_with_tct
 from src.qwen_vl import Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.utils import build_prompt_and_target
 
@@ -100,15 +98,10 @@ def validate_eval_model_path(model_path: str) -> str:
     return resolved_model_path
 
 
-def build_eval_messages(
-    instruction: str,
-    images: List[Image.Image],
-    interframe_action_texts: Sequence[str] | None = None,
-):
+def build_eval_messages(instruction: str, images: List[Image.Image]):
     user_content_template = build_vln_user_content(
         instruction=instruction,
         num_images=len(images),
-        interframe_action_texts=interframe_action_texts,
     )
 
     messages = [
@@ -446,10 +439,6 @@ class PanoVLN_Agent(Agent):
         self.erp_bottom_crop_degrees = float(
             getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
         )
-        self.interframe_action_text_enabled = bool(
-            getattr(self.model.config, "interframe_action_text_enabled", False)
-        )
-        self.tct_enabled = bool(getattr(self.model.config, "tct_enabled", False))
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -488,9 +477,6 @@ class PanoVLN_Agent(Agent):
         
         self.rgb_history = []
         self.current_images = []
-        self.current_raw_images = []
-        self.interframe_action_history = []
-        self.last_returned_action = None
         self.model_generated_actions = []
         self.model_parsed_action_sequences = []
         self.pending_action_queue = []
@@ -519,13 +505,6 @@ class PanoVLN_Agent(Agent):
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
-        if self.tct_enabled and image_count:
-            replace_qwen_pixel_values_with_tct(
-                prompt_inputs,
-                raw_erp_images=self.current_raw_images,
-                image_erp_geometry=image_erp_geometry,
-                image_processor=self.processor.image_processor,
-            )
         prompt_inputs["image_erp_geometry"] = image_erp_geometry
         prompt_inputs["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         prompt_inputs["image_current_index"] = torch.tensor(
@@ -560,12 +539,6 @@ class PanoVLN_Agent(Agent):
         answers = [s.lower().strip() for s in answers]
         return answers[0] if answers else ""
 
-    def _record_previous_action(self):
-        if self.last_returned_action is None:
-            return
-        self.interframe_action_history.append(self.last_returned_action)
-        self.last_returned_action = None
-
     def _select_image_indices(self):
         return select_vln_eval_image_indices(
             history_length=len(self.rgb_history),
@@ -585,46 +558,11 @@ class PanoVLN_Agent(Agent):
         self,
         instruction,
         selected_images,
-        selected_indices,
     ):
-        if len(selected_images) != len(selected_indices):
-            raise ValueError(
-                "Selected image/index counts differ: "
-                f"images={len(selected_images)}, indices={len(selected_indices)}"
-            )
-        if not selected_indices or int(selected_indices[-1]) != len(self.rgb_history) - 1:
-            raise ValueError(
-                "The final selected image must be the current RGB observation: "
-                f"indices={list(selected_indices)}, observations={len(self.rgb_history)}"
-            )
-        interframe_action_texts = None
-        if self.interframe_action_text_enabled:
-            expected_history_length = max(0, len(self.rgb_history) - 1)
-            if len(self.interframe_action_history) != expected_history_length:
-                raise ValueError(
-                    "Executed action history is not aligned with RGB observations: "
-                    f"actions={len(self.interframe_action_history)}, "
-                    f"observations={len(self.rgb_history)}"
-                )
-            history_action_words = []
-            for action_position, action_id in enumerate(self.interframe_action_history):
-                action_id = int(action_id)
-                if action_id < 0 or action_id >= len(ATOMIC_ACTION_NAMES):
-                    raise ValueError(
-                        "Invalid executed action id in observation history: "
-                        f"id={action_id}, position={action_position}"
-                    )
-                history_action_words.append(ATOMIC_ACTION_NAMES[action_id])
-            interframe_action_texts = build_vln_interframe_action_texts(
-                history_actions=history_action_words,
-                selected_frame_indices=selected_indices,
-            )
         self.current_images = selected_images
-        self.current_raw_images = [self.rgb_history[index] for index in selected_indices]
         self.conversations = build_eval_messages(
             instruction=instruction,
             images=selected_images,
-            interframe_action_texts=interframe_action_texts,
         )
 
         navigation = self.predict_inference()
@@ -642,9 +580,7 @@ class PanoVLN_Agent(Agent):
         return action_ids
 
     def finalize_episode(self):
-        # The final returned action has no subsequent observation stored in
-        # rgb_history, so it is not a valid inter-frame edge for future prompts.
-        self.last_returned_action = None
+        pass
 
     def reset(self):       
         if self.save_topdown and getattr(self, "episode_id", None) is not None and self.topdown_frames:
@@ -660,9 +596,6 @@ class PanoVLN_Agent(Agent):
         self.topdown_frames = []
         self.rgb_history = []
         self.current_images = []
-        self.current_raw_images = []
-        self.interframe_action_history = []
-        self.last_returned_action = None
         self.model_generated_actions = []
         self.model_parsed_action_sequences = []
         self.pending_action_queue = []
@@ -678,8 +611,6 @@ class PanoVLN_Agent(Agent):
             render_frame = np.concatenate((observations["rgb"], top_down_frame), axis=1)
             self.topdown_frames.append(render_frame)
 
-        self._record_previous_action()
-
         rgb = observations["rgb"]
         self.rgb_history.append(Image.fromarray(rgb.astype('uint8')).convert('RGB'))
 
@@ -689,7 +620,6 @@ class PanoVLN_Agent(Agent):
             navigation, action_ids = self._predict_action_sequence_from_images(
                 instruction=observations["instruction"]["text"],
                 selected_images=selected_images,
-                selected_indices=selected_indices,
             )
 
             if not action_ids:
@@ -702,8 +632,6 @@ class PanoVLN_Agent(Agent):
         action_id = self.pending_action_queue.pop(0)
         if action_id == STOP_ACTION_ID:
             self.pending_action_queue = []
-
-        self.last_returned_action = action_id
 
         return {"action": action_id}
 

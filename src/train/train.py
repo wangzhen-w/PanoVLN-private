@@ -188,11 +188,6 @@ def validate_training_config(cfg) -> None:
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
         return
-    if cfg.model.tct_enabled:
-        raise ValueError(
-            "TCT currently supports the PanoVLN ERP stream only; "
-            "disable data.panoworld before enabling TCT"
-        )
     if not panoworld_cfg.jsonl:
         raise ValueError("data.panoworld.jsonl is required when data.panoworld.enabled=true")
     if not panoworld_cfg.image_root:
@@ -229,12 +224,8 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
-    rank0_print(RANK, f"tct_enabled: {_config_value(cfg.model.tct_enabled)}")
-    rank0_print(
-        RANK,
-        "interframe_action_text_enabled: "
-        f"{_config_value(cfg.model.interframe_action_text_enabled)}",
-    )
+    rank0_print(RANK, f"panorama_rope_enabled: {_config_value(cfg.model.panorama_rope_enabled)}")
+    rank0_print(RANK, f"panorama_rope_variant: {_config_value(cfg.model.panorama_rope_variant)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
@@ -308,6 +299,9 @@ def main():
     processor, tokenizer = load_processor_and_tokenizer(cfg)
     model = load_model(cfg)
     model_config = model.config
+    effective_panorama_rope_enabled = bool(
+        getattr(model_config, "panorama_rope_enabled", cfg.model.panorama_rope_enabled)
+    )
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
@@ -315,18 +309,13 @@ def main():
     effective_erp_bottom_crop_degrees = float(
         getattr(model_config, "erp_bottom_crop_degrees", cfg.model.erp_bottom_crop_degrees)
     )
-    effective_interframe_action_text_enabled = bool(
-        getattr(
-            model_config,
-            "interframe_action_text_enabled",
-            cfg.model.interframe_action_text_enabled,
-        )
-    )
-    effective_tct_enabled = bool(
-        getattr(model_config, "tct_enabled", cfg.model.tct_enabled)
-    )
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
+        rank0_print(RANK, f"panorama_rope_enabled: {_config_value(effective_panorama_rope_enabled)}")
+        rank0_print(
+            RANK,
+            f"panorama_rope_variant: {_config_value(getattr(model_config, 'panorama_rope_variant', None))}",
+        )
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
         rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
@@ -334,12 +323,6 @@ def main():
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
-        rank0_print(RANK, f"tct_enabled: {_config_value(effective_tct_enabled)}")
-        rank0_print(
-            RANK,
-            "interframe_action_text_enabled: "
-            f"{_config_value(effective_interframe_action_text_enabled)}",
-        )
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
     eval_image_root = cfg.data.eval_image_root or train_image_root
@@ -354,9 +337,7 @@ def main():
         model_max_length=cfg.model.model_max_length,
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
-        tct_enabled=effective_tct_enabled,
         panovggt_enabled=effective_panovggt_enabled,
-        interframe_action_text_enabled=effective_interframe_action_text_enabled,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
         prompt_format=cfg.data.prompt_format,
@@ -411,9 +392,7 @@ def main():
             model_max_length=cfg.model.model_max_length,
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
-            tct_enabled=effective_tct_enabled,
             panovggt_enabled=effective_panovggt_enabled,
-            interframe_action_text_enabled=effective_interframe_action_text_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
@@ -508,10 +487,11 @@ def main():
     trainer.save_state()
 
     if cfg.training.save_model_at_end:
-        copy_chat_template_files(
-            source_dir=cfg.model.name_or_path,
-            output_dir=training_args.output_dir,
-        )
+        if RANK == 0:
+            copy_chat_template_files(
+                source_dir=cfg.model.name_or_path,
+                output_dir=training_args.output_dir,
+            )
 
         model.config.use_cache = True
         if hasattr(model.config, "text_config") and model.config.text_config is not None:

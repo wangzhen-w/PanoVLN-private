@@ -84,6 +84,14 @@ def set_model(cfg, model):
         for _, param in module.named_parameters():
             param.requires_grad = True
 
+    # ``visual`` recursively contains the merger.  Re-apply an explicit merger
+    # freeze after enabling the rest of the tower so both switches remain
+    # independently meaningful.
+    visual_merger = named_modules["visual_merger"]
+    if visual_merger is not None and not trainable_modules.get("visual_merger"):
+        for _, param in visual_merger.named_parameters():
+            param.requires_grad = False
+
     if trainable_modules.get("language_model"):
         if hasattr(model, "lm_head"):
             for _, param in model.lm_head.named_parameters():
@@ -103,6 +111,10 @@ def _load_model_config(cfg):
     erp_crop_fields = (
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
+    )
+    panorama_rope_fields = (
+        "panorama_rope_enabled",
+        "panorama_rope_variant",
     )
     panovggt_fields = (
         "panovggt_enabled",
@@ -137,11 +149,9 @@ def _load_model_config(cfg):
 
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
-    setattr(config, "tct_enabled", bool(getattr(cfg.model, "tct_enabled", False)))
-    setattr(
-        config,
-        "interframe_action_text_enabled",
-        bool(getattr(cfg.model, "interframe_action_text_enabled", False)),
+    apply_module_fields_preserve_checkpoint(
+        bool(getattr(cfg.model, "panorama_rope_enabled", False)),
+        panorama_rope_fields,
     )
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     return config
