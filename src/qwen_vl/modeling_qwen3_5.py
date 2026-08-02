@@ -16,245 +16,10 @@ PANOVGGT_POINT_HIDDEN_DIM = 1024
 PANOVGGT_FEATURE_SOURCES = {"aggregator", "point_hidden"}
 PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
-ACTION_BEARING_HIDDEN_SIZE = 2048
-ACTION_BEARING_TURN_ANGLE_DEG = 15.0
-ACTION_BEARING_MAX_STEPS = 4
-ACTION_BEARING_SIGMA_STEPS = 0.6
-ACTION_BEARING_LEFT_TOKEN_ID = 2282
-ACTION_BEARING_RIGHT_TOKEN_ID = 1246
-ACTION_BEARING_FRONT_TOKEN_ID = 6735
-ACTION_BEARING_ONE_TOKEN_ID = 799
-ACTION_BEARING_TWO_TOKEN_ID = 1330
-ACTION_BEARING_THREE_TOKEN_ID = 2250
-ACTION_BEARING_FOUR_TOKEN_ID = 2943
-ACTION_BEARING_BIN_TOKEN_IDS = (
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_TWO_TOKEN_ID),
-    (ACTION_BEARING_LEFT_TOKEN_ID, ACTION_BEARING_ONE_TOKEN_ID),
-    (ACTION_BEARING_FRONT_TOKEN_ID,),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_ONE_TOKEN_ID),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_TWO_TOKEN_ID),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_THREE_TOKEN_ID),
-    (ACTION_BEARING_RIGHT_TOKEN_ID, ACTION_BEARING_FOUR_TOKEN_ID),
-)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
 VENDORED_PANOVGGT_CONFIG_PATH = VENDORED_PANOVGGT_DIR / "training" / "config" / "default.yaml"
-
-
-def _inverse_sigmoid(value: float) -> float:
-    value = min(max(float(value), 1e-6), 1.0 - 1e-6)
-    return math.log(value / (1.0 - value))
-
-
-def _bounded_raw_alpha(alpha_init: float, alpha_max: float) -> torch.Tensor:
-    alpha_max = float(alpha_max)
-    alpha_init = float(alpha_init)
-    if alpha_max <= 0.0:
-        raise ValueError(f"alpha_max must be positive, got {alpha_max}")
-    alpha_init = min(max(alpha_init, 1e-6), alpha_max * (1.0 - 1e-6))
-    return torch.tensor(_inverse_sigmoid(alpha_init / alpha_max), dtype=torch.float32)
-
-
-def ensure_action_bearing_config(config) -> None:
-    vision_config = config.vision_config
-    text_config = getattr(config, "text_config", None)
-    text_hidden_size = getattr(
-        text_config,
-        "hidden_size",
-        getattr(vision_config, "out_hidden_size", 3584),
-    )
-    output_dim = int(getattr(vision_config, "out_hidden_size", text_hidden_size))
-    defaults = {
-        "action_bearing_enabled": False,
-        "action_bearing_alpha_init": 0.02,
-        "action_bearing_alpha_max": 0.1,
-        "action_bearing_output_dim": output_dim,
-    }
-    for field_name, default_value in defaults.items():
-        if not hasattr(config, field_name):
-            setattr(config, field_name, default_value)
-
-
-class ActionBearingResidual(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        ensure_action_bearing_config(config)
-
-        self.enabled = bool(getattr(config, "action_bearing_enabled", False))
-        self.output_dim = int(
-            getattr(config, "action_bearing_output_dim", config.text_config.hidden_size)
-        )
-        self.hidden_dim = ACTION_BEARING_HIDDEN_SIZE
-        self.alpha_init = float(getattr(config, "action_bearing_alpha_init", 0.02))
-        self.alpha_max = float(getattr(config, "action_bearing_alpha_max", 0.1))
-        self.turn_angle_deg = ACTION_BEARING_TURN_ANGLE_DEG
-        self.max_steps = ACTION_BEARING_MAX_STEPS
-        self.sigma_steps = ACTION_BEARING_SIGMA_STEPS
-        self.spatial_merge_size = int(getattr(config.vision_config, "spatial_merge_size", 2))
-
-        if self.turn_angle_deg <= 0.0:
-            raise ValueError(
-                f"action_bearing_turn_angle_deg must be positive, got {self.turn_angle_deg}"
-            )
-        if self.max_steps < 1:
-            raise ValueError(
-                f"action_bearing_max_steps must be >= 1, got {self.max_steps}"
-            )
-        if self.sigma_steps <= 0.0:
-            raise ValueError(
-                f"action_bearing_sigma_steps must be positive, got {self.sigma_steps}"
-            )
-
-        self.num_bins = 2 * self.max_steps + 1
-        if len(ACTION_BEARING_BIN_TOKEN_IDS) != self.num_bins:
-            raise AssertionError(
-                "ACTION_BEARING_BIN_TOKEN_IDS must match the action-bearing bin count: "
-                f"token_id_rows={len(ACTION_BEARING_BIN_TOKEN_IDS)}, num_bins={self.num_bins}"
-            )
-        self.bin_embeddings = nn.Parameter(torch.empty(self.num_bins, self.output_dim))
-        self.input_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.output_dim, self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.output_dim),
-        )
-        self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
-        self.raw_alpha = nn.Parameter(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
-        self.reset_parameters(float(getattr(config.vision_config, "initializer_range", 0.02)))
-
-    @property
-    def alpha(self) -> torch.Tensor:
-        return float(self.alpha_max) * torch.sigmoid(self.raw_alpha)
-
-    @property
-    def turn_angle_radians(self) -> float:
-        return math.radians(self.turn_angle_deg)
-
-    def reset_parameters(self, init_std: float = 0.02) -> None:
-        nn.init.normal_(self.bin_embeddings, mean=0.0, std=float(init_std))
-        self.input_norm.reset_parameters()
-        self.output_norm.reset_parameters()
-        for module in self.mlp:
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=float(init_std))
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        with torch.no_grad():
-            self.raw_alpha.copy_(_bounded_raw_alpha(self.alpha_init, self.alpha_max))
-
-    def initialize_bin_embeddings_from_text(
-        self,
-        input_embeddings: nn.Embedding | None,
-    ) -> bool:
-        if input_embeddings is None or not hasattr(input_embeddings, "weight"):
-            return False
-        weight = input_embeddings.weight
-        if int(weight.shape[1]) != self.output_dim:
-            return False
-
-        phrase_embeddings = []
-        vocab_size = int(weight.shape[0])
-        for phrase_token_ids in ACTION_BEARING_BIN_TOKEN_IDS:
-            token_ids = [
-                self._valid_token_id(token_id, vocab_size)
-                for token_id in phrase_token_ids
-            ]
-            if any(token_id is None for token_id in token_ids):
-                return False
-            ids = torch.tensor(token_ids, device=weight.device, dtype=torch.long)
-            phrase_embeddings.append(weight.index_select(0, ids).mean(dim=0))
-
-        with torch.no_grad():
-            init_values = torch.stack(phrase_embeddings, dim=0).to(
-                device=self.bin_embeddings.device,
-                dtype=self.bin_embeddings.dtype,
-            )
-            self.bin_embeddings.copy_(init_values)
-        return True
-
-    @staticmethod
-    def _valid_token_id(token_id, vocab_size: int) -> int | None:
-        if token_id is None:
-            return None
-        token_id = int(token_id)
-        if token_id < 0 or token_id >= vocab_size:
-            return None
-        return token_id
-
-    def compute_soft_action_scores(self, yaw: torch.Tensor) -> torch.Tensor:
-        steps = (yaw.to(dtype=torch.float32) / float(self.turn_angle_radians)).clamp(
-            min=-float(self.max_steps),
-            max=float(self.max_steps),
-        )
-        centers = torch.arange(
-            -self.max_steps,
-            self.max_steps + 1,
-            device=steps.device,
-            dtype=torch.float32,
-        )
-        distances = steps.unsqueeze(-1) - centers
-        scores = torch.exp(-0.5 * (distances / float(self.sigma_steps)).pow(2))
-        return scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-    @staticmethod
-    def _build_grid_yaw(target_h: int, target_w: int, device: torch.device) -> torch.Tensor:
-        del target_h
-        xs = torch.arange(target_w, device=device, dtype=torch.float32) + 0.5
-        yaw = (xs / float(target_w) - 0.5) * (2.0 * math.pi)
-        return yaw.unsqueeze(0)
-
-    def _target_grid_hw(
-        self,
-        grid_thw: list[int],
-        target_len: int,
-    ) -> tuple[int, int]:
-        num_frames, grid_h, grid_w = [int(value) for value in grid_thw]
-        if num_frames != 1:
-            raise AssertionError(
-                "Action-Bearing residual expects a single current panorama per Qwen image, "
-                f"got image_grid_thw={grid_thw}"
-            )
-        target_h = max(1, grid_h // self.spatial_merge_size)
-        target_w = max(1, grid_w // self.spatial_merge_size)
-        expected_len = target_h * target_w
-        if expected_len != int(target_len):
-            raise AssertionError(
-                "Cannot map Action-Bearing scores to the Qwen 2D visual-token grid: "
-                f"image_grid_thw={grid_thw}, spatial_merge_size={self.spatial_merge_size}, "
-                f"expected_len={expected_len}, qwen_len={int(target_len)}"
-            )
-        return target_h, target_w
-
-    def forward(
-        self,
-        image_tokens: torch.Tensor,
-        grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self.enabled or image_tokens.numel() == 0:
-            return image_tokens
-
-        target_h, target_w = self._target_grid_hw(
-            grid_thw.detach().to(device="cpu", dtype=torch.long).tolist(),
-            target_len=int(image_tokens.shape[0]),
-        )
-        param = self.bin_embeddings
-        yaw = self._build_grid_yaw(
-            target_h,
-            target_w,
-            device=param.device,
-        ).expand(target_h, target_w)
-        scores = self.compute_soft_action_scores(yaw.reshape(-1)).to(dtype=param.dtype)
-        action_prior = scores @ self.bin_embeddings
-        delta = self.output_norm(self.mlp(self.input_norm(action_prior)))
-        delta = self.alpha.to(dtype=delta.dtype) * delta
-        return image_tokens + delta.to(
-            device=image_tokens.device,
-            dtype=image_tokens.dtype,
-        )
-
 
 def ensure_panovggt_config(config) -> None:
     vision_config = config.vision_config
@@ -857,49 +622,21 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.mlp.2.bias",
         "panovggt_mlp.output_norm.weight",
     )
-    ACTION_BEARING_STATE_KEYS = (
-        "action_bearing_residual.bin_embeddings",
-        "action_bearing_residual.input_norm.weight",
-        "action_bearing_residual.mlp.0.weight",
-        "action_bearing_residual.mlp.0.bias",
-        "action_bearing_residual.mlp.2.weight",
-        "action_bearing_residual.mlp.2.bias",
-        "action_bearing_residual.output_norm.weight",
-        "action_bearing_residual.raw_alpha",
-    )
-
     def __init__(self, config):
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
-        action_bearing_enabled = bool(
-            getattr(config, "action_bearing_enabled", False)
-        )
         if panovggt_enabled:
             ensure_panovggt_config(config)
-        if action_bearing_enabled:
-            ensure_action_bearing_config(config)
         super().__init__(config)
 
         if panovggt_enabled:
             ensure_panovggt_config(config)
-        if action_bearing_enabled:
-            ensure_action_bearing_config(config)
 
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
-        self.action_bearing_residual = (
-            ActionBearingResidual(config)
-            if action_bearing_enabled
-            else None
-        )
-        if self.action_bearing_residual is not None:
-            self.action_bearing_residual.initialize_bin_embeddings_from_text(
-                self.get_input_embeddings()
-            )
         self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
         self._panovggt_device = None
         self._panovggt_mlp_load_was_incompatible = False
-        self._action_bearing_initialized_after_load = False
         self._pano_runtime_grid_thw = None
         self._pano_runtime_image_num_images = None
         self._pano_runtime_image_current_index = None
@@ -911,12 +648,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._install_image_feature_hook()
         self.register_load_state_dict_pre_hook(self._drop_incompatible_panovggt_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
-
-    def _action_bearing_enabled(self) -> bool:
-        return (
-            self.action_bearing_residual is not None
-            and bool(getattr(self.action_bearing_residual, "enabled", False))
-        )
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
@@ -1034,28 +765,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         vision_output.pooler_output = tuple(image_embeds)
         return vision_output
 
-    def _apply_action_bearing_residual(self, vision_output, image_grid_thw: torch.Tensor):
-        action_bearing_residual = self.action_bearing_residual
-        if (
-            action_bearing_residual is None
-            or image_grid_thw is None
-            or vision_output.pooler_output is None
-        ):
-            return vision_output
-
-        image_embeds = list(vision_output.pooler_output)
-        current_items = self._select_current_items(
-            image_grid_thw,
-            num_image_outputs=len(image_embeds),
-        )
-        for _, image_index in current_items:
-            image_embeds[image_index] = action_bearing_residual(
-                image_embeds[image_index],
-                image_grid_thw[image_index],
-            )
-        vision_output.pooler_output = tuple(image_embeds)
-        return vision_output
-
     def _apply_pre_merger_panovggt_residual(
         self,
         hidden_states: torch.Tensor,
@@ -1149,7 +858,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         visual.merger.forward = MethodType(merger_with_pano_pre_merger_residual, visual.merger)
 
     def _install_image_feature_hook(self) -> None:
-        if not (self._panovggt_enabled() or self._action_bearing_enabled()):
+        if not self._panovggt_enabled():
             return
         if hasattr(self.model, "_pano_origin_get_image_features"):
             return
@@ -1179,11 +888,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 and owner._panovggt_injection_stage() == "post_merger"
             ):
                 vision_output = owner._apply_post_merger_panovggt_residual(
-                    vision_output,
-                    image_grid_thw,
-                )
-            if owner._action_bearing_enabled():
-                vision_output = owner._apply_action_bearing_residual(
                     vision_output,
                     image_grid_thw,
                 )
@@ -1443,7 +1147,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
-        if self._panovggt_enabled() or self._action_bearing_enabled():
+        if self._panovggt_enabled():
             self._set_runtime_pano_context(
                 image_grid_thw=image_grid_thw,
                 image_num_images=image_num_images,
@@ -1474,20 +1178,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         del module
         missing_keys = set(incompatible_keys.missing_keys)
 
-        action_bearing_module = self.action_bearing_residual
-        if (
-            action_bearing_module is not None
-            and action_bearing_module.enabled
-            and any(key.startswith("action_bearing_residual.") for key in missing_keys)
-        ):
-            action_bearing_module.reset_parameters(
-                float(getattr(self.config.vision_config, "initializer_range", 0.02))
-            )
-            action_bearing_module.initialize_bin_embeddings_from_text(
-                self.get_input_embeddings()
-            )
-            self._action_bearing_initialized_after_load = True
-
         panovggt_module = self.panovggt_mlp
         if (
             panovggt_module is not None
@@ -1505,16 +1195,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             else:
                 self._mark_panovggt_weights_ready()
 
-    def _reset_action_bearing_parameters_after_pretrained_load(self) -> None:
-        if self._action_bearing_enabled() and self.action_bearing_residual is not None:
-            self.action_bearing_residual.reset_parameters(
-                float(getattr(self.config.vision_config, "initializer_range", 0.02))
-            )
-            self.action_bearing_residual.initialize_bin_embeddings_from_text(
-                self.get_input_embeddings()
-            )
-            self._action_bearing_initialized_after_load = True
-
     def _reset_panovggt_parameters_after_pretrained_load(self) -> None:
         if self._panovggt_enabled() and self.panovggt_mlp is not None:
             self.panovggt_mlp.reset_parameters()
@@ -1522,16 +1202,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
         return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.PANOVGGT_STATE_KEYS)
-
-    @classmethod
-    def _checkpoint_has_action_bearing_weights(
-        cls,
-        pretrained_model_name_or_path,
-    ) -> bool | None:
-        return cls._checkpoint_has_any_weights(
-            pretrained_model_name_or_path,
-            cls.ACTION_BEARING_STATE_KEYS,
-        )
 
     @classmethod
     def _checkpoint_has_any_weights(cls, pretrained_model_name_or_path, state_keys) -> bool | None:
@@ -1580,15 +1250,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-        has_action_bearing_weights = cls._checkpoint_has_action_bearing_weights(
-            pretrained_model_name_or_path
-        )
-        if (
-            model._action_bearing_enabled()
-            and has_action_bearing_weights is not True
-            and not model._action_bearing_initialized_after_load
-        ):
-            model._reset_action_bearing_parameters_after_pretrained_load()
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
             model._reset_panovggt_parameters_after_pretrained_load()

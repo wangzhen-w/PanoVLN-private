@@ -32,24 +32,15 @@ RANK = int(os.environ.get("RANK", "0"))
 
 
 class PanoVLNTrainer(Trainer):
-    NO_WEIGHT_DECAY_SUFFIXES = (
-        "action_bearing_residual.raw_alpha",
-    )
     MODULE_LR_KEYS = (
         "language_model",
         "visual",
         "visual_merger",
-        "action_bearing_residual",
         "panovggt_mlp",
     )
 
     def get_decay_parameter_names(self, model):
-        decay_parameters = set(super().get_decay_parameter_names(model))
-        return [
-            name
-            for name in decay_parameters
-            if not name.endswith(self.NO_WEIGHT_DECAY_SUFFIXES)
-        ]
+        return super().get_decay_parameter_names(model)
 
     def __init__(
         self,
@@ -69,8 +60,6 @@ class PanoVLNTrainer(Trainer):
         return name == module_name or name.startswith(f"{module_name}.") or f".{module_name}." in name
 
     def _module_lr_key_for_parameter(self, name: str):
-        if self._name_has_module(name, "action_bearing_residual"):
-            return "action_bearing_residual"
         if name.startswith("visual.merger.") or ".visual.merger." in name:
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
@@ -199,6 +188,11 @@ def validate_training_config(cfg) -> None:
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
         return
+    if cfg.model.tct_enabled:
+        raise ValueError(
+            "TCT currently supports the PanoVLN ERP stream only; "
+            "disable data.panoworld before enabling TCT"
+        )
     if not panoworld_cfg.jsonl:
         raise ValueError("data.panoworld.jsonl is required when data.panoworld.enabled=true")
     if not panoworld_cfg.image_root:
@@ -235,14 +229,12 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
+    rank0_print(RANK, f"tct_enabled: {_config_value(cfg.model.tct_enabled)}")
     rank0_print(
         RANK,
         "interframe_action_text_enabled: "
         f"{_config_value(cfg.model.interframe_action_text_enabled)}",
     )
-    rank0_print(RANK, f"action_bearing_enabled: {_config_value(cfg.model.action_bearing_enabled)}")
-    rank0_print(RANK, f"action_bearing_alpha_init: {_config_value(cfg.model.action_bearing_alpha_init)}")
-    rank0_print(RANK, f"action_bearing_alpha_max: {_config_value(cfg.model.action_bearing_alpha_max)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
@@ -262,11 +254,6 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"language_model_lr: {_config_value(cfg.training.language_model_lr)}")
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
-    rank0_print(
-        RANK,
-        "action_bearing_residual_lr: "
-        f"{_config_value(cfg.training.action_bearing_residual_lr)}",
-    )
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
@@ -335,6 +322,9 @@ def main():
             cfg.model.interframe_action_text_enabled,
         )
     )
+    effective_tct_enabled = bool(
+        getattr(model_config, "tct_enabled", cfg.model.tct_enabled)
+    )
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
@@ -344,25 +334,11 @@ def main():
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
+        rank0_print(RANK, f"tct_enabled: {_config_value(effective_tct_enabled)}")
         rank0_print(
             RANK,
             "interframe_action_text_enabled: "
             f"{_config_value(effective_interframe_action_text_enabled)}",
-        )
-        rank0_print(
-            RANK,
-            f"action_bearing_enabled: "
-            f"{_config_value(getattr(model_config, 'action_bearing_enabled', None))}",
-        )
-        rank0_print(
-            RANK,
-            f"action_bearing_alpha_init: "
-            f"{_config_value(getattr(model_config, 'action_bearing_alpha_init', None))}",
-        )
-        rank0_print(
-            RANK,
-            f"action_bearing_alpha_max: "
-            f"{_config_value(getattr(model_config, 'action_bearing_alpha_max', None))}",
         )
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
@@ -378,6 +354,7 @@ def main():
         model_max_length=cfg.model.model_max_length,
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
+        tct_enabled=effective_tct_enabled,
         panovggt_enabled=effective_panovggt_enabled,
         interframe_action_text_enabled=effective_interframe_action_text_enabled,
         max_samples=cfg.data.train_max_samples,
@@ -434,6 +411,7 @@ def main():
             model_max_length=cfg.model.model_max_length,
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
+            tct_enabled=effective_tct_enabled,
             panovggt_enabled=effective_panovggt_enabled,
             interframe_action_text_enabled=effective_interframe_action_text_enabled,
             max_samples=cfg.data.eval_max_samples,
@@ -497,7 +475,6 @@ def main():
             "language_model": cfg.training.language_model_lr,
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
-            "action_bearing_residual": cfg.training.action_bearing_residual_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
         },
         compute_metrics=(

@@ -38,6 +38,7 @@ from src.train.data.data import (
     resolve_current_image_index,
     text_content,
 )
+from src.train.data.tct import replace_qwen_pixel_values_with_tct
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
 
@@ -200,6 +201,7 @@ class PanoVLNPredictor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.erp_top_crop_degrees = DEFAULT_ERP_TOP_CROP_DEGREES
         self.erp_bottom_crop_degrees = DEFAULT_ERP_BOTTOM_CROP_DEGREES
+        self.tct_enabled = False
         self._load()
 
     @staticmethod
@@ -361,12 +363,14 @@ class PanoVLNPredictor:
             self.erp_bottom_crop_degrees = float(
                 getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
             )
+            self.tct_enabled = bool(getattr(self.model.config, "tct_enabled", False))
             _log_stage(
                 "model moved and initialized "
                 f"device={self._input_device()} "
                 f"dtype={next(self.model.parameters()).dtype} "
                 f"crop_top={self.erp_top_crop_degrees} "
                 f"crop_bottom={self.erp_bottom_crop_degrees} "
+                f"tct_enabled={self.tct_enabled} "
                 f"in {_format_elapsed(step_start)}"
             )
             _log_stage(f"model load finished in {_format_elapsed(load_start)}")
@@ -485,11 +489,19 @@ class PanoVLNPredictor:
             padding=True,
         )
         image_count = len(processed_images)
-        encoded["image_erp_geometry"] = build_erp_image_geometry_batch(
+        image_erp_geometry = build_erp_image_geometry_batch(
             image_count,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
+        if self.tct_enabled and image_count:
+            replace_qwen_pixel_values_with_tct(
+                encoded,
+                raw_erp_images=selected_images,
+                image_erp_geometry=image_erp_geometry,
+                image_processor=self.processor.image_processor,
+            )
+        encoded["image_erp_geometry"] = image_erp_geometry
         encoded["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         encoded["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],

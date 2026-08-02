@@ -17,9 +17,6 @@ class ModelConfig:
     trainable_modules: Optional[Dict[str, bool]] = None
     erp_top_crop_degrees: float = 0.0
     erp_bottom_crop_degrees: float = 0.0
-    action_bearing_enabled: bool = False
-    action_bearing_alpha_init: float = 0.02
-    action_bearing_alpha_max: float = 0.1
     panovggt_enabled: bool = True
     panovggt_checkpoint_path: str = "/workspace/code/a_property/model/PanoVGGT/model.pt"
     panovggt_alpha_value: float = 0.05
@@ -56,7 +53,6 @@ class TrainingConfig:
     language_model_lr: Optional[float] = 1.0e-6
     visual_lr: Optional[float] = 1.0e-6
     visual_merger_lr: Optional[float] = 1.0e-6
-    action_bearing_residual_lr: Optional[float] = 1.0e-6
     panovggt_mlp_lr: Optional[float] = 1.0e-6
     weight_decay: float = 0.01
     num_train_epochs: float = 1.0

@@ -26,7 +26,6 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual": True,
     "visual_merger": True,
     "language_model": True,
-    "action_bearing_residual": True,
     "panovggt_mlp": True,
 }
 def set_seed(seed: int):
@@ -73,7 +72,6 @@ def set_model(cfg, model):
             getattr(visual_model, "merger", None)
             if visual_model is not None else None
         ),
-        "action_bearing_residual": getattr(model, "action_bearing_residual", None),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
         "language_model": language_model,
     }
@@ -101,11 +99,6 @@ def _load_model_config(cfg):
     config = Qwen3_5Config.from_pretrained(
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
-    )
-    action_bearing_fields = (
-        "action_bearing_enabled",
-        "action_bearing_alpha_init",
-        "action_bearing_alpha_max",
     )
     erp_crop_fields = (
         "erp_top_crop_degrees",
@@ -142,13 +135,13 @@ def _load_model_config(cfg):
             return
         apply_module_fields(False, field_names)
 
-    apply_module_fields(bool(cfg.model.action_bearing_enabled), action_bearing_fields)
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
+    setattr(config, "tct_enabled", bool(getattr(cfg.model, "tct_enabled", False)))
     setattr(
         config,
         "interframe_action_text_enabled",
-        bool(cfg.model.interframe_action_text_enabled),
+        bool(getattr(cfg.model, "interframe_action_text_enabled", False)),
     )
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     return config

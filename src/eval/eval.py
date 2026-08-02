@@ -39,6 +39,7 @@ from src.train.data.data import (
     preprocess_vln_memory_image,
     resolve_current_image_index,
 )
+from src.train.data.tct import replace_qwen_pixel_values_with_tct
 from src.qwen_vl import Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.utils import build_prompt_and_target
 
@@ -448,6 +449,7 @@ class PanoVLN_Agent(Agent):
         self.interframe_action_text_enabled = bool(
             getattr(self.model.config, "interframe_action_text_enabled", False)
         )
+        self.tct_enabled = bool(getattr(self.model.config, "tct_enabled", False))
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -486,6 +488,7 @@ class PanoVLN_Agent(Agent):
         
         self.rgb_history = []
         self.current_images = []
+        self.current_raw_images = []
         self.interframe_action_history = []
         self.last_returned_action = None
         self.model_generated_actions = []
@@ -511,11 +514,19 @@ class PanoVLN_Agent(Agent):
             padding=True,
         )
         image_count = len(self.current_images)
-        prompt_inputs["image_erp_geometry"] = build_erp_image_geometry_batch(
+        image_erp_geometry = build_erp_image_geometry_batch(
             image_count,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
+        if self.tct_enabled and image_count:
+            replace_qwen_pixel_values_with_tct(
+                prompt_inputs,
+                raw_erp_images=self.current_raw_images,
+                image_erp_geometry=image_erp_geometry,
+                image_processor=self.processor.image_processor,
+            )
+        prompt_inputs["image_erp_geometry"] = image_erp_geometry
         prompt_inputs["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         prompt_inputs["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],
@@ -609,6 +620,7 @@ class PanoVLN_Agent(Agent):
                 selected_frame_indices=selected_indices,
             )
         self.current_images = selected_images
+        self.current_raw_images = [self.rgb_history[index] for index in selected_indices]
         self.conversations = build_eval_messages(
             instruction=instruction,
             images=selected_images,
@@ -648,6 +660,7 @@ class PanoVLN_Agent(Agent):
         self.topdown_frames = []
         self.rgb_history = []
         self.current_images = []
+        self.current_raw_images = []
         self.interframe_action_history = []
         self.last_returned_action = None
         self.model_generated_actions = []

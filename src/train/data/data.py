@@ -10,8 +10,10 @@ from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
 try:
+    from src.train.data.tct import replace_qwen_pixel_values_with_tct
     from src.train.utils import build_prompt_and_target
 except ModuleNotFoundError:
+    from data.tct import replace_qwen_pixel_values_with_tct
     from utils import build_prompt_and_target
 
 
@@ -600,6 +602,7 @@ class SupervisedDataset(Dataset):
         model_max_length: Optional[int],
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+        tct_enabled: bool = False,
         panovggt_enabled: bool = False,
         interframe_action_text_enabled: bool = False,
         max_samples: Optional[int] = None,
@@ -618,6 +621,7 @@ class SupervisedDataset(Dataset):
         self.model_max_length = model_max_length
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
+        self.tct_enabled = bool(tct_enabled)
         self.panovggt_enabled = bool(panovggt_enabled)
         self.interframe_action_text_enabled = bool(interframe_action_text_enabled)
         self.prompt_format = prompt_format
@@ -660,25 +664,28 @@ class SupervisedDataset(Dataset):
         return json.loads(handle.readline())
 
     def _load_images(self, image_paths: List[str]):
-        images = []
+        processed_images = []
+        raw_images = []
         num_images = len(image_paths)
         for image_index, image_path in enumerate(image_paths):
             with Image.open(image_path) as image:
+                raw_image = image.convert("RGB")
                 is_current_observation = image_index == num_images - 1
                 if is_current_observation:
                     processed_image = preprocess_vln_current_image(
-                        image,
+                        raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
                     )
                 else:
                     processed_image = preprocess_vln_memory_image(
-                        image,
+                        raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
                     )
-                images.append(processed_image)
-        return images
+                raw_images.append(raw_image)
+                processed_images.append(processed_image)
+        return processed_images, raw_images
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         example = apply_vln_memory_policy(
@@ -700,12 +707,12 @@ class SupervisedDataset(Dataset):
         target_with_eos = target_text + eos
         full_text = prompt_text + target_with_eos
 
+        raw_images = []
         if vision_paths:
+            processed_images, raw_images = self._load_images(image_paths=vision_paths)
             encoded = self.processor(
                 text=full_text,
-                images=self._load_images(
-                    image_paths=vision_paths,
-                ),
+                images=processed_images,
                 return_tensors="pt",
                 truncation=self.model_max_length is not None,
                 max_length=self.model_max_length,
@@ -738,17 +745,26 @@ class SupervisedDataset(Dataset):
         if target_len > 0:
             labels[:-target_len] = -100
 
+        image_count = len(vision_paths)
+        image_erp_geometry = build_erp_image_geometry_batch(
+            image_count,
+            top_crop_degrees=self.erp_top_crop_degrees,
+            bottom_crop_degrees=self.erp_bottom_crop_degrees,
+        )
+        if self.tct_enabled and vision_paths:
+            replace_qwen_pixel_values_with_tct(
+                encoded,
+                raw_erp_images=raw_images,
+                image_erp_geometry=image_erp_geometry,
+                image_processor=self.processor.image_processor,
+            )
+
         item = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
-        image_count = len(vision_paths)
-        item["image_erp_geometry"] = build_erp_image_geometry_batch(
-            image_count,
-            top_crop_degrees=self.erp_top_crop_degrees,
-            bottom_crop_degrees=self.erp_bottom_crop_degrees,
-        )
+        item["image_erp_geometry"] = image_erp_geometry
         item["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         item["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],
@@ -759,8 +775,9 @@ class SupervisedDataset(Dataset):
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
 
         if self.panovggt_enabled and vision_paths:
-            with Image.open(vision_paths[-1]) as image:
-                item["panovggt_pixel_values"] = preprocess_panovggt_current_image(image).unsqueeze(0)
+            item["panovggt_pixel_values"] = preprocess_panovggt_current_image(
+                raw_images[-1]
+            ).unsqueeze(0)
 
         for key in STACKABLE_KEYS:
             if key in encoded:
