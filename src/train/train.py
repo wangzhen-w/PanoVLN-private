@@ -224,8 +224,6 @@ def print_training_config(cfg) -> None:
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
     rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(cfg.model.erp_top_crop_degrees)}")
     rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(cfg.model.erp_bottom_crop_degrees)}")
-    rank0_print(RANK, f"panorama_rope_enabled: {_config_value(cfg.model.panorama_rope_enabled)}")
-    rank0_print(RANK, f"panorama_rope_variant: {_config_value(cfg.model.panorama_rope_variant)}")
     rank0_print(RANK, f"panovggt_enabled: {_config_value(cfg.model.panovggt_enabled)}")
     rank0_print(RANK, f"panovggt_alpha_value: {_config_value(cfg.model.panovggt_alpha_value)}")
     rank0_print(RANK, f"panovggt_feature_source: {_config_value(cfg.model.panovggt_feature_source)}")
@@ -299,9 +297,6 @@ def main():
     processor, tokenizer = load_processor_and_tokenizer(cfg)
     model = load_model(cfg)
     model_config = model.config
-    effective_panorama_rope_enabled = bool(
-        getattr(model_config, "panorama_rope_enabled", cfg.model.panorama_rope_enabled)
-    )
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
@@ -311,11 +306,6 @@ def main():
     )
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
-        rank0_print(RANK, f"panorama_rope_enabled: {_config_value(effective_panorama_rope_enabled)}")
-        rank0_print(
-            RANK,
-            f"panorama_rope_variant: {_config_value(getattr(model_config, 'panorama_rope_variant', None))}",
-        )
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
         rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")

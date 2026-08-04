@@ -112,10 +112,6 @@ def _load_model_config(cfg):
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
     )
-    panorama_rope_fields = (
-        "panorama_rope_enabled",
-        "panorama_rope_variant",
-    )
     panovggt_fields = (
         "panovggt_enabled",
         "panovggt_checkpoint_path",
@@ -149,10 +145,6 @@ def _load_model_config(cfg):
 
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
-    apply_module_fields_preserve_checkpoint(
-        bool(getattr(cfg.model, "panorama_rope_enabled", False)),
-        panorama_rope_fields,
-    )
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     return config
 
