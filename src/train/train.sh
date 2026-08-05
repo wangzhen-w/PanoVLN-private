@@ -7,14 +7,14 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/data2/model/ablation_new/panovggt_only/panovggt_0.20_lr2e-5_singlepoint_8card"
+OUTPUT_DIR="/workspace/data2/model/ablation_new/route_recovery/panovggt_0.20_lr2e-5_singlepoint_8card_with_recovery"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
 MASTER_PORT="29520"
 
 if (( $# != 0 )); then
-    echo "The controlled PanoVGGT-only launcher does not accept overrides: $*" >&2
+    echo "The controlled route-recovery launcher does not accept overrides: $*" >&2
     exit 1
 fi
 
