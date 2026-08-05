@@ -22,7 +22,7 @@ model:
   panovggt_force_fp32: false
 
 data:
-  train_jsonl: "/workspace/data2/dataset/ablation/route_recovery/train_r2r_rxr_ebs_event050_bg005_tail080_with_recovery.jsonl"
+  train_jsonl: "/workspace/data2/dataset/ablation/fds_ids/train_r2r_rxr_ebs_event050_bg005_tail080_with_ids.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/z_PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -40,7 +40,7 @@ data:
     mixing_strategy: "sample"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/ablation_new/route_recovery/panovggt_0.20_lr2e-5_singlepoint_8card_with_recovery"
+  output_dir: "/workspace/data2/model/ablation_new/fds_ids/panovggt_0.20_lr2e-5_singlepoint_ids_8card"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4

@@ -13,6 +13,7 @@ DEFAULT_ACTION_HORIZON = 4
 DEFAULT_SEED = 42
 DEFAULT_SUBSET_SEED = 42
 EBS_SAMPLER = "ebs"
+FORWARD_DYNAMICS_TASK = "fds"
 DEFAULT_EVENT_KEEP_PROB = 0.60
 DEFAULT_BACKGROUND_KEEP_PROB = 0.11
 DEFAULT_TAIL_DENSE_KEEP_PROB = 0.50
@@ -449,9 +450,17 @@ def process_dataset(
                     # Keep the label identical for paired ScaleVLN rewrite
                     # ablation so the published samples differ only in instruction.
                     "dataset": dataset_label,
+                    "task_type": FORWARD_DYNAMICS_TASK,
                     "step_index": action_chunk["start_step"],
                     "end_step": action_chunk["end_step"],
                     "real_action_count": action_chunk["real_action_count"],
+                    # IDS supervision uses the four actions immediately before
+                    # step_index.  Store the complete executable prefix so IDS can
+                    # be derived without re-reading or re-aligning annotations.
+                    "history_actions": [
+                        action_id_to_str(action_id)
+                        for action_id in actions[: action_chunk["start_step"]]
+                    ],
                 }
                 if episode_item.get("trajectory_id") is not None:
                     sample["trajectory_id"] = str(episode_item["trajectory_id"])

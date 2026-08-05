@@ -36,6 +36,9 @@ VLN_ACTION_ALIASES = {
     "stop": "stop",
 }
 VLN_ACTION_SEQUENCE_LENGTH = 4
+VLN_TASK_FDS = "fds"
+VLN_TASK_IDS = "ids"
+VLN_TASK_TYPES = {VLN_TASK_FDS, VLN_TASK_IDS}
 VLN_SYSTEM_PROMPT = (
     "You are an autonomous navigation assistant. "
     "Your task is to follow the navigation instruction. "
@@ -44,6 +47,15 @@ VLN_SYSTEM_PROMPT = (
     "forward by 25 centimeters, or stop once the task is complete. "
     "Return exactly four action words in execution order, separated by spaces. "
     "If the task is complete before four actions, fill the remaining positions with stop."
+)
+VLN_INVERSE_DYNAMICS_SYSTEM_PROMPT = (
+    "You are an autonomous navigation assistant. "
+    "Your task is to understand the agent's recent navigation history. "
+    "Given the navigation instruction, a history memory observation, and the "
+    "current observation, analyze the visual change and infer the recent navigation "
+    "actions executed by the agent to reach its current state. "
+    "Use the four actions: left or right by 15 degrees, forward by 25 centimeters, "
+    "or stop. Return exactly four action words in execution order, separated by spaces."
 )
 
 
@@ -229,6 +241,22 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
     return content
 
 
+def build_inverse_dynamics_user_content(
+    instruction: str,
+) -> List[Dict[str, str]]:
+    return [
+        text_content(f"Instruction: {instruction.strip()}"),
+        text_content("\nHistory memory observation (panoramic view):"),
+        image_content(),
+        text_content("\nCurrent observation (panoramic view):"),
+        image_content(),
+        text_content(
+            "\nInfer the recent action sequence that brought the agent to its "
+            "current state."
+        ),
+    ]
+
+
 def _resolve_image_path(path: str, image_root: Optional[str]) -> str:
     if os.path.isabs(path) or path.startswith(("http://", "https://", "file://")):
         return path
@@ -288,6 +316,16 @@ def _extract_vln_instruction(example: Dict[str, Any]) -> str:
     raise ValueError("VLN example is missing an instruction")
 
 
+def _extract_vln_task_type(example: Dict[str, Any]) -> str:
+    task_type = example.get("task_type", VLN_TASK_FDS)
+    if task_type in VLN_TASK_TYPES:
+        return task_type
+    raise ValueError(
+        "VLN example field 'task_type' must be either "
+        f"{VLN_TASK_FDS!r} or {VLN_TASK_IDS!r}, got {task_type!r}"
+    )
+
+
 def _normalize_vln_action(action: Any) -> Optional[str]:
     if not isinstance(action, str):
         return None
@@ -330,23 +368,51 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(image_path, str) or not image_path:
             raise ValueError("VLN example field 'images' must contain non-empty string paths")
 
-    selected_images = select_vln_image_paths(raw_images)
+    task_type = _extract_vln_task_type(example)
+    if task_type == VLN_TASK_IDS:
+        current_frame_index = len(raw_images) - 1
+        start_frame_index = current_frame_index - VLN_ACTION_SEQUENCE_LENGTH
+        if start_frame_index < 0:
+            raise ValueError(
+                "Inverse-dynamics samples require at least four historical actions "
+                f"and five observations, got {len(raw_images)} observations"
+            )
+        selected_images = [
+            raw_images[start_frame_index],
+            raw_images[current_frame_index],
+        ]
+    else:
+        selected_images = select_vln_image_paths(raw_images)
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example)
+    if task_type == VLN_TASK_IDS and "stop" in action_sequence:
+        raise ValueError(
+            "Inverse-dynamics action_sequence cannot contain terminal stop"
+        )
+
+    if task_type == VLN_TASK_IDS:
+        system_prompt = VLN_INVERSE_DYNAMICS_SYSTEM_PROMPT
+        user_content = build_inverse_dynamics_user_content(
+            instruction=instruction,
+        )
+    else:
+        system_prompt = VLN_SYSTEM_PROMPT
+        user_content = build_vln_user_content(
+            instruction=instruction,
+            num_images=len(selected_images),
+        )
 
     normalized = dict(example)
+    normalized["task_type"] = task_type
     normalized["images"] = selected_images
     normalized["messages"] = [
         {
             "role": "system",
-            "content": [text_content(VLN_SYSTEM_PROMPT)],
+            "content": [text_content(system_prompt)],
         },
         {
             "role": "user",
-            "content": build_vln_user_content(
-                instruction=instruction,
-                num_images=len(selected_images),
-            ),
+            "content": user_content,
         },
         {
             "role": "assistant",
@@ -477,7 +543,11 @@ class SupervisedDataset(Dataset):
         handle.seek(self.offsets[index])
         return json.loads(handle.readline())
 
-    def _load_images(self, image_paths: List[str]):
+    def _load_images(
+        self,
+        image_paths: List[str],
+        task_type: str = VLN_TASK_FDS,
+    ):
         processed_images = []
         raw_images = []
         num_images = len(image_paths)
@@ -485,7 +555,10 @@ class SupervisedDataset(Dataset):
             with Image.open(image_path) as image:
                 raw_image = image.convert("RGB")
                 is_current_observation = image_index == num_images - 1
-                if is_current_observation:
+                # IDS compares two equally important endpoints.  Keep both at the
+                # current-observation resolution instead of treating the earlier
+                # endpoint as a low-resolution FDS memory frame.
+                if task_type == VLN_TASK_IDS or is_current_observation:
                     processed_image = preprocess_vln_current_image(
                         raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
@@ -520,7 +593,10 @@ class SupervisedDataset(Dataset):
 
         raw_images = []
         if vision_paths:
-            processed_images, raw_images = self._load_images(image_paths=vision_paths)
+            processed_images, raw_images = self._load_images(
+                image_paths=vision_paths,
+                task_type=example["task_type"],
+            )
             encoded = self.processor(
                 text=full_text,
                 images=processed_images,
