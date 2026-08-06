@@ -14,18 +14,17 @@ export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="/opt/conda/bin/python"  # 当前训练环境；需迁移时改这一处。
 INPUT_ROOT="/workspace/data2/dataset/PanoVLN"
-OUTPUT_PATH="/workspace/data2/dataset/ablation/instruction_compare/panovln_event085_bg005_tail100_30k_ep.jsonl"
-# 新数据集使用 panovln；旧 ScaleVLN 指令消融分别使用 scalevln/scalevln_rewrite。
-DATASET_NAMES=(panovln)
-MAX_EPISODES_PER_SUBSET="30000"   # 随机选取的源episode数量；留空表示使用全部episode。
+OUTPUT_PATH="/workspace/data2/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
+DATASET_NAMES=(r2r rxr)
+MAX_EPISODES_PER_SUBSET=""        # 当前 canonical EBS 使用两个子集的全部episode。
 SUBSET_SEED="42"                # 固定episode随机排列；不同规模取同一排列的前缀。
 PAD_STOP_TO_HORIZON="true"
 SEED="42"                       # EBS action chunk采样seed，与episode抽样相互独立。
 
-EVENT_KEEP_PROB="0.85"       # 保留含转向事件的 body action chunk 的概率。
+EVENT_KEEP_PROB="0.50"       # 保留含转向事件的 body action chunk 的概率。
 BACKGROUND_KEEP_PROB="0.05"  # 保留纯前进 body action chunk 的概率。
 BODY_KEEP_ADVANCE="4"        # body chunk 被保留后向前跳过的起始步数。
-TAIL_DENSE_KEEP_PROB="1.00"   # 完整保留轨迹末尾4个dense起点。
+TAIL_DENSE_KEEP_PROB="0.80"   # 轨迹末尾4个dense起点的保留概率。
 
 mkdir -p "$(dirname "${OUTPUT_PATH}")"
 

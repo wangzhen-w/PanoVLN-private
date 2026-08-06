@@ -121,6 +121,11 @@ def _select_images(
         last_frame_index=len(images) - 1,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
+        required_frame_indices=(
+            [len(images) - 1 - ACTION_SEQUENCE_LENGTH]
+            if len(images) - 1 >= ACTION_SEQUENCE_LENGTH
+            else None
+        ),
     )
     return [images[index] for index in selected_indices]
 

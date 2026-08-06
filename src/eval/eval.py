@@ -143,6 +143,11 @@ def select_vln_eval_image_indices(
         last_frame_index=last_frame_index,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
+        required_frame_indices=(
+            [last_frame_index - ACTION_SEQUENCE_LENGTH]
+            if last_frame_index >= ACTION_SEQUENCE_LENGTH
+            else None
+        ),
     )
 
 

@@ -27,6 +27,8 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "panovggt_mlp": True,
+    "pbo_head": True,
+    "forward_dynamics_head": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -73,6 +75,8 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
+        "pbo_head": getattr(model, "pbo_head", None),
+        "forward_dynamics_head": getattr(model, "forward_dynamics_head", None),
         "language_model": language_model,
     }
 
@@ -121,6 +125,15 @@ def _load_model_config(cfg):
         "panovggt_sampling_mode",
         "panovggt_force_fp32",
     )
+    pbo_fields = (
+        "pbo_enabled",
+        "pbo_loss_weight",
+        "pbo_head_hidden_size",
+    )
+    forward_dynamics_fields = (
+        "forward_dynamics_enabled",
+        "forward_dynamics_loss_weight",
+    )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
         if enabled:
@@ -146,6 +159,11 @@ def _load_model_config(cfg):
     for field_name in erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
+    apply_module_fields_preserve_checkpoint(bool(cfg.model.pbo_enabled), pbo_fields)
+    apply_module_fields_preserve_checkpoint(
+        bool(cfg.model.forward_dynamics_enabled),
+        forward_dynamics_fields,
+    )
     return config
 
 

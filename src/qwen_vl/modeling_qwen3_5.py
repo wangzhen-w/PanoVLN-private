@@ -15,6 +15,10 @@ PANOVGGT_POINT_HIDDEN_DIM = 1024
 PANOVGGT_FEATURE_SOURCES = {"aggregator", "point_hidden"}
 PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
+PBO_ACTION_HORIZON = 4
+PBO_NUM_ACTIONS = 4
+PBO_INPUT_VECTOR_COUNT = 7
+FORWARD_DYNAMICS_TARGET_DIM = 2048
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
@@ -33,6 +37,19 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_sampling_mode": "grouping",
         "panovggt_force_fp32": False,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
+    }
+    for field_name, default_value in defaults.items():
+        if not hasattr(config, field_name):
+            setattr(config, field_name, default_value)
+
+
+def ensure_auxiliary_dynamics_config(config) -> None:
+    defaults = {
+        "pbo_enabled": False,
+        "pbo_loss_weight": 0.1,
+        "pbo_head_hidden_size": 512,
+        "forward_dynamics_enabled": False,
+        "forward_dynamics_loss_weight": 0.1,
     }
     for field_name, default_value in defaults.items():
         if not hasattr(config, field_name):
@@ -610,7 +627,9 @@ class PanoVGGTGeometryMLP(nn.Module):
 class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration):
     _keys_to_ignore_on_load_unexpected = list(
         getattr(Qwen3_5ForConditionalGeneration, "_keys_to_ignore_on_load_unexpected", []) or []
-    ) + [r"panovggt\..*"]
+    ) + [
+        r"panovggt\..*",
+    ]
 
     PANOVGGT_STATE_KEYS = (
         "panovggt_mlp.alpha_value",
@@ -622,6 +641,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.output_norm.weight",
     )
     def __init__(self, config):
+        ensure_auxiliary_dynamics_config(config)
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
         if panovggt_enabled:
             ensure_panovggt_config(config)
@@ -631,6 +651,34 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             ensure_panovggt_config(config)
 
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
+        text_hidden_size = int(config.text_config.hidden_size)
+        pbo_hidden_size = int(getattr(config, "pbo_head_hidden_size", 512))
+        self.pbo_head = None
+        if bool(getattr(config, "pbo_enabled", False)):
+            self.pbo_head = nn.Sequential(
+                nn.LayerNorm(text_hidden_size * PBO_INPUT_VECTOR_COUNT),
+                nn.Linear(
+                    text_hidden_size * PBO_INPUT_VECTOR_COUNT,
+                    pbo_hidden_size,
+                ),
+                nn.GELU(),
+                nn.Linear(
+                    pbo_hidden_size,
+                    PBO_ACTION_HORIZON * PBO_NUM_ACTIONS,
+                ),
+            )
+            self.pbo_head.apply(self._init_weights)
+
+        self.forward_dynamics_head = None
+        if bool(getattr(config, "forward_dynamics_enabled", False)):
+            self.forward_dynamics_head = nn.Sequential(
+                nn.LayerNorm(text_hidden_size * 2),
+                nn.Linear(text_hidden_size * 2, text_hidden_size),
+                nn.GELU(),
+                nn.Linear(text_hidden_size, FORWARD_DYNAMICS_TARGET_DIM),
+            )
+            self.forward_dynamics_head.apply(self._init_weights)
+
         self.panovggt = None
         self._panovggt_weights_ready = False
         self._panovggt_dtype = None
@@ -643,10 +691,49 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_panovggt_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
+        self._capture_auxiliary_hidden = False
+        self._auxiliary_last_hidden = None
+        self.model.language_model.norm.register_forward_hook(
+            self._capture_auxiliary_hidden_hook
+        )
         self._install_pano_merger_hook()
         self._install_image_feature_hook()
         self.register_load_state_dict_pre_hook(self._drop_incompatible_panovggt_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
+
+    def _capture_auxiliary_hidden_hook(self, module, inputs, output) -> None:
+        del module, inputs
+        if self._capture_auxiliary_hidden:
+            self._auxiliary_last_hidden = output
+
+    def _pbo_enabled(self) -> bool:
+        return self.pbo_head is not None and bool(getattr(self.config, "pbo_enabled", False))
+
+    def _forward_dynamics_enabled(self) -> bool:
+        return self.forward_dynamics_head is not None and bool(
+            getattr(self.config, "forward_dynamics_enabled", False)
+        )
+
+    @staticmethod
+    def _distributed_masked_mean(
+        local_sum: torch.Tensor,
+        local_count: int,
+    ) -> torch.Tensor:
+        count = torch.tensor(
+            float(local_count),
+            device=local_sum.device,
+            dtype=torch.float32,
+        )
+        world_size = 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+            world_size = torch.distributed.get_world_size()
+        if float(count.item()) <= 0.0:
+            return local_sum * 0.0
+        # DDP/DeepSpeed averages gradients across data-parallel ranks.  Scaling
+        # each local sum by world_size/global_count therefore produces the true
+        # global masked mean after gradient reduction.
+        return local_sum * (float(world_size) / count)
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
@@ -1126,6 +1213,447 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if bool(valid[batch_index].item())
         ]
 
+    def _split_llm_image_hidden_states(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None,
+        image_grid_thw: torch.Tensor,
+        image_num_images: torch.Tensor,
+        image_erp_geometry: torch.Tensor | None,
+    ) -> list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]]:
+        batch_size = int(hidden_states.shape[0])
+        image_num_images = image_num_images.to(device="cpu", dtype=torch.long)
+        if int(image_num_images.numel()) != batch_size:
+            raise AssertionError(
+                "image_num_images batch mismatch: "
+                f"counts={int(image_num_images.numel())}, batch={batch_size}"
+            )
+        image_grid_cpu = image_grid_thw.detach().to(device="cpu", dtype=torch.long)
+        if int(image_num_images.sum().item()) != int(image_grid_cpu.shape[0]):
+            raise AssertionError(
+                "image_num_images does not sum to image_grid_thw rows: "
+                f"counts={image_num_images.tolist()}, grids={int(image_grid_cpu.shape[0])}"
+            )
+
+        geometry_cpu = None
+        if image_erp_geometry is not None:
+            geometry_cpu = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32)
+            if int(geometry_cpu.shape[0]) != int(image_grid_cpu.shape[0]):
+                raise AssertionError(
+                    "image_erp_geometry/image_grid_thw row mismatch: "
+                    f"geometry={int(geometry_cpu.shape[0])}, grids={int(image_grid_cpu.shape[0])}"
+                )
+
+        merge_size = int(self.config.vision_config.spatial_merge_size)
+        grid_offset = 0
+        grouped_hidden_states = []
+        for batch_index, num_images_tensor in enumerate(image_num_images):
+            num_images = int(num_images_tensor.item())
+            sample_grids = image_grid_cpu[grid_offset:grid_offset + num_images]
+            sample_geometry = (
+                None
+                if geometry_cpu is None
+                else geometry_cpu[grid_offset:grid_offset + num_images]
+            )
+            grid_offset += num_images
+
+            if mm_token_type_ids is not None:
+                visual_positions = torch.nonzero(
+                    mm_token_type_ids[batch_index] == 1,
+                    as_tuple=False,
+                ).flatten()
+            else:
+                visual_positions = torch.nonzero(
+                    input_ids[batch_index] == int(self.config.image_token_id),
+                    as_tuple=False,
+                ).flatten()
+
+            image_lengths = []
+            for grid in sample_grids.tolist():
+                grid_t, grid_h, grid_w = [int(value) for value in grid]
+                if grid_h % merge_size != 0 or grid_w % merge_size != 0:
+                    raise AssertionError(
+                        "Image grid is not divisible by Qwen spatial merge size: "
+                        f"grid={grid}, merge_size={merge_size}"
+                    )
+                image_lengths.append(
+                    grid_t * (grid_h // merge_size) * (grid_w // merge_size)
+                )
+            if int(visual_positions.numel()) != sum(image_lengths):
+                raise AssertionError(
+                    "LLM visual-token count does not match image grids: "
+                    f"sample={batch_index}, tokens={int(visual_positions.numel())}, "
+                    f"expected={sum(image_lengths)}, lengths={image_lengths}"
+                )
+
+            sample_visual_hidden = hidden_states[batch_index].index_select(
+                0,
+                visual_positions.to(device=hidden_states.device),
+            )
+            sample_groups = []
+            token_offset = 0
+            for image_index, (grid, image_length) in enumerate(
+                zip(sample_grids, image_lengths)
+            ):
+                geometry = (
+                    None if sample_geometry is None else sample_geometry[image_index]
+                )
+                sample_groups.append(
+                    (
+                        sample_visual_hidden[token_offset:token_offset + image_length],
+                        grid,
+                        geometry,
+                    )
+                )
+                token_offset += image_length
+            grouped_hidden_states.append(sample_groups)
+
+        return grouped_hidden_states
+
+    @staticmethod
+    def spherical_yaw_fourier_pool(
+        image_hidden_states: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        image_erp_geometry: torch.Tensor | None,
+        spatial_merge_size: int,
+    ) -> torch.Tensor:
+        grid_t, grid_h, grid_w = [
+            int(value)
+            for value in image_grid_thw.detach().to(device="cpu", dtype=torch.long).tolist()
+        ]
+        if grid_h % spatial_merge_size != 0 or grid_w % spatial_merge_size != 0:
+            raise AssertionError(
+                "Image grid is not divisible by the spatial merge size: "
+                f"grid={(grid_t, grid_h, grid_w)}, merge={spatial_merge_size}"
+            )
+        pooled_h = grid_h // spatial_merge_size
+        pooled_w = grid_w // spatial_merge_size
+        expected_tokens = grid_t * pooled_h * pooled_w
+        if int(image_hidden_states.shape[0]) != expected_tokens:
+            raise AssertionError(
+                "Fourier pooling token/grid mismatch: "
+                f"tokens={int(image_hidden_states.shape[0])}, expected={expected_tokens}"
+            )
+
+        hidden = image_hidden_states.float().reshape(
+            grid_t,
+            pooled_h,
+            pooled_w,
+            int(image_hidden_states.shape[-1]),
+        )
+        device = hidden.device
+        if image_erp_geometry is None:
+            vertical_fov = math.pi
+            center_latitude = 0.0
+        else:
+            geometry_values = image_erp_geometry.detach().to(
+                device="cpu",
+                dtype=torch.float32,
+            ).tolist()
+            vertical_fov = float(geometry_values[0])
+            center_latitude = float(geometry_values[1])
+
+        latitude = (
+            center_latitude
+            - 0.5 * vertical_fov
+            + (torch.arange(pooled_h, device=device, dtype=torch.float32) + 0.5)
+            * (vertical_fov / pooled_h)
+        )
+        longitude = (
+            -math.pi
+            + (torch.arange(pooled_w, device=device, dtype=torch.float32) + 0.5)
+            * (2.0 * math.pi / pooled_w)
+        )
+        area_weight = latitude.cos().clamp_min(0.0).view(1, pooled_h, 1, 1)
+        cosine_basis = longitude.cos().view(1, 1, pooled_w, 1)
+        sine_basis = longitude.sin().view(1, 1, pooled_w, 1)
+        denominator = area_weight.sum() * float(grid_t * pooled_w)
+        denominator = denominator.clamp_min(torch.finfo(torch.float32).eps)
+
+        zero_order = (hidden * area_weight).sum(dim=(0, 1, 2)) / denominator
+        cosine_order = (
+            2.0 * (hidden * area_weight * cosine_basis).sum(dim=(0, 1, 2))
+            / denominator
+        )
+        sine_order = (
+            2.0 * (hidden * area_weight * sine_basis).sum(dim=(0, 1, 2))
+            / denominator
+        )
+        return torch.cat((zero_order, cosine_order, sine_order), dim=-1)
+
+    @staticmethod
+    def _first_supervised_token_index(sample_labels: torch.Tensor) -> int:
+        supervised_positions = torch.nonzero(sample_labels != -100, as_tuple=False).flatten()
+        if supervised_positions.numel() == 0:
+            return -1
+        return int(supervised_positions[0].item())
+
+    def _last_action_token_index(self, sample_labels: torch.Tensor) -> int:
+        supervised_positions = torch.nonzero(
+            sample_labels != -100,
+            as_tuple=False,
+        ).flatten()
+        if supervised_positions.numel() == 0:
+            return -1
+
+        eos_token_id = getattr(self.config, "eos_token_id", None)
+        if eos_token_id is None:
+            text_config = getattr(self.config, "text_config", None)
+            eos_token_id = getattr(text_config, "eos_token_id", None)
+        if eos_token_id is None:
+            raise AssertionError(
+                "Forward dynamics requires eos_token_id to isolate action tokens"
+            )
+        eos_ids = torch.as_tensor(
+            eos_token_id,
+            device=sample_labels.device,
+            dtype=sample_labels.dtype,
+        ).flatten()
+        supervised_token_ids = sample_labels.index_select(
+            0,
+            supervised_positions,
+        )
+        is_eos = torch.isin(supervised_token_ids, eos_ids)
+        if not bool(is_eos[-1].item()):
+            raise AssertionError(
+                "Forward dynamics expects the supervised response to end with EOS"
+            )
+        supervised_positions = supervised_positions[~is_eos]
+        if supervised_positions.numel() == 0:
+            return -1
+        return int(supervised_positions[-1].item())
+
+    def _compute_pbo_loss(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
+        labels: torch.Tensor,
+        image_current_index: torch.Tensor,
+        pbo_action_labels: torch.Tensor | None,
+        pbo_valid_mask: torch.Tensor | None,
+        pbo_start_image_index: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.pbo_head is None:
+            return hidden_states.sum() * 0.0
+
+        batch_size, _, hidden_size = hidden_states.shape
+        head_dtype = next(self.pbo_head.parameters()).dtype
+        features = torch.zeros(
+            (batch_size, hidden_size * PBO_INPUT_VECTOR_COUNT),
+            device=hidden_states.device,
+            dtype=head_dtype,
+        )
+        if pbo_valid_mask is None:
+            valid_mask = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.bool)
+        else:
+            valid_mask = pbo_valid_mask.to(device=hidden_states.device, dtype=torch.bool)
+
+        current_indices = image_current_index.to(device="cpu", dtype=torch.long)
+        start_indices = (
+            torch.full((batch_size,), -1, dtype=torch.long)
+            if pbo_start_image_index is None
+            else pbo_start_image_index.to(device="cpu", dtype=torch.long)
+        )
+        merge_size = int(self.config.vision_config.spatial_merge_size)
+        for batch_index in torch.nonzero(valid_mask, as_tuple=False).flatten().tolist():
+            start_index = int(start_indices[batch_index].item())
+            current_index = int(current_indices[batch_index].item())
+            sample_groups = image_groups[batch_index]
+            if not (0 <= start_index < len(sample_groups)):
+                raise AssertionError(
+                    f"PBO start image index is invalid: sample={batch_index}, index={start_index}, "
+                    f"num_images={len(sample_groups)}"
+                )
+            if not (0 <= current_index < len(sample_groups)):
+                raise AssertionError(
+                    f"PBO current image index is invalid: sample={batch_index}, index={current_index}, "
+                    f"num_images={len(sample_groups)}"
+                )
+
+            previous_hidden, previous_grid, previous_geometry = sample_groups[start_index]
+            current_hidden, current_grid, current_geometry = sample_groups[current_index]
+            previous_fourier = self.spherical_yaw_fourier_pool(
+                previous_hidden,
+                previous_grid,
+                previous_geometry,
+                merge_size,
+            )
+            current_fourier = self.spherical_yaw_fourier_pool(
+                current_hidden,
+                current_grid,
+                current_geometry,
+                merge_size,
+            )
+            context_index = self._first_supervised_token_index(labels[batch_index]) - 1
+            if context_index < 0:
+                raise AssertionError(
+                    f"PBO sample {batch_index} has no prompt token before assistant response"
+                )
+            pbo_feature = torch.cat(
+                (
+                    hidden_states[batch_index, context_index].float(),
+                    previous_fourier,
+                    current_fourier,
+                ),
+                dim=-1,
+            )
+            features[batch_index] = pbo_feature.to(dtype=head_dtype)
+
+        logits = self.pbo_head(features).reshape(
+            batch_size,
+            PBO_ACTION_HORIZON,
+            PBO_NUM_ACTIONS,
+        )
+        local_loss_sum = logits.sum() * 0.0
+        local_target_count = 0
+        if bool(valid_mask.any().item()):
+            if pbo_action_labels is None:
+                raise AssertionError(
+                    "PBO has valid samples but pbo_action_labels is missing"
+                )
+            targets = pbo_action_labels.to(device=logits.device, dtype=torch.long)
+            valid_targets = targets[valid_mask].reshape(-1)
+            local_target_count = int((valid_targets != -100).sum().item())
+            local_loss_sum = F.cross_entropy(
+                logits[valid_mask].reshape(-1, PBO_NUM_ACTIONS).float(),
+                valid_targets,
+                reduction="sum",
+            )
+        return self._distributed_masked_mean(
+            local_loss_sum,
+            local_target_count,
+        )
+
+    def _panovggt_spatial_targets(
+        self,
+        panovggt_pixel_values: torch.Tensor,
+        *,
+        output_device: torch.device,
+    ) -> torch.Tensor:
+        if panovggt_pixel_values.ndim != 4:
+            raise AssertionError(
+                "Expected forward target panoramas [B,3,H,W], got "
+                f"{tuple(panovggt_pixel_values.shape)}"
+            )
+        panovggt_model = self._ensure_panovggt_model(
+            device=output_device,
+            dtype=next(self.forward_dynamics_head.parameters()).dtype,
+        )
+        if panovggt_model is None:
+            raise AssertionError("Forward dynamics requires an enabled PanoVGGT encoder")
+        encoder_param = next(panovggt_model.parameters())
+        images = panovggt_pixel_values.to(
+            device=encoder_param.device,
+            dtype=encoder_param.dtype,
+        ).unsqueeze(1)
+        with torch.no_grad():
+            aggregated = panovggt_model.aggregator(images)
+            if isinstance(aggregated, (list, tuple)):
+                token_list = aggregated[0]
+                patch_start_idx = int(aggregated[1])
+                tokens = token_list[-1] if isinstance(token_list, list) else token_list
+            else:
+                tokens = aggregated
+                patch_start_idx = 0
+            if tokens.ndim != 4:
+                raise AssertionError(
+                    "Expected PanoVGGT spatial tokens [B,S,P,C], got "
+                    f"{tuple(tokens.shape)}"
+                )
+            tokens = tokens[:, -1, patch_start_idx:, :]
+            if int(tokens.shape[-1]) != FORWARD_DYNAMICS_TARGET_DIM:
+                raise AssertionError(
+                    "Unexpected PanoVGGT target dimension: "
+                    f"expected={FORWARD_DYNAMICS_TARGET_DIM}, got={int(tokens.shape[-1])}"
+                )
+            targets = tokens.float().mean(dim=1)
+        return targets.to(device=output_device)
+
+    def _compute_forward_dynamics_loss(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
+        labels: torch.Tensor,
+        image_current_index: torch.Tensor,
+        forward_dynamics_valid_mask: torch.Tensor | None,
+        forward_target_panovggt_pixel_values: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.forward_dynamics_head is None:
+            return hidden_states.sum() * 0.0
+
+        batch_size, _, hidden_size = hidden_states.shape
+        head_dtype = next(self.forward_dynamics_head.parameters()).dtype
+        features = torch.zeros(
+            (batch_size, hidden_size * 2),
+            device=hidden_states.device,
+            dtype=head_dtype,
+        )
+        if forward_dynamics_valid_mask is None:
+            valid_mask = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.bool)
+        else:
+            valid_mask = forward_dynamics_valid_mask.to(
+                device=hidden_states.device,
+                dtype=torch.bool,
+            )
+        current_indices = image_current_index.to(device="cpu", dtype=torch.long)
+        for batch_index in torch.nonzero(valid_mask, as_tuple=False).flatten().tolist():
+            current_index = int(current_indices[batch_index].item())
+            sample_groups = image_groups[batch_index]
+            if not (0 <= current_index < len(sample_groups)):
+                raise AssertionError(
+                    "Forward dynamics current image index is invalid: "
+                    f"sample={batch_index}, index={current_index}, num_images={len(sample_groups)}"
+                )
+            current_observation_hidden = sample_groups[current_index][0][-1]
+            # The target is the state after the complete four-action chunk.  The
+            # last action-token hidden is causal, so it encodes all four actions.
+            action_token_index = self._last_action_token_index(labels[batch_index])
+            if action_token_index < 0:
+                raise AssertionError(
+                    f"Forward dynamics sample {batch_index} has no non-EOS action token"
+                )
+            action_hidden = hidden_states[batch_index, action_token_index]
+            features[batch_index] = torch.cat(
+                (current_observation_hidden, action_hidden),
+                dim=-1,
+            ).to(dtype=head_dtype)
+
+        predictions = self.forward_dynamics_head(features)
+        local_loss_sum = predictions.sum() * 0.0
+        local_target_count = 0
+        if bool(valid_mask.any().item()):
+            if forward_target_panovggt_pixel_values is None:
+                raise AssertionError(
+                    "Forward dynamics has valid samples but next-observation "
+                    "PanoVGGT targets are missing"
+                )
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+            target_pixels = forward_target_panovggt_pixel_values.index_select(
+                0,
+                valid_indices.to(
+                    device=forward_target_panovggt_pixel_values.device,
+                ),
+            )
+            targets = self._panovggt_spatial_targets(
+                target_pixels,
+                output_device=predictions.device,
+            )
+            valid_predictions = predictions.index_select(0, valid_indices).float()
+            local_target_count = int(valid_predictions.numel())
+            local_loss_sum = F.mse_loss(
+                valid_predictions,
+                targets.float(),
+                reduction="sum",
+            )
+        return self._distributed_masked_mean(
+            local_loss_sum,
+            local_target_count,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1144,6 +1672,11 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images: torch.LongTensor | None = None,
         image_current_index: torch.LongTensor | None = None,
         panovggt_pixel_values: torch.Tensor | None = None,
+        pbo_action_labels: torch.LongTensor | None = None,
+        pbo_valid_mask: torch.BoolTensor | None = None,
+        pbo_start_image_index: torch.LongTensor | None = None,
+        forward_dynamics_valid_mask: torch.BoolTensor | None = None,
+        forward_target_panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
         if self._panovggt_enabled():
@@ -1154,8 +1687,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 image_erp_geometry=image_erp_geometry,
                 panovggt_pixel_values=panovggt_pixel_values,
             )
+        auxiliary_enabled = bool(
+            labels is not None
+            and (self._pbo_enabled() or self._forward_dynamics_enabled())
+        )
+        self._capture_auxiliary_hidden = auxiliary_enabled
+        self._auxiliary_last_hidden = None
         try:
-            return super().forward(
+            outputs = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1170,7 +1709,69 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 logits_to_keep=logits_to_keep,
                 **kwargs,
             )
+            if not auxiliary_enabled:
+                return outputs
+            hidden_states = self._auxiliary_last_hidden
+            if hidden_states is None:
+                raise AssertionError("Failed to capture the final LLM hidden states")
+            if input_ids is None or labels is None:
+                raise AssertionError("Auxiliary dynamics losses require input_ids and labels")
+
+            batch_size = int(hidden_states.shape[0])
+            if image_num_images is None:
+                image_num_images = torch.zeros(
+                    batch_size,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+            if image_current_index is None:
+                image_current_index = image_num_images - 1
+            if image_grid_thw is not None:
+                image_groups = self._split_llm_image_hidden_states(
+                    hidden_states=hidden_states,
+                    input_ids=input_ids,
+                    mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw,
+                    image_num_images=image_num_images,
+                    image_erp_geometry=image_erp_geometry,
+                )
+            else:
+                image_groups = [[] for _ in range(batch_size)]
+
+            auxiliary_loss = hidden_states.sum() * 0.0
+            if self._pbo_enabled():
+                pbo_loss = self._compute_pbo_loss(
+                    hidden_states=hidden_states,
+                    image_groups=image_groups,
+                    labels=labels,
+                    image_current_index=image_current_index,
+                    pbo_action_labels=pbo_action_labels,
+                    pbo_valid_mask=pbo_valid_mask,
+                    pbo_start_image_index=pbo_start_image_index,
+                )
+                auxiliary_loss = auxiliary_loss + float(
+                    getattr(self.config, "pbo_loss_weight", 0.1)
+                ) * pbo_loss
+            if self._forward_dynamics_enabled():
+                forward_dynamics_loss = self._compute_forward_dynamics_loss(
+                    hidden_states=hidden_states,
+                    image_groups=image_groups,
+                    labels=labels,
+                    image_current_index=image_current_index,
+                    forward_dynamics_valid_mask=forward_dynamics_valid_mask,
+                    forward_target_panovggt_pixel_values=(
+                        forward_target_panovggt_pixel_values
+                    ),
+                )
+                auxiliary_loss = auxiliary_loss + float(
+                    getattr(self.config, "forward_dynamics_loss_weight", 0.1)
+                ) * forward_dynamics_loss
+
+            outputs.loss = auxiliary_loss if outputs.loss is None else outputs.loss + auxiliary_loss
+            return outputs
         finally:
+            self._capture_auxiliary_hidden = False
+            self._auxiliary_last_hidden = None
             self._clear_runtime_pano_context()
 
     def _load_missing_pano_parameters_post_hook(self, module, incompatible_keys) -> None:

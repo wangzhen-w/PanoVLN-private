@@ -2,6 +2,8 @@ import json
 import math
 import os
 import random
+import re
+from itertools import combinations
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -36,9 +38,12 @@ VLN_ACTION_ALIASES = {
     "stop": "stop",
 }
 VLN_ACTION_SEQUENCE_LENGTH = 4
-VLN_TASK_FDS = "fds"
-VLN_TASK_IDS = "ids"
-VLN_TASK_TYPES = {VLN_TASK_FDS, VLN_TASK_IDS}
+VLN_ACTION_TO_ID = {
+    "stop": 0,
+    "forward": 1,
+    "left": 2,
+    "right": 3,
+}
 VLN_SYSTEM_PROMPT = (
     "You are an autonomous navigation assistant. "
     "Your task is to follow the navigation instruction. "
@@ -48,17 +53,6 @@ VLN_SYSTEM_PROMPT = (
     "Return exactly four action words in execution order, separated by spaces. "
     "If the task is complete before four actions, fill the remaining positions with stop."
 )
-VLN_INVERSE_DYNAMICS_SYSTEM_PROMPT = (
-    "You are an autonomous navigation assistant. "
-    "Your task is to understand the agent's recent navigation history. "
-    "Given the navigation instruction, a history memory observation, and the "
-    "current observation, analyze the visual change and infer the recent navigation "
-    "actions executed by the agent to reach its current state. "
-    "Use the four actions: left or right by 15 degrees, forward by 25 centimeters, "
-    "or stop. Return exactly four action words in execution order, separated by spaces."
-)
-
-
 def crop_erp_latitude(
     image: Image.Image,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
@@ -166,6 +160,7 @@ def build_vln_image_selection(
     last_frame_index: int,
     max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
     memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
+    required_frame_indices: Optional[List[int]] = None,
 ) -> List[int]:
     max_memory_images = max(0, int(max_memory_images))
     memory_pool_window_frames = max(1, int(memory_pool_window_frames))
@@ -173,22 +168,125 @@ def build_vln_image_selection(
     pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
     candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
 
+    required = sorted(
+        {
+            int(index)
+            for index in (required_frame_indices or [])
+            if pool_start_frame <= int(index) <= current_frame_index
+        }
+    )
+
     total_selected_images = max_memory_images + 1
     if total_selected_images <= 0 or not candidate_frame_indices:
         return [current_frame_index]
 
     if len(candidate_frame_indices) <= total_selected_images:
-        return candidate_frame_indices
+        selected_indices = candidate_frame_indices
+    elif total_selected_images == 1:
+        if any(index != current_frame_index for index in required):
+            raise ValueError(
+                "Cannot retain required VLN history frames without a memory slot: "
+                f"required={required}, budget={total_selected_images}"
+            )
+        selected_indices = [current_frame_index]
+    else:
+        mandatory_indices = sorted(
+            {pool_start_frame, current_frame_index, *required}
+        )
+        if len(mandatory_indices) > total_selected_images:
+            raise ValueError(
+                "Cannot retain required VLN history frames within the configured "
+                f"memory budget: required={required}, budget={total_selected_images}"
+            )
 
-    if total_selected_images == 1:
-        return [current_frame_index]
+        # Start from the original uniform grid.  If a required anchor is
+        # missing, jointly redistribute the grid so that adjacent temporal
+        # gaps remain as even as possible under the anchor constraint.
+        last_candidate_position = len(candidate_frame_indices) - 1
+        selected_positions = [
+            (slot * last_candidate_position) // (total_selected_images - 1)
+            for slot in range(total_selected_images)
+        ]
+        selected_indices = [
+            candidate_frame_indices[position] for position in selected_positions
+        ]
+        missing_required = [
+            index for index in required if index not in selected_indices
+        ]
+        if not missing_required:
+            return selected_indices
 
-    last_candidate_position = len(candidate_frame_indices) - 1
-    selected_positions = [
-        (slot * last_candidate_position) // (total_selected_images - 1)
-        for slot in range(total_selected_images)
-    ]
-    return [candidate_frame_indices[position] for position in selected_positions]
+        internal_mandatory = [
+            index
+            for index in mandatory_indices
+            if index not in {pool_start_frame, current_frame_index}
+        ]
+        best_selection = None
+        best_score = None
+        for internal_slots in combinations(
+            range(1, total_selected_images - 1),
+            len(internal_mandatory),
+        ):
+            anchor_indices = [
+                pool_start_frame,
+                *internal_mandatory,
+                current_frame_index,
+            ]
+            anchor_slots = [0, *internal_slots, total_selected_images - 1]
+            if any(
+                right_index - left_index < right_slot - left_slot
+                for left_index, right_index, left_slot, right_slot in zip(
+                    anchor_indices,
+                    anchor_indices[1:],
+                    anchor_slots,
+                    anchor_slots[1:],
+                )
+            ):
+                continue
+
+            selection = [pool_start_frame] * total_selected_images
+            for left_index, right_index, left_slot, right_slot in zip(
+                anchor_indices,
+                anchor_indices[1:],
+                anchor_slots,
+                anchor_slots[1:],
+            ):
+                frame_span = right_index - left_index
+                slot_span = right_slot - left_slot
+                for offset in range(slot_span + 1):
+                    selection[left_slot + offset] = left_index + (
+                        offset * frame_span + slot_span // 2
+                    ) // slot_span
+
+            gaps = [
+                right - left for left, right in zip(selection, selection[1:])
+            ]
+            gap_uniformity_cost = sum(gap * gap for gap in gaps)
+            original_grid_distance = sum(
+                (frame_index - original_index) ** 2
+                for frame_index, original_index in zip(
+                    selection,
+                    selected_indices,
+                )
+            )
+            candidate_score = (
+                gap_uniformity_cost,
+                original_grid_distance,
+                selection,
+            )
+            if best_score is None or candidate_score < best_score:
+                best_score = candidate_score
+                best_selection = selection
+
+        if best_selection is None:
+            raise ValueError(
+                "Cannot distribute required VLN history frames within the "
+                f"configured memory budget: required={required}, "
+                f"budget={total_selected_images}"
+            )
+        selected_indices = best_selection
+
+    return selected_indices
 
 
 def select_vln_image_paths(
@@ -239,22 +337,6 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
         ]
     )
     return content
-
-
-def build_inverse_dynamics_user_content(
-    instruction: str,
-) -> List[Dict[str, str]]:
-    return [
-        text_content(f"Instruction: {instruction.strip()}"),
-        text_content("\nHistory memory observation (panoramic view):"),
-        image_content(),
-        text_content("\nCurrent observation (panoramic view):"),
-        image_content(),
-        text_content(
-            "\nInfer the recent action sequence that brought the agent to its "
-            "current state."
-        ),
-    ]
 
 
 def _resolve_image_path(path: str, image_root: Optional[str]) -> str:
@@ -316,16 +398,6 @@ def _extract_vln_instruction(example: Dict[str, Any]) -> str:
     raise ValueError("VLN example is missing an instruction")
 
 
-def _extract_vln_task_type(example: Dict[str, Any]) -> str:
-    task_type = example.get("task_type", VLN_TASK_FDS)
-    if task_type in VLN_TASK_TYPES:
-        return task_type
-    raise ValueError(
-        "VLN example field 'task_type' must be either "
-        f"{VLN_TASK_FDS!r} or {VLN_TASK_IDS!r}, got {task_type!r}"
-    )
-
-
 def _normalize_vln_action(action: Any) -> Optional[str]:
     if not isinstance(action, str):
         return None
@@ -360,7 +432,95 @@ def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
     return normalized_actions
 
 
-def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_vln_history_actions(
+    example: Dict[str, Any],
+    current_step: int,
+) -> Optional[List[str]]:
+    history_actions = example.get("history_actions")
+    if history_actions is None:
+        return None
+    if not isinstance(history_actions, list):
+        raise ValueError("VLN example field 'history_actions' must be a list")
+    normalized_actions = []
+    for action_index, action in enumerate(history_actions):
+        normalized_action = _normalize_vln_action(action)
+        if normalized_action is None:
+            raise ValueError(
+                "VLN example field 'history_actions' contains an invalid action "
+                f"at index {action_index}: {action!r}"
+            )
+        if normalized_action == "stop":
+            raise ValueError("VLN history_actions cannot contain terminal stop")
+        normalized_actions.append(normalized_action)
+    if len(normalized_actions) != current_step:
+        raise ValueError(
+            "VLN history/image alignment mismatch: "
+            f"step_index={current_step}, history_actions={len(normalized_actions)}"
+        )
+    return normalized_actions
+
+
+def _extract_real_action_count(
+    example: Dict[str, Any],
+    action_sequence: List[str],
+) -> int:
+    try:
+        first_stop_index = action_sequence.index("stop")
+    except ValueError:
+        expected_count = len(action_sequence)
+    else:
+        expected_count = first_stop_index + 1
+        if any(action != "stop" for action in action_sequence[first_stop_index + 1:]):
+            raise ValueError(
+                "VLN action_sequence cannot contain executable actions after stop"
+            )
+
+    value = example.get("real_action_count")
+    if value is None:
+        return expected_count
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("VLN example field 'real_action_count' must be an integer")
+    if value < 1 or value > VLN_ACTION_SEQUENCE_LENGTH:
+        raise ValueError(
+            "VLN example field 'real_action_count' must be in [1, 4], "
+            f"got {value}"
+        )
+    if value != expected_count:
+        raise ValueError(
+            "VLN real_action_count/action_sequence mismatch: "
+            f"real_action_count={value}, expected={expected_count}, "
+            f"action_sequence={action_sequence}"
+        )
+    return int(value)
+
+
+def _forward_target_observation_path(
+    current_path: str,
+    action_sequence: List[str],
+) -> str:
+    directory, filename = os.path.split(current_path)
+    match = re.fullmatch(r"frame_(\d+)(\.[^.]+)", filename)
+    if match is None:
+        raise ValueError(
+            "Forward dynamics requires frame_<step> image names, got "
+            f"{current_path!r}"
+        )
+    # Each non-STOP action produces one stored observation.  A real STOP in the
+    # fourth slot is an identity transition, so its conceptual t+4 state reuses
+    # the stored t+3 panorama.
+    target_offset = sum(action != "stop" for action in action_sequence)
+    target_filename = (
+        f"frame_{int(match.group(1)) + target_offset}{match.group(2)}"
+    )
+    return os.path.join(directory, target_filename)
+
+
+def apply_vln_memory_policy(
+    example: Dict[str, Any],
+    *,
+    pbo_enabled: bool = False,
+    forward_dynamics_enabled: bool = False,
+) -> Dict[str, Any]:
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
         raise ValueError("VLN example field 'images' must contain the full image history")
@@ -368,47 +528,74 @@ def apply_vln_memory_policy(example: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(image_path, str) or not image_path:
             raise ValueError("VLN example field 'images' must contain non-empty string paths")
 
-    task_type = _extract_vln_task_type(example)
-    if task_type == VLN_TASK_IDS:
-        current_frame_index = len(raw_images) - 1
-        start_frame_index = current_frame_index - VLN_ACTION_SEQUENCE_LENGTH
-        if start_frame_index < 0:
-            raise ValueError(
-                "Inverse-dynamics samples require at least four historical actions "
-                f"and five observations, got {len(raw_images)} observations"
-            )
-        selected_images = [
-            raw_images[start_frame_index],
-            raw_images[current_frame_index],
-        ]
-    else:
-        selected_images = select_vln_image_paths(raw_images)
+    current_step = example.get("step_index", len(raw_images) - 1)
+    if isinstance(current_step, bool) or not isinstance(current_step, int) or current_step < 0:
+        raise ValueError("VLN example field 'step_index' must be a non-negative integer")
+    if len(raw_images) != current_step + 1:
+        raise ValueError(
+            "VLN history/image alignment mismatch: "
+            f"step_index={current_step}, images={len(raw_images)}"
+        )
+
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example)
-    if task_type == VLN_TASK_IDS and "stop" in action_sequence:
-        raise ValueError(
-            "Inverse-dynamics action_sequence cannot contain terminal stop"
-        )
+    history_actions = _extract_vln_history_actions(example, current_step)
+    real_action_count = _extract_real_action_count(example, action_sequence)
 
-    if task_type == VLN_TASK_IDS:
-        system_prompt = VLN_INVERSE_DYNAMICS_SYSTEM_PROMPT
-        user_content = build_inverse_dynamics_user_content(
-            instruction=instruction,
-        )
+    pbo_valid = bool(
+        pbo_enabled
+        and history_actions is not None
+        and len(history_actions) >= VLN_ACTION_SEQUENCE_LENGTH
+    )
+    four_step_memory_anchor = (
+        current_step - VLN_ACTION_SEQUENCE_LENGTH
+        if current_step >= VLN_ACTION_SEQUENCE_LENGTH
+        else -1
+    )
+    selected_indices = build_vln_image_selection(
+        current_step=current_step,
+        last_frame_index=len(raw_images) - 1,
+        required_frame_indices=(
+            [four_step_memory_anchor] if four_step_memory_anchor >= 0 else None
+        ),
+    )
+    selected_images = [raw_images[index] for index in selected_indices]
+    pbo_start_image_index = (
+        selected_indices.index(four_step_memory_anchor) if pbo_valid else -1
+    )
+
+    if pbo_valid:
+        pbo_action_labels = [
+            VLN_ACTION_TO_ID[action]
+            for action in history_actions[-VLN_ACTION_SEQUENCE_LENGTH:]
+        ]
     else:
-        system_prompt = VLN_SYSTEM_PROMPT
-        user_content = build_vln_user_content(
-            instruction=instruction,
-            num_images=len(selected_images),
-        )
+        pbo_action_labels = [-100] * VLN_ACTION_SEQUENCE_LENGTH
+
+    user_content = build_vln_user_content(
+        instruction=instruction,
+        num_images=len(selected_images),
+    )
 
     normalized = dict(example)
-    normalized["task_type"] = task_type
     normalized["images"] = selected_images
+    normalized["_pbo_valid"] = pbo_valid
+    normalized["_pbo_start_image_index"] = pbo_start_image_index
+    normalized["_pbo_action_labels"] = pbo_action_labels
+    forward_dynamics_valid = bool(
+        forward_dynamics_enabled
+        and real_action_count == VLN_ACTION_SEQUENCE_LENGTH
+    )
+    normalized["_forward_dynamics_valid"] = forward_dynamics_valid
+    normalized["_forward_target_image"] = (
+        _forward_target_observation_path(raw_images[-1], action_sequence)
+        if forward_dynamics_valid
+        else None
+    )
     normalized["messages"] = [
         {
             "role": "system",
-            "content": [text_content(system_prompt)],
+            "content": [text_content(VLN_SYSTEM_PROMPT)],
         },
         {
             "role": "user",
@@ -487,6 +674,8 @@ class SupervisedDataset(Dataset):
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
+        pbo_enabled: bool = False,
+        forward_dynamics_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -504,6 +693,8 @@ class SupervisedDataset(Dataset):
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
+        self.pbo_enabled = bool(pbo_enabled)
+        self.forward_dynamics_enabled = bool(forward_dynamics_enabled)
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -546,7 +737,6 @@ class SupervisedDataset(Dataset):
     def _load_images(
         self,
         image_paths: List[str],
-        task_type: str = VLN_TASK_FDS,
     ):
         processed_images = []
         raw_images = []
@@ -555,10 +745,7 @@ class SupervisedDataset(Dataset):
             with Image.open(image_path) as image:
                 raw_image = image.convert("RGB")
                 is_current_observation = image_index == num_images - 1
-                # IDS compares two equally important endpoints.  Keep both at the
-                # current-observation resolution instead of treating the earlier
-                # endpoint as a low-resolution FDS memory frame.
-                if task_type == VLN_TASK_IDS or is_current_observation:
+                if is_current_observation:
                     processed_image = preprocess_vln_current_image(
                         raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
@@ -575,7 +762,11 @@ class SupervisedDataset(Dataset):
         return processed_images, raw_images
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        example = apply_vln_memory_policy(self._load_example(index))
+        example = apply_vln_memory_policy(
+            self._load_example(index),
+            pbo_enabled=self.pbo_enabled,
+            forward_dynamics_enabled=self.forward_dynamics_enabled,
+        )
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
             image_root=self.image_root,
@@ -595,7 +786,6 @@ class SupervisedDataset(Dataset):
         if vision_paths:
             processed_images, raw_images = self._load_images(
                 image_paths=vision_paths,
-                task_type=example["task_type"],
             )
             encoded = self.processor(
                 text=full_text,
@@ -649,6 +839,22 @@ class SupervisedDataset(Dataset):
             [resolve_current_image_index(image_count)],
             dtype=torch.long,
         )
+        item["pbo_action_labels"] = torch.tensor(
+            [example["_pbo_action_labels"]],
+            dtype=torch.long,
+        )
+        item["pbo_valid_mask"] = torch.tensor(
+            [example["_pbo_valid"]],
+            dtype=torch.bool,
+        )
+        item["pbo_start_image_index"] = torch.tensor(
+            [example["_pbo_start_image_index"]],
+            dtype=torch.long,
+        )
+        item["forward_dynamics_valid_mask"] = torch.tensor(
+            [example["_forward_dynamics_valid"]],
+            dtype=torch.bool,
+        )
 
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
@@ -657,6 +863,21 @@ class SupervisedDataset(Dataset):
             item["panovggt_pixel_values"] = preprocess_panovggt_current_image(
                 raw_images[-1]
             ).unsqueeze(0)
+
+        if example["_forward_dynamics_valid"]:
+            target_path = _resolve_image_path(
+                example["_forward_target_image"],
+                self.image_root,
+            )
+            current_path = vision_paths[-1]
+            if os.path.abspath(target_path) == os.path.abspath(current_path):
+                target_raw_image = raw_images[-1]
+            else:
+                with Image.open(target_path) as image:
+                    target_raw_image = image.convert("RGB")
+            item["forward_target_panovggt_pixel_values"] = (
+                preprocess_panovggt_current_image(target_raw_image).unsqueeze(0)
+            )
 
         for key in STACKABLE_KEYS:
             if key in encoded:
@@ -672,4 +893,9 @@ STACKABLE_KEYS = (
     "image_num_images",
     "image_current_index",
     "panovggt_pixel_values",
+    "pbo_action_labels",
+    "pbo_valid_mask",
+    "pbo_start_image_index",
+    "forward_dynamics_valid_mask",
+    "forward_target_panovggt_pixel_values",
 )

@@ -11,6 +11,8 @@ model:
     visual_merger: true
     language_model: true
     panovggt_mlp: true
+    pbo_head: true
+    forward_dynamics_head: true
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
   panovggt_enabled: true
@@ -20,6 +22,13 @@ model:
   panovggt_injection_stage: "pre_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
   panovggt_sampling_mode: "singlepoint"    #"singlepoint"每个 Qwen token 采一个 PanoVGGT token / "grouping"每个 Qwen token 聚合局部2x2 PanoVGGT latent
   panovggt_force_fp32: false
+  # PBO: 7D fixed Fourier endpoint/context features + past-4 action head.
+  pbo_enabled: true
+  pbo_loss_weight: 0.1
+  pbo_head_hidden_size: 512
+  # FutureNav-style prediction of the PanoVGGT latent after a full 4-action chunk.
+  forward_dynamics_enabled: true
+  forward_dynamics_loss_weight: 0.1
 
 data:
   train_jsonl: "/workspace/data2/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
@@ -40,7 +49,7 @@ data:
     mixing_strategy: "sample"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.20_lr2e-5_singlepoint_8card"
+  output_dir: "/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.20_lr2e-5_singlepoint_8card_pbo_fd"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -50,6 +59,8 @@ training:
   visual_lr: 2e-6
   visual_merger_lr: 1.0e-5
   panovggt_mlp_lr: 2.0e-5
+  pbo_head_lr: 2.0e-5
+  forward_dynamics_head_lr: 2.0e-5
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5
