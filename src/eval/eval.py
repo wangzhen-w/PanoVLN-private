@@ -134,6 +134,7 @@ def select_vln_eval_image_indices(
     history_length: int,
     max_memory_images: int,
     memory_pool_window_frames: int,
+    pbo_enabled: bool = False,
 ) -> List[int]:
     last_frame_index = history_length - 1
     if last_frame_index < 0:
@@ -145,7 +146,7 @@ def select_vln_eval_image_indices(
         memory_pool_window_frames=memory_pool_window_frames,
         required_frame_indices=(
             [last_frame_index - ACTION_SEQUENCE_LENGTH]
-            if last_frame_index >= ACTION_SEQUENCE_LENGTH
+            if pbo_enabled and last_frame_index >= ACTION_SEQUENCE_LENGTH
             else None
         ),
     )
@@ -444,6 +445,7 @@ class PanoVLN_Agent(Agent):
         self.erp_bottom_crop_degrees = float(
             getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
         )
+        self.pbo_enabled = bool(getattr(self.model.config, "pbo_enabled", False))
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -478,7 +480,11 @@ class PanoVLN_Agent(Agent):
                 setattr(text_config, "bos_token_id", self.bos_token_id)
             if getattr(self.model, "generation_config", None) is not None:
                 self.model.generation_config.bos_token_id = self.bos_token_id
-        print(f"Initialization Complete (attn_implementation={self.attn_implementation})")
+        print(
+            "Initialization Complete "
+            f"(attn_implementation={self.attn_implementation}, "
+            f"pbo_enabled={self.pbo_enabled})"
+        )
         
         self.rgb_history = []
         self.current_images = []
@@ -549,6 +555,7 @@ class PanoVLN_Agent(Agent):
             history_length=len(self.rgb_history),
             max_memory_images=self.max_memory_images,
             memory_pool_window_frames=self.memory_pool_window_frames,
+            pbo_enabled=self.pbo_enabled,
         )
 
     def _prepare_selected_images(self, selected_indices):

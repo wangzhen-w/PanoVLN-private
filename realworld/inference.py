@@ -111,6 +111,7 @@ def _select_images(
     *,
     max_memory_images: int,
     memory_pool_window_frames: int,
+    pbo_enabled: bool = False,
 ) -> list[Image.Image]:
     if not images:
         raise ValueError("At least one image is required")
@@ -123,7 +124,7 @@ def _select_images(
         memory_pool_window_frames=memory_pool_window_frames,
         required_frame_indices=(
             [len(images) - 1 - ACTION_SEQUENCE_LENGTH]
-            if len(images) - 1 >= ACTION_SEQUENCE_LENGTH
+            if pbo_enabled and len(images) - 1 >= ACTION_SEQUENCE_LENGTH
             else None
         ),
     )
@@ -336,12 +337,14 @@ class PanoVLNPredictor:
             self.erp_bottom_crop_degrees = float(
                 getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
             )
+            self.pbo_enabled = bool(getattr(self.model.config, "pbo_enabled", False))
             _log_stage(
                 "model moved and initialized "
                 f"device={self._input_device()} "
                 f"dtype={next(self.model.parameters()).dtype} "
                 f"crop_top={self.erp_top_crop_degrees} "
                 f"crop_bottom={self.erp_bottom_crop_degrees} "
+                f"pbo_enabled={self.pbo_enabled} "
                 f"in {_format_elapsed(step_start)}"
             )
             _log_stage(f"model load finished in {_format_elapsed(load_start)}")
@@ -408,6 +411,7 @@ class PanoVLNPredictor:
             loaded_images,
             max_memory_images=self.config.max_memory_images,
             memory_pool_window_frames=self.config.memory_pool_window_frames,
+            pbo_enabled=self.pbo_enabled,
         )
         _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
         processed_images, panovggt_pixel_values = self._prepare_images(selected_images)

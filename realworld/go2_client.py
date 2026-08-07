@@ -300,6 +300,7 @@ def selected_history(
     *,
     max_memory_images: int,
     memory_pool_window_frames: int,
+    pbo_enabled: bool = False,
 ) -> list[bytes]:
     if not history:
         return []
@@ -310,7 +311,7 @@ def selected_history(
         memory_pool_window_frames=memory_pool_window_frames,
         required_frame_indices=(
             [len(history) - 1 - PBO_ACTION_HORIZON]
-            if len(history) - 1 >= PBO_ACTION_HORIZON
+            if pbo_enabled and len(history) - 1 >= PBO_ACTION_HORIZON
             else None
         ),
     )
@@ -1088,6 +1089,7 @@ def request_prediction(
     history_snapshot: Sequence[bytes],
     max_memory_images: int,
     memory_pool_window_frames: int,
+    pbo_enabled: bool,
     upload_image_mode: str,
     jpeg_quality: int,
     upload_size: tuple[int, int],
@@ -1096,6 +1098,7 @@ def request_prediction(
         history_snapshot,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
+        pbo_enabled=pbo_enabled,
     )
     request_images = prepare_upload_images(
         selected_images,
@@ -1448,6 +1451,13 @@ def main() -> None:
         ready = client.ready()
         print({"server_ready": ready}, flush=True)
         run_log["server_ready"] = ready
+        if "pbo_enabled" not in ready:
+            raise RuntimeError(
+                "Server /ready response is missing pbo_enabled; update the server "
+                "so real-world memory sampling matches the loaded checkpoint"
+            )
+        pbo_enabled = bool(ready["pbo_enabled"])
+        run_log["upload"]["pbo_enabled"] = pbo_enabled
         backend.stand()
         replans = 0
         pending_prediction: Optional[PendingPrediction] = None
@@ -1465,6 +1475,7 @@ def main() -> None:
                     history_snapshot=list(history),
                     max_memory_images=args.upload_max_memory_images,
                     memory_pool_window_frames=args.upload_memory_pool_window_frames,
+                    pbo_enabled=pbo_enabled,
                     upload_image_mode=args.upload_image_mode,
                     jpeg_quality=args.jpeg_quality,
                     upload_size=(args.upload_width, args.upload_height),
@@ -1564,6 +1575,7 @@ def main() -> None:
                             "history_snapshot": list(history),
                             "max_memory_images": args.upload_max_memory_images,
                             "memory_pool_window_frames": args.upload_memory_pool_window_frames,
+                            "pbo_enabled": pbo_enabled,
                             "upload_image_mode": args.upload_image_mode,
                             "jpeg_quality": args.jpeg_quality,
                             "upload_size": (args.upload_width, args.upload_height),

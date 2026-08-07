@@ -556,7 +556,9 @@ def apply_vln_memory_policy(
         current_step=current_step,
         last_frame_index=len(raw_images) - 1,
         required_frame_indices=(
-            [four_step_memory_anchor] if four_step_memory_anchor >= 0 else None
+            [four_step_memory_anchor]
+            if pbo_valid and four_step_memory_anchor >= 0
+            else None
         ),
     )
     selected_images = [raw_images[index] for index in selected_indices]
