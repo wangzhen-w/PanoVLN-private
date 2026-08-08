@@ -53,5 +53,5 @@ habitat:
     split: train
     roles: [guide]
     languages: ["en-US", "en-IN"]
-    scenes_dir: /workspace/code/a_property/dataset/janusvln_data/scene_datasets
-    data_path: /workspace/code/a_property/dataset/janusvln_data/datasets/rxr/{split}/{split}_{role}.json.gz
+    scenes_dir: /workspace/data2/dataset/general_VLN_data/Matterport3D/mp3d_habitat
+    data_path: /workspace/data2/dataset/general_VLN_data/RxR_VLNCE_v0/{split}/{split}_{role}.json.gz

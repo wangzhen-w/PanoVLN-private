@@ -236,10 +236,24 @@ def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, 
 
 def _resolve_image_path(path: str, image_root: Optional[str]) -> str:
     if os.path.isabs(path) or path.startswith(("http://", "https://", "file://")):
-        return path
-    if image_root is None:
-        return path
-    return os.path.join(image_root, path)
+        resolved_path = path
+    elif image_root is None:
+        resolved_path = path
+    else:
+        resolved_path = os.path.join(image_root, path)
+
+    # Existing VLN JSONL files reference frame_*.jpg.  Allow the extraction
+    # pipeline to switch to lossless PNG without rewriting those large files.
+    if (
+        not resolved_path.startswith(("http://", "https://", "file://"))
+        and not os.path.exists(resolved_path)
+    ):
+        stem, extension = os.path.splitext(resolved_path)
+        if extension.lower() in {".jpg", ".jpeg"}:
+            png_path = f"{stem}.png"
+            if os.path.exists(png_path):
+                return png_path
+    return resolved_path
 
 
 def _resolve_content_item(

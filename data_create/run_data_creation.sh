@@ -29,7 +29,9 @@ MAX_BLACK_RATIO=0.10  # 单帧允许的黑色/无效全景区域最大比例。
 
 PANORAMA_WIDTH=1600  # 正式发布图片的全景宽度。
 PANORAMA_HEIGHT=800  # 正式发布图片的全景高度。
-PANORAMA_JPEG_QUALITY=92  # 正式全景图片的 JPEG 质量。
+PANORAMA_IMAGE_FORMAT="jpeg"  # 正式全景格式：jpeg / png；PanoVLN 默认 JPEG。
+PANORAMA_JPEG_QUALITY=92  # PANORAMA_IMAGE_FORMAT=jpeg 时使用。
+PANORAMA_PNG_COMPRESS_LEVEL=6  # PANORAMA_IMAGE_FORMAT=png 时使用；PNG 始终无损。
 TILE_WIDTH=384  # 从全景投影、交给 VLM 的透视图宽度。
 TILE_HEIGHT=288  # 从全景投影、交给 VLM 的透视图高度。
 SHEET_JPEG_QUALITY=90  # 发送给 VLM 的多视角拼图 JPEG 质量。
@@ -146,10 +148,12 @@ render() {
     --width "${PANORAMA_WIDTH}" \
     --height "${PANORAMA_HEIGHT}" \
     --sensor-height "${SENSOR_HEIGHT}" \
+    --image-format "${PANORAMA_IMAGE_FORMAT}" \
     --max-black-ratio "${MAX_BLACK_RATIO}" \
     --gpu-device-ids "${GPU_DEVICE_IDS}" \
     --processes-per-gpu "${RENDER_PROCESSES_PER_GPU}" \
     --jpeg-quality "${PANORAMA_JPEG_QUALITY}" \
+    --png-compress-level "${PANORAMA_PNG_COMPRESS_LEVEL}" \
     --generation-jsonl "${AGENT_INPUT_JSONL}" \
     --drop-invalid \
     --resume

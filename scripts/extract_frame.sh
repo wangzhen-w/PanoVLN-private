@@ -12,14 +12,21 @@ export GLOG_minloglevel="3"
 export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 PYTHON_BIN="python"
-OUTPUT_ROOT="/workspace/data2/dataset/PanoVLN"
-DATASET_NAMES=(panovln)
-GPU_IDS="4,5,6,7"
-PROCESSES_PER_GPU="2"
-SAVE_IMAGE="true"  # Existing panovln frames are detected and skipped.
+OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
+DATASET_NAMES=(r2r rxr)
+GPU_IDS="0,1,2,3,4,5,6,7"
+PROCESSES_PER_GPU="6"
+SAVE_IMAGE="true"  # Complete episodes in the selected format are skipped.
 SKIP_EXISTING_EPISODES="true"
 MAX_EPISODES=""
 EPISODE_IDS=""
+
+# png/jpeg are supported. PNG is always pixel-lossless; level 0 disables its
+# lossless DEFLATE compression. JPEG settings are ignored when IMAGE_FORMAT=png.
+IMAGE_FORMAT="png"
+PNG_COMPRESS_LEVEL="6"
+JPEG_QUALITY="95"
+JPEG_SUBSAMPLING="0"
 
 mkdir -p "${OUTPUT_ROOT}"
 
@@ -28,6 +35,13 @@ echo "Habitat dataset paths: config/*.yaml"
 echo "DATASET_NAMES: ${DATASET_NAMES[*]}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "PROCESSES_PER_GPU: ${PROCESSES_PER_GPU}"
+echo "IMAGE_FORMAT: ${IMAGE_FORMAT}"
+if [[ "${IMAGE_FORMAT,,}" == "png" ]]; then
+    echo "PNG_COMPRESS_LEVEL: ${PNG_COMPRESS_LEVEL}"
+else
+    echo "JPEG_QUALITY: ${JPEG_QUALITY}"
+    echo "JPEG_SUBSAMPLING: ${JPEG_SUBSAMPLING}"
+fi
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     echo "python not found in PATH" >&2
@@ -47,6 +61,10 @@ CMD=(
     --num_processes_per_gpu "${PROCESSES_PER_GPU}"
     --save_image "${SAVE_IMAGE}"
     --skip_existing_episodes "${SKIP_EXISTING_EPISODES}"
+    --image_format "${IMAGE_FORMAT}"
+    --png_compress_level "${PNG_COMPRESS_LEVEL}"
+    --jpeg_quality "${JPEG_QUALITY}"
+    --jpeg_subsampling "${JPEG_SUBSAMPLING}"
 )
 
 if [[ -n "${MAX_EPISODES}" ]]; then

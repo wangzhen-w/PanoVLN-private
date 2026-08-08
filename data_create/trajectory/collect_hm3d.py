@@ -236,7 +236,20 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--sensor-height", type=float, default=1.25)
     render.add_argument("--forward-step-size", type=float, default=0.25)
     render.add_argument("--turn-angle", type=float, default=15.0)
-    render.add_argument("--jpeg-quality", type=int, default=90)
+    render.add_argument(
+        "--image-format",
+        choices=("jpg", "jpeg", "png"),
+        default="jpeg",
+        help="Published panorama format. PanoVLN defaults to JPEG.",
+    )
+    render.add_argument("--jpeg-quality", type=int, default=75)
+    render.add_argument(
+        "--png-compress-level",
+        type=int,
+        choices=tuple(range(10)),
+        default=6,
+        help="PNG DEFLATE level; every level is pixel-lossless.",
+    )
     render.add_argument("--max-black-ratio", type=float, default=0.10)
     render.add_argument(
         "--pose-tolerance",
@@ -2401,7 +2414,31 @@ def make_panorama_simulator(scene: Path, args: argparse.Namespace):
     return simulator
 
 
-def save_panorama(observation: np.ndarray, path: Path, jpeg_quality: int) -> float:
+def normalize_panorama_image_format(image_format: str) -> str:
+    normalized = str(image_format).strip().lower()
+    if normalized in {"jpg", "jpeg"}:
+        return "jpeg"
+    if normalized == "png":
+        return "png"
+    raise ValueError(f"Unsupported panorama image format: {image_format!r}")
+
+
+def panorama_frame_filename(frame_index: int, image_format: str) -> str:
+    extension = (
+        ".png"
+        if normalize_panorama_image_format(image_format) == "png"
+        else ".jpg"
+    )
+    return f"frame_{int(frame_index)}{extension}"
+
+
+def save_panorama(
+    observation: np.ndarray,
+    path: Path,
+    image_format: str,
+    jpeg_quality: int,
+    png_compress_level: int,
+) -> float:
     from PIL import Image
 
     rgb = np.asarray(observation)
@@ -2410,7 +2447,11 @@ def save_panorama(observation: np.ndarray, path: Path, jpeg_quality: int) -> flo
     rgb = rgb[:, :, :3].astype(np.uint8)
     black_ratio = float(np.mean(np.max(rgb, axis=2) <= 3))
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(rgb).save(path, quality=jpeg_quality)
+    image = Image.fromarray(rgb)
+    if image_format == "png":
+        image.save(path, format="PNG", compress_level=int(png_compress_level))
+    else:
+        image.save(path, format="JPEG", quality=int(jpeg_quality))
     return black_ratio
 
 
@@ -2454,7 +2495,9 @@ def render_run_manifest(
         "sensor_height": float(args.sensor_height),
         "forward_step_size": float(args.forward_step_size),
         "turn_angle": float(args.turn_angle),
+        "image_format": str(args.image_format),
         "jpeg_quality": int(args.jpeg_quality),
+        "png_compress_level": int(args.png_compress_level),
         "max_black_ratio": float(args.max_black_ratio),
         "pose_tolerance": float(args.pose_tolerance),
     }
@@ -2508,6 +2551,7 @@ def completed_render_is_reusable(
     output_root: Path,
     episode_id: str,
     gt_record: Optional[Dict[str, Any]],
+    image_format: str,
     include_failed: bool = False,
 ) -> bool:
     """Trust only an atomically published episode directory with matching journal data."""
@@ -2531,10 +2575,12 @@ def completed_render_is_reusable(
         if failed
         else output_root / episode_id
     )
+    first_frame = panorama_frame_filename(0, image_format)
+    last_frame = panorama_frame_filename(expected_frames - 1, image_format)
     return (
         directory.is_dir()
-        and (directory / "frame_0.jpg").is_file()
-        and (directory / f"frame_{expected_frames - 1}.jpg").is_file()
+        and (directory / first_frame).is_file()
+        and (directory / last_frame).is_file()
     )
 
 
@@ -2734,8 +2780,10 @@ def _render_one_panorama_episode(
     black_ratios.append(
         save_panorama(
             observation,
-            temporary_dir / "frame_0.jpg",
+            temporary_dir / panorama_frame_filename(0, args.image_format),
+            args.image_format,
             args.jpeg_quality,
+            args.png_compress_level,
         )
     )
     collision_count = 0
@@ -2768,8 +2816,11 @@ def _render_one_panorama_episode(
         black_ratios.append(
             save_panorama(
                 observations["rgb"],
-                temporary_dir / f"frame_{action_index}.jpg",
+                temporary_dir
+                / panorama_frame_filename(action_index, args.image_format),
+                args.image_format,
                 args.jpeg_quality,
+                args.png_compress_level,
             )
         )
     if locations and location_index != len(locations) - 1:
@@ -2783,7 +2834,8 @@ def _render_one_panorama_episode(
     if final_goal_error > goal_radius + args.pose_tolerance:
         issues.append("render_goal_radius_failure")
     expected_frames = len(actions) + 1
-    actual_frames = len(list(temporary_dir.glob("frame_*.jpg")))
+    frame_extension = ".png" if args.image_format == "png" else ".jpg"
+    actual_frames = len(list(temporary_dir.glob(f"frame_*{frame_extension}")))
     if actual_frames != expected_frames:
         issues.append("frame_count_mismatch")
     if collision_count:
@@ -3009,6 +3061,14 @@ def _parallel_render_batches(
 
 
 def render_panorama_episodes(args: argparse.Namespace) -> None:
+    args.image_format = normalize_panorama_image_format(args.image_format)
+    if not 1 <= int(args.jpeg_quality) <= 100:
+        raise ValueError(f"jpeg_quality must be in [1, 100], got {args.jpeg_quality}")
+    if not 0 <= int(args.png_compress_level) <= 9:
+        raise ValueError(
+            "png_compress_level must be in [0, 9], "
+            f"got {args.png_compress_level}"
+        )
     os.environ.setdefault("MAGNUM_LOG", "quiet")
     os.environ.setdefault("HABITAT_SIM_LOG", "quiet")
     with gzip.open(args.dataset, "rt", encoding="utf-8") as handle:
@@ -3075,6 +3135,7 @@ def render_panorama_episodes(args: argparse.Namespace) -> None:
             output_root,
             episode_id,
             gt.get(episode_id),
+            args.image_format,
             include_failed=bool(args.drop_invalid),
         ):
             results_by_id[episode_id] = result  # type: ignore[assignment]

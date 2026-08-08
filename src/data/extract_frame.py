@@ -21,6 +21,7 @@ from src.data.habitat_shortest_path import (
     build_locality_balanced_episode_splits,
     build_worker_assignments,
     count_saved_frames,
+    frame_image_filename,
     habitat,
     load_dataset,
     parse_episode_ids,
@@ -29,6 +30,7 @@ from src.data.habitat_shortest_path import (
     reset_episode_output_dir,
     resolve_dataset_paths,
     save_rgb_frame,
+    normalize_image_format,
     sort_episodes_for_scene_locality,
     silence_external_output,
     validate_gpu_ids,
@@ -61,9 +63,12 @@ def annotation_image_id(annotation):
     return str(image_id)
 
 
-def is_episode_complete(image_path, annotation):
+def is_episode_complete(image_path, annotation, image_format):
     episode_image_path = os.path.join(image_path, annotation_image_id(annotation))
-    return count_saved_frames(episode_image_path) == expected_frame_count(annotation)
+    return (
+        count_saved_frames(episode_image_path, image_format=image_format)
+        == expected_frame_count(annotation)
+    )
 
 
 def replay_annotation_episode(
@@ -72,6 +77,10 @@ def replay_annotation_episode(
     annotation,
     episode_image_path=None,
     image_size=ERP_IMAGE_SIZE,
+    image_format="jpeg",
+    jpeg_quality=75,
+    jpeg_subsampling=2,
+    png_compress_level=6,
 ):
     env.current_episode = episode
     observation = env.reset()
@@ -89,8 +98,14 @@ def replay_annotation_episode(
         reset_episode_output_dir(episode_image_path)
         save_rgb_frame(
             observation["rgb"],
-            os.path.join(episode_image_path, "frame_0.jpg"),
+            os.path.join(
+                episode_image_path,
+                frame_image_filename(0, image_format=image_format),
+            ),
             image_size=image_size,
+            jpeg_quality=jpeg_quality,
+            jpeg_subsampling=jpeg_subsampling,
+            png_compress_level=png_compress_level,
         )
 
     for action_index, action in enumerate(actions):
@@ -107,8 +122,14 @@ def replay_annotation_episode(
         if episode_image_path is not None:
             save_rgb_frame(
                 observation["rgb"],
-                os.path.join(episode_image_path, f"frame_{step_id}.jpg"),
+                os.path.join(
+                    episode_image_path,
+                    frame_image_filename(step_id, image_format=image_format),
+                ),
                 image_size=image_size,
+                jpeg_quality=jpeg_quality,
+                jpeg_subsampling=jpeg_subsampling,
+                png_compress_level=png_compress_level,
             )
 
     return {
@@ -128,6 +149,10 @@ def extract_data(
         local_gpu_id=0,
         display_gpu_id=0,
         process_index_on_gpu=0,
+        image_format="jpeg",
+        jpeg_quality=75,
+        jpeg_subsampling=2,
+        png_compress_level=6,
     ):
     env = None
 
@@ -210,6 +235,10 @@ def extract_data(
                     image_size=CONFIG[dataset_name].get(
                         "image_size", ERP_IMAGE_SIZE
                     ),
+                    image_format=image_format,
+                    jpeg_quality=jpeg_quality,
+                    jpeg_subsampling=jpeg_subsampling,
+                    png_compress_level=png_compress_level,
                 )
                 if replay_result["frame_count"] != expected_frame_count(annotation):
                     raise RuntimeError(
@@ -250,6 +279,10 @@ def process_single_dataset(
     skip_existing_episodes,
     max_episodes,
     episode_ids,
+    image_format,
+    jpeg_quality,
+    jpeg_subsampling,
+    png_compress_level,
 ):
     ANNOT_PATH, IMAGE_PATH = resolve_dataset_paths(
         dataset_name,
@@ -329,7 +362,7 @@ def process_single_dataset(
         )
         for checked_count, episode in enumerate(dataset.episodes, start=1):
             annotation = annotation_by_episode_id[int(episode.episode_id)]
-            if is_episode_complete(IMAGE_PATH, annotation):
+            if is_episode_complete(IMAGE_PATH, annotation, image_format):
                 num_skipped += 1
             else:
                 pending_episodes.append(episode)
@@ -429,6 +462,10 @@ def process_single_dataset(
             assignment["local_gpu_id"],
             assignment["display_gpu_id"],
             assignment["process_index_on_gpu"],
+            image_format,
+            jpeg_quality,
+            jpeg_subsampling,
+            png_compress_level,
         )
         p = ctx.Process(target=extract_data, args=worker_args)
         p.start()
@@ -510,6 +547,10 @@ def main(
     skip_existing_episodes,
     max_episodes,
     episode_ids,
+    image_format,
+    jpeg_quality,
+    jpeg_subsampling,
+    png_compress_level,
 ):
     for dataset_name in dataset2process:
         process_single_dataset(
@@ -523,6 +564,10 @@ def main(
             skip_existing_episodes=skip_existing_episodes,
             max_episodes=max_episodes,
             episode_ids=episode_ids,
+            image_format=image_format,
+            jpeg_quality=jpeg_quality,
+            jpeg_subsampling=jpeg_subsampling,
+            png_compress_level=png_compress_level,
         )
 
 
@@ -575,8 +620,34 @@ if __name__ == "__main__":
         default=None,
         help="Optional episode ids to render, e.g. --episode_ids 7142 9001",
     )
+    parser.add_argument(
+        "--image_format",
+        type=str,
+        default="jpeg",
+        choices=("jpg", "jpeg", "png"),
+        help="Output image format. 'jpg' is an alias for 'jpeg'.",
+    )
+    parser.add_argument("--jpeg_quality", type=int, default=75)
+    parser.add_argument(
+        "--jpeg_subsampling",
+        type=int,
+        default=2,
+        choices=(0, 1, 2),
+    )
+    parser.add_argument(
+        "--png_compress_level",
+        type=int,
+        default=6,
+        choices=tuple(range(10)),
+        help="PNG DEFLATE level (0 disables compression; all levels are lossless).",
+    )
 
     args = parser.parse_args()
+    image_format = normalize_image_format(args.image_format)
+    if not 1 <= args.jpeg_quality <= 100:
+        raise ValueError(
+            f"--jpeg_quality must be in [1, 100], got {args.jpeg_quality}"
+        )
     requested_gpu_ids = parse_gpu_ids(args.gpu_ids)
     selected_episode_ids = parse_episode_ids(args.episode_ids)
     visible_gpu_ids = None
@@ -598,4 +669,8 @@ if __name__ == "__main__":
         skip_existing_episodes=args.skip_existing_episodes,
         max_episodes=args.max_episodes,
         episode_ids=selected_episode_ids,
+        image_format=image_format,
+        jpeg_quality=args.jpeg_quality,
+        jpeg_subsampling=args.jpeg_subsampling,
+        png_compress_level=args.png_compress_level,
     )

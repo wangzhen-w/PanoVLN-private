@@ -66,7 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-root",
         required=True,
-        help="Panorama root containing <trajectory_id>/frame_<index>.jpg.",
+        help=(
+            "Panorama root containing one consistent sequence of "
+            "frame_<index>.jpg or frame_<index>.png per trajectory."
+        ),
     )
     parser.add_argument(
         "--gt-output",
@@ -370,11 +373,26 @@ def validate_image_sequence(
             f"Missing image directory for trajectory {trajectory_id}: {directory}"
         )
     indices: List[int] = []
-    for path in directory.glob("frame_*.jpg"):
-        match = re.fullmatch(r"frame_(0|[1-9][0-9]*)\.jpg", path.name)
+    frame_paths = [
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.name.lower().startswith("frame_")
+    ]
+    formats = set()
+    for path in frame_paths:
+        match = re.fullmatch(
+            r"frame_(0|[1-9][0-9]*)\.(jpg|jpeg|png)",
+            path.name,
+            flags=re.IGNORECASE,
+        )
         if match is None:
             raise ValueError(f"Invalid panorama filename: {path}")
         indices.append(int(match.group(1)))
+        formats.add("jpeg" if match.group(2).lower() in {"jpg", "jpeg"} else "png")
+    if len(formats) > 1:
+        raise ValueError(
+            f"Trajectory {trajectory_id} mixes panorama formats: {sorted(formats)}"
+        )
     expected_count = len(actions_without_stop) + 1
     expected_indices = list(range(expected_count))
     if sorted(indices) != expected_indices:

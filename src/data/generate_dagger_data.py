@@ -38,10 +38,12 @@ from src.data.habitat_shortest_path import (
     euclidean_distance,
     extract_instruction,
     filter_episodes,
+    frame_image_filename,
     get_goal_position,
     get_reference_positions,
     habitat,
     load_dataset,
+    normalize_image_format,
     parse_episode_ids,
     parse_gpu_ids,
     position_within_radius,
@@ -209,33 +211,52 @@ def write_jsonl_item(handle, item: Dict) -> None:
     os.fsync(handle.fileno())
 
 
-def count_saved_frames(episode_image_dir: str) -> int:
+def count_saved_frames(episode_image_dir: str, image_format: str) -> int:
     if not os.path.isdir(episode_image_dir):
         return 0
+    expected_suffix = Path(frame_image_filename(0, image_format)).suffix.lower()
     return sum(
         1
         for file_name in os.listdir(episode_image_dir)
-        if file_name.startswith("frame_") and file_name.endswith(".jpg")
+        if re.fullmatch(r"frame_\d+\.[^.]+", file_name, flags=re.IGNORECASE)
+        and Path(file_name).suffix.lower() == expected_suffix
     )
 
 
-def expected_frame_path(episode_image_dir: str, frame_index: int) -> str:
-    return os.path.join(episode_image_dir, f"frame_{frame_index}.jpg")
+def expected_frame_path(
+    episode_image_dir: str,
+    frame_index: int,
+    image_format: str,
+) -> str:
+    return os.path.join(
+        episode_image_dir,
+        frame_image_filename(frame_index, image_format),
+    )
 
 
-def image_file_is_valid(path: str) -> bool:
+def image_file_is_valid(path: str, image_format: str) -> bool:
     if not os.path.exists(path) or os.path.getsize(path) <= 0:
         return False
     try:
         with Image.open(path) as image:
             image.verify()
         with Image.open(path) as image:
-            return image.size == ERP_IMAGE_SIZE and image.mode == "RGB"
+            expected_pil_format = "PNG" if image_format == "png" else "JPEG"
+            return (
+                image.format == expected_pil_format
+                and image.size == ERP_IMAGE_SIZE
+                and image.mode == "RGB"
+            )
     except Exception:
         return False
 
 
-def is_raw_episode_complete(output_root: str, dagger_dataset_name: str, annotation: Dict) -> bool:
+def is_raw_episode_complete(
+    output_root: str,
+    dagger_dataset_name: str,
+    annotation: Dict,
+    image_format: str,
+) -> bool:
     episode_image_dir = os.path.join(
         image_root(output_root, dagger_dataset_name),
         str(annotation["episode_id"]),
@@ -243,15 +264,26 @@ def is_raw_episode_complete(output_root: str, dagger_dataset_name: str, annotati
     action_count = len(annotation.get("actions", []))
     if action_count <= 0 or not os.path.isdir(episode_image_dir):
         return False
-    frame_names = [
+    expected_suffix = Path(frame_image_filename(0, image_format)).suffix.lower()
+    all_frame_names = [
         file_name
         for file_name in os.listdir(episode_image_dir)
-        if file_name.startswith("frame_") and file_name.endswith(".jpg")
+        if re.fullmatch(r"frame_\d+\.(?:jpg|jpeg|png)", file_name, flags=re.IGNORECASE)
     ]
+    frame_names = [
+        file_name
+        for file_name in all_frame_names
+        if Path(file_name).suffix.lower() == expected_suffix
+    ]
+    if len(frame_names) != len(all_frame_names):
+        return False
     if len(frame_names) != action_count:
         return False
     for frame_index in range(action_count):
-        if not image_file_is_valid(expected_frame_path(episode_image_dir, frame_index)):
+        if not image_file_is_valid(
+            expected_frame_path(episode_image_dir, frame_index, image_format),
+            image_format,
+        ):
             return False
     return True
 
@@ -559,8 +591,22 @@ def append_history_image(agent: PanoVLN_Agent, observation) -> None:
     agent.rgb_history.append(image)
 
 
-def save_episode_frame(episode_image_dir: str, frame_index: int, rgb) -> None:
-    save_rgb_frame(rgb, os.path.join(episode_image_dir, f"frame_{frame_index}.jpg"))
+def save_episode_frame(
+    episode_image_dir: str,
+    frame_index: int,
+    rgb,
+    image_format: str,
+    jpeg_quality: int,
+    jpeg_subsampling: int,
+    png_compress_level: int,
+) -> None:
+    save_rgb_frame(
+        rgb,
+        expected_frame_path(episode_image_dir, frame_index, image_format),
+        jpeg_quality=jpeg_quality,
+        jpeg_subsampling=jpeg_subsampling,
+        png_compress_level=png_compress_level,
+    )
 
 
 def executable_prefix(action_ids: Sequence[int], execute_horizon: int) -> List[int]:
@@ -587,11 +633,23 @@ def execute_and_record_one_action(
     episode_image_dir: str,
     frame_index: int,
     action_id: int,
+    image_format: str,
+    jpeg_quality: int,
+    jpeg_subsampling: int,
+    png_compress_level: int,
 ):
     observation = env.step(int(action_id))
     if int(action_id) == STOP_ACTION:
         return observation, frame_index
-    save_episode_frame(episode_image_dir, frame_index, observation["rgb"])
+    save_episode_frame(
+        episode_image_dir,
+        frame_index,
+        observation["rgb"],
+        image_format,
+        jpeg_quality,
+        jpeg_subsampling,
+        png_compress_level,
+    )
     append_history_image(agent, observation)
     return observation, frame_index + 1
 
@@ -612,6 +670,10 @@ def collect_raw_dagger_episode(
     action_horizon: int,
     execute_horizon: int,
     max_steps_per_episode: int,
+    image_format: str,
+    jpeg_quality: int,
+    jpeg_subsampling: int,
+    png_compress_level: int,
 ) -> Tuple[Optional[Dict], Dict]:
     env.current_episode = episode
     observation = env.reset()
@@ -632,7 +694,15 @@ def collect_raw_dagger_episode(
         str(dagger_id),
     )
     reset_episode_output_dir(episode_image_dir)
-    save_episode_frame(episode_image_dir, 0, observation["rgb"])
+    save_episode_frame(
+        episode_image_dir,
+        0,
+        observation["rgb"],
+        image_format,
+        jpeg_quality,
+        jpeg_subsampling,
+        png_compress_level,
+    )
     append_history_image(agent, observation)
 
     start_position = to_position_list(env.sim.get_agent_state().position)
@@ -726,6 +796,10 @@ def collect_raw_dagger_episode(
                 episode_image_dir=episode_image_dir,
                 frame_index=frame_index,
                 action_id=action_to_execute,
+                image_format=image_format,
+                jpeg_quality=jpeg_quality,
+                jpeg_subsampling=jpeg_subsampling,
+                png_compress_level=png_compress_level,
             )
             current_position = to_position_list(env.sim.get_agent_state().position)
             executed_path_length += euclidean_distance(previous_position, current_position)
@@ -774,6 +848,7 @@ def collect_raw_dagger_episode(
             "expert_steps": len(expert_actions),
             "executed_steps": len(executed_actions),
             "saved_frames": 0,
+            "image_format": image_format,
             "replans": replan_index,
             "dagger_alpha": float(alpha),
             "dagger_beta_values": beta_values,
@@ -814,7 +889,8 @@ def collect_raw_dagger_episode(
         "reference_steps": int(reference_steps),
         "expert_steps": len(expert_actions),
         "executed_steps": len(executed_actions),
-        "saved_frames": count_saved_frames(episode_image_dir),
+        "saved_frames": count_saved_frames(episode_image_dir, image_format),
+        "image_format": image_format,
         "replans": replan_index,
         "dagger_alpha": float(alpha),
         "dagger_beta_values": beta_values,
@@ -870,6 +946,10 @@ def dagger_worker(
     max_memory_images,
     memory_pool_window_frames,
     skip_failed_episodes,
+    image_format,
+    jpeg_quality,
+    jpeg_subsampling,
+    png_compress_level,
 ):
     env = None
     try:
@@ -948,6 +1028,10 @@ def dagger_worker(
                         action_horizon=action_horizon,
                         execute_horizon=execute_horizon,
                         max_steps_per_episode=max_steps_per_episode,
+                        image_format=image_format,
+                        jpeg_quality=jpeg_quality,
+                        jpeg_subsampling=jpeg_subsampling,
+                        png_compress_level=png_compress_level,
                     )
                     write_jsonl_item(summary_handle, summary)
                     if annotation is None:
@@ -978,6 +1062,7 @@ def dagger_worker(
                         "source_dataset": source_dataset,
                         "source_episode_id": str(episode.episode_id),
                         "status": "error",
+                        "image_format": image_format,
                         "error": error,
                     }
                     write_jsonl_item(summary_handle, summary)
@@ -1044,17 +1129,32 @@ def build_worker_jobs(
     return worker_jobs
 
 
-def load_complete_existing_annotations(output_root, dagger_dataset_name, progress_dir=None):
+def load_complete_existing_annotations(
+    output_root,
+    dagger_dataset_name,
+    image_format,
+    progress_dir=None,
+):
     existing: Dict[int, Dict] = {}
     for annotation in load_jsonl_index(annotation_path(output_root, dagger_dataset_name)).values():
-        if is_raw_episode_complete(output_root, dagger_dataset_name, annotation):
+        if is_raw_episode_complete(
+            output_root,
+            dagger_dataset_name,
+            annotation,
+            image_format,
+        ):
             existing[int(annotation["episode_id"])] = annotation
     if progress_dir is not None:
         for path in list_rank_paths(progress_dir, ".jsonl"):
             if path.endswith(".summary.jsonl"):
                 continue
             for annotation in load_jsonl_index(path).values():
-                if not is_raw_episode_complete(output_root, dagger_dataset_name, annotation):
+                if not is_raw_episode_complete(
+                    output_root,
+                    dagger_dataset_name,
+                    annotation,
+                    image_format,
+                ):
                     continue
                 episode_id = int(annotation["episode_id"])
                 if episode_id in existing and existing[episode_id] != annotation:
@@ -1072,8 +1172,14 @@ def add_complete_annotation(
     dagger_dataset_name: str,
     annotation: Dict,
     source_path: str,
+    image_format: str,
 ) -> None:
-    if not is_raw_episode_complete(output_root, dagger_dataset_name, annotation):
+    if not is_raw_episode_complete(
+        output_root,
+        dagger_dataset_name,
+        annotation,
+        image_format,
+    ):
         tqdm.write(
             f"[dagger] skipping incomplete annotation episode_id="
             f"{annotation.get('episode_id')} from {source_path}"
@@ -1094,6 +1200,7 @@ def merge_partial_outputs(
     dagger_dataset_name: str,
     progress_dir: str,
     existing_annotations: Dict[int, Dict],
+    image_format: str,
 ):
     merged_annotations: Dict[int, Dict] = {}
     for annotation in existing_annotations.values():
@@ -1103,6 +1210,7 @@ def merge_partial_outputs(
             dagger_dataset_name=dagger_dataset_name,
             annotation=annotation,
             source_path="existing_annotations",
+            image_format=image_format,
         )
     for path in list_rank_paths(progress_dir, ".jsonl"):
         if path.endswith(".summary.jsonl"):
@@ -1114,6 +1222,7 @@ def merge_partial_outputs(
                 dagger_dataset_name=dagger_dataset_name,
                 annotation=annotation,
                 source_path=path,
+                image_format=image_format,
             )
     write_jsonl_index(annotation_path(output_root, dagger_dataset_name), merged_annotations)
 
@@ -1148,6 +1257,10 @@ def process_source_dataset(
     max_memory_images,
     memory_pool_window_frames,
     skip_failed_episodes,
+    image_format,
+    jpeg_quality,
+    jpeg_subsampling,
+    png_compress_level,
 ):
     _, dataset = load_dataset(dataset_name=source_dataset)
     reference_lengths = load_reference_action_lengths(
@@ -1177,6 +1290,7 @@ def process_source_dataset(
     existing_annotations = load_complete_existing_annotations(
         output_root,
         dagger_dataset_name,
+        image_format,
         progress_dir=progress_dir,
     )
     pending_episodes = []
@@ -1268,6 +1382,10 @@ def process_source_dataset(
                 max_memory_images,
                 memory_pool_window_frames,
                 skip_failed_episodes,
+                image_format,
+                jpeg_quality,
+                jpeg_subsampling,
+                png_compress_level,
             ),
         )
         process.start()
@@ -1357,6 +1475,21 @@ def process_source_dataset(
 
 def validate_args(args) -> None:
     validate_safe_dataset_name(args.dagger_dataset_name)
+    args.image_format = normalize_image_format(args.image_format)
+    if not 1 <= args.jpeg_quality <= 100:
+        raise ValueError(
+            f"jpeg_quality must be in [1, 100], got {args.jpeg_quality}"
+        )
+    if args.jpeg_subsampling not in {0, 1, 2}:
+        raise ValueError(
+            "jpeg_subsampling must be one of 0, 1, 2, "
+            f"got {args.jpeg_subsampling}"
+        )
+    if not 0 <= args.png_compress_level <= 9:
+        raise ValueError(
+            "png_compress_level must be in [0, 9], "
+            f"got {args.png_compress_level}"
+        )
     unsupported_sources = [
         dataset_name
         for dataset_name in args.source_dataset_name
@@ -1460,6 +1593,26 @@ def parse_args():
         default=False,
         type=str2bool,
     )
+    parser.add_argument(
+        "--image_format",
+        type=str,
+        default="png",
+        choices=("jpg", "jpeg", "png"),
+        help="Saved panorama format. DAgger defaults to lossless PNG.",
+    )
+    parser.add_argument("--jpeg_quality", type=int, default=75)
+    parser.add_argument(
+        "--jpeg_subsampling",
+        type=int,
+        default=2,
+        choices=(0, 1, 2),
+    )
+    parser.add_argument(
+        "--png_compress_level",
+        type=int,
+        default=6,
+        choices=tuple(range(10)),
+    )
     return parser.parse_args()
 
 
@@ -1494,6 +1647,7 @@ def main() -> None:
         existing_annotations = load_complete_existing_annotations(
             output_root=args.output_root,
             dagger_dataset_name=args.dagger_dataset_name,
+            image_format=args.image_format,
             progress_dir=progress_dir,
         )
     else:
@@ -1515,7 +1669,7 @@ def main() -> None:
     print(
         f"model={args.model_path}, output_root={args.output_root}, "
         f"dagger_dataset={args.dagger_dataset_name}, "
-        f"sources={args.source_dataset_name}"
+        f"sources={args.source_dataset_name}, image_format={args.image_format}"
     )
     print(
         f"gpu_ids={args.gpu_ids}, num_thread={args.num_thread}, "
@@ -1552,6 +1706,10 @@ def main() -> None:
                 max_memory_images=args.max_memory_images,
                 memory_pool_window_frames=args.memory_pool_window_frames,
                 skip_failed_episodes=args.skip_failed_episodes,
+                image_format=args.image_format,
+                jpeg_quality=args.jpeg_quality,
+                jpeg_subsampling=args.jpeg_subsampling,
+                png_compress_level=args.png_compress_level,
             )
 
         merge_partial_outputs(
@@ -1559,6 +1717,7 @@ def main() -> None:
             dagger_dataset_name=args.dagger_dataset_name,
             progress_dir=progress_dir,
             existing_annotations=existing_annotations,
+            image_format=args.image_format,
         )
         success = True
     finally:

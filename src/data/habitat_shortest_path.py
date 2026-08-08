@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import sys
 import warnings
 from contextlib import contextmanager
@@ -19,6 +20,11 @@ if PROJECT_ROOT not in sys.path:
 DEFAULT_GOAL_RADIUS = 0.5
 ERP_IMAGE_SIZE = (1280, 640)
 LOCALITY_BLOCK_SIZE_MULTIPLIER = 0.5
+IMAGE_FORMAT_EXTENSIONS = {
+    "jpeg": ".jpg",
+    "png": ".png",
+}
+FRAME_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 CONFIG = {
     "r2r": {
@@ -542,21 +548,47 @@ def action_to_int(action) -> int:
     return action_id
 
 
-def count_saved_frames(episode_image_path: str) -> int:
+def normalize_image_format(image_format: str) -> str:
+    normalized = str(image_format).strip().lower()
+    if normalized in {"jpg", "jpeg"}:
+        return "jpeg"
+    if normalized == "png":
+        return "png"
+    raise ValueError(
+        f"Unsupported image format {image_format!r}; expected one of: jpg, jpeg, png"
+    )
+
+
+def frame_image_filename(frame_index: int, image_format: str = "jpeg") -> str:
+    normalized_format = normalize_image_format(image_format)
+    return f"frame_{int(frame_index)}{IMAGE_FORMAT_EXTENSIONS[normalized_format]}"
+
+
+def _is_frame_image(file_name: str, extensions) -> bool:
+    match = re.fullmatch(r"frame_\d+(\.[^.]+)", file_name, flags=re.IGNORECASE)
+    return bool(match and match.group(1).lower() in extensions)
+
+
+def count_saved_frames(
+    episode_image_path: str,
+    image_format: str = "jpeg",
+) -> int:
     if not os.path.isdir(episode_image_path):
         return 0
 
+    normalized_format = normalize_image_format(image_format)
+    expected_extension = IMAGE_FORMAT_EXTENSIONS[normalized_format]
     return sum(
         1
         for file_name in os.listdir(episode_image_path)
-        if file_name.startswith("frame_") and file_name.endswith(".jpg")
+        if _is_frame_image(file_name, {expected_extension})
     )
 
 
 def reset_episode_output_dir(episode_image_path: str) -> None:
     os.makedirs(episode_image_path, exist_ok=True)
     for file_name in os.listdir(episode_image_path):
-        if file_name.startswith("frame_") and file_name.endswith(".jpg"):
+        if _is_frame_image(file_name, FRAME_IMAGE_EXTENSIONS):
             os.remove(os.path.join(episode_image_path, file_name))
 
 
@@ -564,13 +596,46 @@ def save_rgb_frame(
     rgb,
     output_path: str,
     image_size: Tuple[int, int] = ERP_IMAGE_SIZE,
+    jpeg_quality: int = 75,
+    jpeg_subsampling: int = 2,
+    png_compress_level: int = 6,
 ) -> None:
+    if not 1 <= int(jpeg_quality) <= 100:
+        raise ValueError(f"jpeg_quality must be in [1, 100], got {jpeg_quality}")
+    if int(jpeg_subsampling) not in {0, 1, 2}:
+        raise ValueError(
+            f"jpeg_subsampling must be one of 0, 1, 2, got {jpeg_subsampling}"
+        )
+    if not 0 <= int(png_compress_level) <= 9:
+        raise ValueError(
+            f"png_compress_level must be in [0, 9], got {png_compress_level}"
+        )
+
     rgb_frame = Image.fromarray(rgb)
     if rgb_frame.mode != "RGB":
         rgb_frame = rgb_frame.convert("RGB")
     if rgb_frame.size != image_size:
         rgb_frame = rgb_frame.resize(image_size)
-    rgb_frame.save(output_path)
+
+    output_extension = Path(output_path).suffix.lower()
+    if output_extension == ".png":
+        rgb_frame.save(
+            output_path,
+            format="PNG",
+            compress_level=int(png_compress_level),
+        )
+    elif output_extension in {".jpg", ".jpeg"}:
+        rgb_frame.save(
+            output_path,
+            format="JPEG",
+            quality=int(jpeg_quality),
+            subsampling=int(jpeg_subsampling),
+        )
+    else:
+        raise ValueError(
+            f"Cannot infer image format from output path {output_path!r}; "
+            "expected a .jpg, .jpeg, or .png suffix"
+        )
 
 
 def rollout_shortest_path_episode(

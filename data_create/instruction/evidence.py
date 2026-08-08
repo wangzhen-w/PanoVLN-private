@@ -79,15 +79,34 @@ def sorted_frame_paths(image_root: str, row: Mapping[str, Any]) -> Tuple[str, Li
             continue
 
         def frame_index(path: Path) -> int:
-            match = re.fullmatch(r"frame_(0|[1-9][0-9]*)\.jpg", path.name)
+            match = re.fullmatch(
+                r"frame_(0|[1-9][0-9]*)\.(?:jpg|jpeg|png)",
+                path.name,
+                flags=re.IGNORECASE,
+            )
             if match is None:
                 raise ValueError(f"Unexpected frame filename: {path}")
             return int(match.group(1))
 
-        paths = sorted(directory.glob("frame_*.jpg"), key=frame_index)
+        paths = sorted(
+            [
+                path
+                for path in directory.iterdir()
+                if path.is_file() and path.name.lower().startswith("frame_")
+            ],
+            key=frame_index,
+        )
         indices = [frame_index(path) for path in paths]
         if not paths:
-            raise FileNotFoundError(f"No frame_*.jpg files under {directory}")
+            raise FileNotFoundError(f"No frame images under {directory}")
+        formats = {
+            "jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "png"
+            for path in paths
+        }
+        if len(formats) != 1:
+            raise ValueError(
+                f"Mixed panorama image formats under {directory}: {sorted(formats)}"
+            )
         if indices != list(range(len(indices))):
             raise ValueError(
                 f"Non-contiguous frame sequence under {directory}: got {indices[:20]}"

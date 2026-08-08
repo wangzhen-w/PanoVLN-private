@@ -32,6 +32,10 @@ SEED="42"
 ATTN_IMPLEMENTATION="sdpa"
 SKIP_EXISTING_EPISODES="true"
 SKIP_FAILED_EPISODES="false"
+IMAGE_FORMAT="png"  # DAgger 默认保存无损 PNG；也可改为 jpeg。
+PNG_COMPRESS_LEVEL="6"
+JPEG_QUALITY="75"
+JPEG_SUBSAMPLING="2"
 
 mkdir -p "${OUTPUT_ROOT}"
 
@@ -45,6 +49,13 @@ echo "PROCESSES_PER_GPU: ${PROCESSES_PER_GPU}"
 echo "GOAL_RADIUS: ${GOAL_RADIUS}"
 echo "SUCCESS_RADIUS: ${SUCCESS_RADIUS}"
 echo "ALPHA: ${ALPHA}"
+echo "IMAGE_FORMAT: ${IMAGE_FORMAT}"
+if [[ "${IMAGE_FORMAT,,}" == "png" ]]; then
+    echo "PNG_COMPRESS_LEVEL: ${PNG_COMPRESS_LEVEL}"
+else
+    echo "JPEG_QUALITY: ${JPEG_QUALITY}"
+    echo "JPEG_SUBSAMPLING: ${JPEG_SUBSAMPLING}"
+fi
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     echo "python not found in PATH" >&2
@@ -73,6 +84,10 @@ CMD=(
     --attn_implementation "${ATTN_IMPLEMENTATION}"
     --skip_existing_episodes "${SKIP_EXISTING_EPISODES}"
     --skip_failed_episodes "${SKIP_FAILED_EPISODES}"
+    --image_format "${IMAGE_FORMAT}"
+    --png_compress_level "${PNG_COMPRESS_LEVEL}"
+    --jpeg_quality "${JPEG_QUALITY}"
+    --jpeg_subsampling "${JPEG_SUBSAMPLING}"
 )
 
 if [[ -n "${MAX_EPISODES}" ]]; then
