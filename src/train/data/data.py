@@ -3,7 +3,6 @@ import math
 import os
 import random
 import re
-from itertools import combinations
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -160,7 +159,6 @@ def build_vln_image_selection(
     last_frame_index: int,
     max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES,
     memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
-    required_frame_indices: Optional[List[int]] = None,
 ) -> List[int]:
     max_memory_images = max(0, int(max_memory_images))
     memory_pool_window_frames = max(1, int(memory_pool_window_frames))
@@ -168,125 +166,22 @@ def build_vln_image_selection(
     pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
     candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
 
-    required = sorted(
-        {
-            int(index)
-            for index in (required_frame_indices or [])
-            if pool_start_frame <= int(index) <= current_frame_index
-        }
-    )
-
     total_selected_images = max_memory_images + 1
     if total_selected_images <= 0 or not candidate_frame_indices:
         return [current_frame_index]
 
     if len(candidate_frame_indices) <= total_selected_images:
-        selected_indices = candidate_frame_indices
-    elif total_selected_images == 1:
-        if any(index != current_frame_index for index in required):
-            raise ValueError(
-                "Cannot retain required VLN history frames without a memory slot: "
-                f"required={required}, budget={total_selected_images}"
-            )
-        selected_indices = [current_frame_index]
-    else:
-        mandatory_indices = sorted(
-            {pool_start_frame, current_frame_index, *required}
-        )
-        if len(mandatory_indices) > total_selected_images:
-            raise ValueError(
-                "Cannot retain required VLN history frames within the configured "
-                f"memory budget: required={required}, budget={total_selected_images}"
-            )
+        return candidate_frame_indices
 
-        # Start from the original uniform grid.  If a required anchor is
-        # missing, jointly redistribute the grid so that adjacent temporal
-        # gaps remain as even as possible under the anchor constraint.
-        last_candidate_position = len(candidate_frame_indices) - 1
-        selected_positions = [
-            (slot * last_candidate_position) // (total_selected_images - 1)
-            for slot in range(total_selected_images)
-        ]
-        selected_indices = [
-            candidate_frame_indices[position] for position in selected_positions
-        ]
-        missing_required = [
-            index for index in required if index not in selected_indices
-        ]
-        if not missing_required:
-            return selected_indices
+    if total_selected_images == 1:
+        return [current_frame_index]
 
-        internal_mandatory = [
-            index
-            for index in mandatory_indices
-            if index not in {pool_start_frame, current_frame_index}
-        ]
-        best_selection = None
-        best_score = None
-        for internal_slots in combinations(
-            range(1, total_selected_images - 1),
-            len(internal_mandatory),
-        ):
-            anchor_indices = [
-                pool_start_frame,
-                *internal_mandatory,
-                current_frame_index,
-            ]
-            anchor_slots = [0, *internal_slots, total_selected_images - 1]
-            if any(
-                right_index - left_index < right_slot - left_slot
-                for left_index, right_index, left_slot, right_slot in zip(
-                    anchor_indices,
-                    anchor_indices[1:],
-                    anchor_slots,
-                    anchor_slots[1:],
-                )
-            ):
-                continue
-
-            selection = [pool_start_frame] * total_selected_images
-            for left_index, right_index, left_slot, right_slot in zip(
-                anchor_indices,
-                anchor_indices[1:],
-                anchor_slots,
-                anchor_slots[1:],
-            ):
-                frame_span = right_index - left_index
-                slot_span = right_slot - left_slot
-                for offset in range(slot_span + 1):
-                    selection[left_slot + offset] = left_index + (
-                        offset * frame_span + slot_span // 2
-                    ) // slot_span
-
-            gaps = [
-                right - left for left, right in zip(selection, selection[1:])
-            ]
-            gap_uniformity_cost = sum(gap * gap for gap in gaps)
-            original_grid_distance = sum(
-                (frame_index - original_index) ** 2
-                for frame_index, original_index in zip(
-                    selection,
-                    selected_indices,
-                )
-            )
-            candidate_score = (
-                gap_uniformity_cost,
-                original_grid_distance,
-                selection,
-            )
-            if best_score is None or candidate_score < best_score:
-                best_score = candidate_score
-                best_selection = selection
-
-        if best_selection is None:
-            raise ValueError(
-                "Cannot distribute required VLN history frames within the "
-                f"configured memory budget: required={required}, "
-                f"budget={total_selected_images}"
-            )
-        selected_indices = best_selection
-
-    return selected_indices
+    last_candidate_position = len(candidate_frame_indices) - 1
+    selected_positions = [
+        (slot * last_candidate_position) // (total_selected_images - 1)
+        for slot in range(total_selected_images)
+    ]
+    return [candidate_frame_indices[position] for position in selected_positions]
 
 
 def select_vln_image_paths(
@@ -555,16 +450,26 @@ def apply_vln_memory_policy(
     selected_indices = build_vln_image_selection(
         current_step=current_step,
         last_frame_index=len(raw_images) - 1,
-        required_frame_indices=(
-            [four_step_memory_anchor]
-            if pbo_valid and four_step_memory_anchor >= 0
-            else None
-        ),
     )
     selected_images = [raw_images[index] for index in selected_indices]
-    pbo_start_image_index = (
-        selected_indices.index(four_step_memory_anchor) if pbo_valid else -1
-    )
+    pbo_start_image_index = -1
+    if pbo_valid:
+        if four_step_memory_anchor in selected_indices:
+            pbo_start_image_index = selected_indices.index(four_step_memory_anchor)
+        else:
+            # Keep standard uniform memory sampling.  When t-4 is not on the
+            # uniform grid, pair the current panorama with the newest selected
+            # memory panorama instead.
+            pbo_start_image_index = len(selected_indices) - 2
+            if (
+                pbo_start_image_index < 0
+                or selected_indices[pbo_start_image_index] >= current_step
+            ):
+                raise AssertionError(
+                    "PBO requires at least one selected memory panorama before "
+                    f"the current step: current_step={current_step}, "
+                    f"selected_indices={selected_indices}"
+                )
 
     if pbo_valid:
         pbo_action_labels = [

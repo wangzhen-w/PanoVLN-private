@@ -134,7 +134,6 @@ def select_vln_eval_image_indices(
     history_length: int,
     max_memory_images: int,
     memory_pool_window_frames: int,
-    pbo_enabled: bool = False,
 ) -> List[int]:
     last_frame_index = history_length - 1
     if last_frame_index < 0:
@@ -144,11 +143,6 @@ def select_vln_eval_image_indices(
         last_frame_index=last_frame_index,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
-        required_frame_indices=(
-            [last_frame_index - ACTION_SEQUENCE_LENGTH]
-            if pbo_enabled and last_frame_index >= ACTION_SEQUENCE_LENGTH
-            else None
-        ),
     )
 
 
@@ -555,7 +549,6 @@ class PanoVLN_Agent(Agent):
             history_length=len(self.rgb_history),
             max_memory_images=self.max_memory_images,
             memory_pool_window_frames=self.memory_pool_window_frames,
-            pbo_enabled=self.pbo_enabled,
         )
 
     def _prepare_selected_images(self, selected_indices):

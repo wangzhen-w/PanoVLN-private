@@ -17,7 +17,7 @@ PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
 PBO_ACTION_HORIZON = 4
 PBO_NUM_ACTIONS = 4
-PBO_INPUT_VECTOR_COUNT = 7
+PBO_INPUT_VECTOR_COUNT = 3
 FORWARD_DYNAMICS_TARGET_DIM = 2048
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -1312,84 +1312,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
         return grouped_hidden_states
 
-    @staticmethod
-    def spherical_yaw_fourier_pool(
-        image_hidden_states: torch.Tensor,
-        image_grid_thw: torch.Tensor,
-        image_erp_geometry: torch.Tensor | None,
-        spatial_merge_size: int,
-    ) -> torch.Tensor:
-        grid_t, grid_h, grid_w = [
-            int(value)
-            for value in image_grid_thw.detach().to(device="cpu", dtype=torch.long).tolist()
-        ]
-        if grid_h % spatial_merge_size != 0 or grid_w % spatial_merge_size != 0:
-            raise AssertionError(
-                "Image grid is not divisible by the spatial merge size: "
-                f"grid={(grid_t, grid_h, grid_w)}, merge={spatial_merge_size}"
-            )
-        pooled_h = grid_h // spatial_merge_size
-        pooled_w = grid_w // spatial_merge_size
-        expected_tokens = grid_t * pooled_h * pooled_w
-        if int(image_hidden_states.shape[0]) != expected_tokens:
-            raise AssertionError(
-                "Fourier pooling token/grid mismatch: "
-                f"tokens={int(image_hidden_states.shape[0])}, expected={expected_tokens}"
-            )
-
-        hidden = image_hidden_states.float().reshape(
-            grid_t,
-            pooled_h,
-            pooled_w,
-            int(image_hidden_states.shape[-1]),
-        )
-        device = hidden.device
-        if image_erp_geometry is None:
-            vertical_fov = math.pi
-            center_latitude = 0.0
-        else:
-            geometry_values = image_erp_geometry.detach().to(
-                device="cpu",
-                dtype=torch.float32,
-            ).tolist()
-            vertical_fov = float(geometry_values[0])
-            center_latitude = float(geometry_values[1])
-
-        latitude = (
-            center_latitude
-            - 0.5 * vertical_fov
-            + (torch.arange(pooled_h, device=device, dtype=torch.float32) + 0.5)
-            * (vertical_fov / pooled_h)
-        )
-        longitude = (
-            -math.pi
-            + (torch.arange(pooled_w, device=device, dtype=torch.float32) + 0.5)
-            * (2.0 * math.pi / pooled_w)
-        )
-        area_weight = latitude.cos().clamp_min(0.0).view(1, pooled_h, 1, 1)
-        cosine_basis = longitude.cos().view(1, 1, pooled_w, 1)
-        sine_basis = longitude.sin().view(1, 1, pooled_w, 1)
-        denominator = area_weight.sum() * float(grid_t * pooled_w)
-        denominator = denominator.clamp_min(torch.finfo(torch.float32).eps)
-
-        zero_order = (hidden * area_weight).sum(dim=(0, 1, 2)) / denominator
-        cosine_order = (
-            2.0 * (hidden * area_weight * cosine_basis).sum(dim=(0, 1, 2))
-            / denominator
-        )
-        sine_order = (
-            2.0 * (hidden * area_weight * sine_basis).sum(dim=(0, 1, 2))
-            / denominator
-        )
-        return torch.cat((zero_order, cosine_order, sine_order), dim=-1)
-
-    @staticmethod
-    def _first_supervised_token_index(sample_labels: torch.Tensor) -> int:
-        supervised_positions = torch.nonzero(sample_labels != -100, as_tuple=False).flatten()
-        if supervised_positions.numel() == 0:
-            return -1
-        return int(supervised_positions[0].item())
-
     def _last_action_token_index(self, sample_labels: torch.Tensor) -> int:
         supervised_positions = torch.nonzero(
             sample_labels != -100,
@@ -1430,7 +1352,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         *,
         hidden_states: torch.Tensor,
         image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
-        labels: torch.Tensor,
         image_current_index: torch.Tensor,
         pbo_action_labels: torch.Tensor | None,
         pbo_valid_mask: torch.Tensor | None,
@@ -1457,7 +1378,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if pbo_start_image_index is None
             else pbo_start_image_index.to(device="cpu", dtype=torch.long)
         )
-        merge_size = int(self.config.vision_config.spatial_merge_size)
         for batch_index in torch.nonzero(valid_mask, as_tuple=False).flatten().tolist():
             start_index = int(start_indices[batch_index].item())
             current_index = int(current_indices[batch_index].item())
@@ -1473,30 +1393,19 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                     f"num_images={len(sample_groups)}"
                 )
 
-            previous_hidden, previous_grid, previous_geometry = sample_groups[start_index]
-            current_hidden, current_grid, current_geometry = sample_groups[current_index]
-            previous_fourier = self.spherical_yaw_fourier_pool(
-                previous_hidden,
-                previous_grid,
-                previous_geometry,
-                merge_size,
-            )
-            current_fourier = self.spherical_yaw_fourier_pool(
-                current_hidden,
-                current_grid,
-                current_geometry,
-                merge_size,
-            )
-            context_index = self._first_supervised_token_index(labels[batch_index]) - 1
-            if context_index < 0:
+            previous_hidden = sample_groups[start_index][0]
+            current_hidden = sample_groups[current_index][0]
+            if previous_hidden.numel() == 0 or current_hidden.numel() == 0:
                 raise AssertionError(
-                    f"PBO sample {batch_index} has no prompt token before assistant response"
+                    f"PBO sample {batch_index} has an empty visual-token group"
                 )
+            previous_mean = previous_hidden.float().mean(dim=0)
+            current_mean = current_hidden.float().mean(dim=0)
             pbo_feature = torch.cat(
                 (
-                    hidden_states[batch_index, context_index].float(),
-                    previous_fourier,
-                    current_fourier,
+                    previous_mean,
+                    current_mean,
+                    current_mean - previous_mean,
                 ),
                 dim=-1,
             )
@@ -1743,7 +1652,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 pbo_loss = self._compute_pbo_loss(
                     hidden_states=hidden_states,
                     image_groups=image_groups,
-                    labels=labels,
                     image_current_index=image_current_index,
                     pbo_action_labels=pbo_action_labels,
                     pbo_valid_mask=pbo_valid_mask,

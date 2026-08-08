@@ -111,7 +111,6 @@ def _select_images(
     *,
     max_memory_images: int,
     memory_pool_window_frames: int,
-    pbo_enabled: bool = False,
 ) -> list[Image.Image]:
     if not images:
         raise ValueError("At least one image is required")
@@ -122,11 +121,6 @@ def _select_images(
         last_frame_index=len(images) - 1,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
-        required_frame_indices=(
-            [len(images) - 1 - ACTION_SEQUENCE_LENGTH]
-            if pbo_enabled and len(images) - 1 >= ACTION_SEQUENCE_LENGTH
-            else None
-        ),
     )
     return [images[index] for index in selected_indices]
 
@@ -411,7 +405,6 @@ class PanoVLNPredictor:
             loaded_images,
             max_memory_images=self.config.max_memory_images,
             memory_pool_window_frames=self.config.memory_pool_window_frames,
-            pbo_enabled=self.pbo_enabled,
         )
         _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
         processed_images, panovggt_pixel_values = self._prepare_images(selected_images)

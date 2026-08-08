@@ -12,7 +12,6 @@ import time
 import subprocess
 from collections import deque
 from dataclasses import asdict, dataclass
-from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -36,7 +35,6 @@ DEFAULT_VIDEO_WRITER = "ffmpeg"
 DEFAULT_SAVE_CONTENTS = "none"
 DEFAULT_MAX_MEMORY_IMAGES = 10
 DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 100
-PBO_ACTION_HORIZON = 4
 DEFAULT_HISTORY_LIMIT = DEFAULT_MEMORY_POOL_WINDOW_FRAMES + DEFAULT_MAX_MEMORY_IMAGES + 10
 DEFAULT_UPLOAD_IMAGE_MODE = "resize"
 DEFAULT_UPLOAD_IMAGE_SIZE = (1280, 640)
@@ -175,124 +173,26 @@ def build_vln_image_selection(
     last_frame_index: int,
     max_memory_images: int = 10,
     memory_pool_window_frames: int = 100,
-    required_frame_indices: Optional[Sequence[int]] = None,
 ) -> list[int]:
     max_memory_images = max(0, int(max_memory_images))
     memory_pool_window_frames = max(1, int(memory_pool_window_frames))
     current_frame_index = min(max(0, int(current_step)), int(last_frame_index))
     pool_start_frame = max(0, current_frame_index - memory_pool_window_frames + 1)
     candidate_frame_indices = list(range(pool_start_frame, current_frame_index + 1))
-    required = sorted(
-        {
-            int(index)
-            for index in (required_frame_indices or [])
-            if pool_start_frame <= int(index) <= current_frame_index
-        }
-    )
-
     total_selected_images = max_memory_images + 1
     if total_selected_images <= 0 or not candidate_frame_indices:
         return [current_frame_index]
     if len(candidate_frame_indices) <= total_selected_images:
         return candidate_frame_indices
     if total_selected_images == 1:
-        if any(index != current_frame_index for index in required):
-            raise ValueError(
-                "Cannot retain required VLN history frames without a memory slot: "
-                f"required={required}, budget={total_selected_images}"
-            )
         return [current_frame_index]
-
-    mandatory_indices = sorted(
-        {pool_start_frame, current_frame_index, *required}
-    )
-    if len(mandatory_indices) > total_selected_images:
-        raise ValueError(
-            "Cannot retain required VLN history frames within the configured "
-            f"memory budget: required={required}, budget={total_selected_images}"
-        )
 
     last_candidate_position = len(candidate_frame_indices) - 1
     selected_positions = [
         (slot * last_candidate_position) // (total_selected_images - 1)
         for slot in range(total_selected_images)
     ]
-    selected_indices = [
-        candidate_frame_indices[position] for position in selected_positions
-    ]
-    missing_required = [
-        index for index in required if index not in selected_indices
-    ]
-    if not missing_required:
-        return selected_indices
-
-    internal_mandatory = [
-        index
-        for index in mandatory_indices
-        if index not in {pool_start_frame, current_frame_index}
-    ]
-    best_selection = None
-    best_score = None
-    for internal_slots in combinations(
-        range(1, total_selected_images - 1),
-        len(internal_mandatory),
-    ):
-        anchor_indices = [
-            pool_start_frame,
-            *internal_mandatory,
-            current_frame_index,
-        ]
-        anchor_slots = [0, *internal_slots, total_selected_images - 1]
-        if any(
-            right_index - left_index < right_slot - left_slot
-            for left_index, right_index, left_slot, right_slot in zip(
-                anchor_indices,
-                anchor_indices[1:],
-                anchor_slots,
-                anchor_slots[1:],
-            )
-        ):
-            continue
-
-        selection = [pool_start_frame] * total_selected_images
-        for left_index, right_index, left_slot, right_slot in zip(
-            anchor_indices,
-            anchor_indices[1:],
-            anchor_slots,
-            anchor_slots[1:],
-        ):
-            frame_span = right_index - left_index
-            slot_span = right_slot - left_slot
-            for offset in range(slot_span + 1):
-                selection[left_slot + offset] = left_index + (
-                    offset * frame_span + slot_span // 2
-                ) // slot_span
-
-        gaps = [
-            right - left for left, right in zip(selection, selection[1:])
-        ]
-        candidate_score = (
-            sum(gap * gap for gap in gaps),
-            sum(
-                (frame_index - original_index) ** 2
-                for frame_index, original_index in zip(
-                    selection,
-                    selected_indices,
-                )
-            ),
-            selection,
-        )
-        if best_score is None or candidate_score < best_score:
-            best_score = candidate_score
-            best_selection = selection
-
-    if best_selection is None:
-        raise ValueError(
-            "Cannot distribute required VLN history frames within the "
-            f"configured memory budget: required={required}, "
-            f"budget={total_selected_images}"
-        )
-    return best_selection
+    return [candidate_frame_indices[position] for position in selected_positions]
 
 
 def selected_history(
@@ -300,7 +200,6 @@ def selected_history(
     *,
     max_memory_images: int,
     memory_pool_window_frames: int,
-    pbo_enabled: bool = False,
 ) -> list[bytes]:
     if not history:
         return []
@@ -309,11 +208,6 @@ def selected_history(
         last_frame_index=len(history) - 1,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
-        required_frame_indices=(
-            [len(history) - 1 - PBO_ACTION_HORIZON]
-            if pbo_enabled and len(history) - 1 >= PBO_ACTION_HORIZON
-            else None
-        ),
     )
     return [history[index] for index in indices]
 
@@ -1089,7 +983,6 @@ def request_prediction(
     history_snapshot: Sequence[bytes],
     max_memory_images: int,
     memory_pool_window_frames: int,
-    pbo_enabled: bool,
     upload_image_mode: str,
     jpeg_quality: int,
     upload_size: tuple[int, int],
@@ -1098,7 +991,6 @@ def request_prediction(
         history_snapshot,
         max_memory_images=max_memory_images,
         memory_pool_window_frames=memory_pool_window_frames,
-        pbo_enabled=pbo_enabled,
     )
     request_images = prepare_upload_images(
         selected_images,
@@ -1451,13 +1343,6 @@ def main() -> None:
         ready = client.ready()
         print({"server_ready": ready}, flush=True)
         run_log["server_ready"] = ready
-        if "pbo_enabled" not in ready:
-            raise RuntimeError(
-                "Server /ready response is missing pbo_enabled; update the server "
-                "so real-world memory sampling matches the loaded checkpoint"
-            )
-        pbo_enabled = bool(ready["pbo_enabled"])
-        run_log["upload"]["pbo_enabled"] = pbo_enabled
         backend.stand()
         replans = 0
         pending_prediction: Optional[PendingPrediction] = None
@@ -1475,7 +1360,6 @@ def main() -> None:
                     history_snapshot=list(history),
                     max_memory_images=args.upload_max_memory_images,
                     memory_pool_window_frames=args.upload_memory_pool_window_frames,
-                    pbo_enabled=pbo_enabled,
                     upload_image_mode=args.upload_image_mode,
                     jpeg_quality=args.jpeg_quality,
                     upload_size=(args.upload_width, args.upload_height),
@@ -1575,7 +1459,6 @@ def main() -> None:
                             "history_snapshot": list(history),
                             "max_memory_images": args.upload_max_memory_images,
                             "memory_pool_window_frames": args.upload_memory_pool_window_frames,
-                            "pbo_enabled": pbo_enabled,
                             "upload_image_mode": args.upload_image_mode,
                             "jpeg_quality": args.jpeg_quality,
                             "upload_size": (args.upload_width, args.upload_height),
