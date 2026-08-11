@@ -451,7 +451,7 @@ def apply_vln_memory_policy(
     history_actions = _extract_vln_history_actions(example, current_step)
     real_action_count = _extract_real_action_count(example, action_sequence)
 
-    pbo_valid = bool(
+    has_pbo_target = bool(
         pbo_enabled
         and history_actions is not None
         and len(history_actions) >= VLN_ACTION_SEQUENCE_LENGTH
@@ -466,24 +466,17 @@ def apply_vln_memory_policy(
         last_frame_index=len(raw_images) - 1,
     )
     selected_images = [raw_images[index] for index in selected_indices]
-    pbo_start_image_index = -1
-    if pbo_valid:
-        if four_step_memory_anchor in selected_indices:
-            pbo_start_image_index = selected_indices.index(four_step_memory_anchor)
-        else:
-            # Keep standard uniform memory sampling.  When t-4 is not on the
-            # uniform grid, pair the current panorama with the newest selected
-            # memory panorama instead.
-            pbo_start_image_index = len(selected_indices) - 2
-            if (
-                pbo_start_image_index < 0
-                or selected_indices[pbo_start_image_index] >= current_step
-            ):
-                raise AssertionError(
-                    "PBO requires at least one selected memory panorama before "
-                    f"the current step: current_step={current_step}, "
-                    f"selected_indices={selected_indices}"
-                )
+    # Keep the policy's standard uniform memory sampling unchanged.  PBO is
+    # supervised only when that sampling naturally includes the exact t-4
+    # endpoint required by the past-four action labels.
+    pbo_valid = bool(
+        has_pbo_target and four_step_memory_anchor in selected_indices
+    )
+    pbo_start_image_index = (
+        selected_indices.index(four_step_memory_anchor)
+        if pbo_valid
+        else -1
+    )
 
     if pbo_valid:
         pbo_action_labels = [

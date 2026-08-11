@@ -17,7 +17,7 @@ PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
 PBO_ACTION_HORIZON = 4
 PBO_NUM_ACTIONS = 4
-PBO_INPUT_VECTOR_COUNT = 7
+PBO_INPUT_VECTOR_COUNT = 6
 FORWARD_DYNAMICS_TARGET_DIM = 2048
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -1383,13 +1383,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         )
         return torch.cat((zero_order, cosine_order, sine_order), dim=-1)
 
-    @staticmethod
-    def _first_supervised_token_index(sample_labels: torch.Tensor) -> int:
-        supervised_positions = torch.nonzero(sample_labels != -100, as_tuple=False).flatten()
-        if supervised_positions.numel() == 0:
-            return -1
-        return int(supervised_positions[0].item())
-
     def _last_action_token_index(self, sample_labels: torch.Tensor) -> int:
         supervised_positions = torch.nonzero(
             sample_labels != -100,
@@ -1430,7 +1423,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         *,
         hidden_states: torch.Tensor,
         image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
-        labels: torch.Tensor,
         image_current_index: torch.Tensor,
         pbo_action_labels: torch.Tensor | None,
         pbo_valid_mask: torch.Tensor | None,
@@ -1487,14 +1479,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 current_geometry,
                 merge_size,
             )
-            context_index = self._first_supervised_token_index(labels[batch_index]) - 1
-            if context_index < 0:
-                raise AssertionError(
-                    f"PBO sample {batch_index} has no prompt token before assistant response"
-                )
             pbo_feature = torch.cat(
                 (
-                    hidden_states[batch_index, context_index].float(),
                     previous_fourier,
                     current_fourier,
                 ),
@@ -1743,7 +1729,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 pbo_loss = self._compute_pbo_loss(
                     hidden_states=hidden_states,
                     image_groups=image_groups,
-                    labels=labels,
                     image_current_index=image_current_index,
                     pbo_action_labels=pbo_action_labels,
                     pbo_valid_mask=pbo_valid_mask,

@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.20_lr2e-5_singlepoint_8card_png"
+OUTPUT_DIR="/workspace/data2/model/ablation_new/pbo_fd/panovggt_0.20_lr2e-5_singlepoint_8card_png_fd"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"
