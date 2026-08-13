@@ -16,7 +16,6 @@ PYTHON_BIN="python"
 MODEL_PATH="/workspace/data2/model/ablation_new/pbo_fd/panovggt_0.20_lr2e-5_singlepoint_8card_66.4pbo"
 OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 REFERENCE_INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
-DAGGER_DATASET_NAME="dagger"
 SOURCE_DATASET_NAMES=(r2r rxr)
 GPU_IDS="0,1,2,3,4,5,6,7"
 PROCESSES_PER_GPU="4"
@@ -35,14 +34,13 @@ SKIP_FAILED_EPISODES="false"
 IMAGE_FORMAT="jpeg"  # 当前保存 JPEG；如需无损图像可改为 png。
 PNG_COMPRESS_LEVEL="6"
 JPEG_QUALITY="95"
-JPEG_SUBSAMPLING="2"
+JPEG_SUBSAMPLING="1"
 
 mkdir -p "${OUTPUT_ROOT}"
 
 echo "MODEL_PATH: ${MODEL_PATH}"
 echo "OUTPUT_ROOT: ${OUTPUT_ROOT}"
 echo "REFERENCE_INPUT_ROOT: ${REFERENCE_INPUT_ROOT}"
-echo "DAGGER_DATASET_NAME: ${DAGGER_DATASET_NAME}"
 echo "SOURCE_DATASET_NAMES: ${SOURCE_DATASET_NAMES[*]}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "PROCESSES_PER_GPU: ${PROCESSES_PER_GPU}"
@@ -69,7 +67,6 @@ NUM_THREAD="$((GPU_COUNT * PROCESSES_PER_GPU))"
 CMD=(
     "${PYTHON_BIN}" src/data/generate_dagger_data.py
     --source_dataset_name "${SOURCE_DATASET_NAMES[@]}"
-    --dagger_dataset_name "${DAGGER_DATASET_NAME}"
     --model_path "${MODEL_PATH}"
     --output_root "${OUTPUT_ROOT}"
     --reference_input_root "${REFERENCE_INPUT_ROOT}"

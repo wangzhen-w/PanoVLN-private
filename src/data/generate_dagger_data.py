@@ -48,7 +48,6 @@ from src.data.habitat_shortest_path import (
     normalize_image_format,
     parse_episode_ids,
     parse_gpu_ids,
-    position_within_radius,
     positions_equal,
     remap_gpu_ids_to_visible_devices,
     reset_episode_output_dir,
@@ -76,22 +75,12 @@ DEFAULT_OUTPUT_ROOT = "/workspace/data2/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
 DEFAULT_SOURCE_DATASETS = ("r2r", "rxr")
 QUEUE_POLL_TIMEOUT_SECONDS = 5
-SAFE_DATASET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 SUPPORTED_ACTION_IDS = {
     STOP_ACTION,
     MOVE_FORWARD_ACTION,
     TURN_LEFT_ACTION,
     TURN_RIGHT_ACTION,
 }
-DEFAULT_DAGGER_ID_OFFSETS = {
-    "r2r": 0,
-    "rxr": 1_000_000,
-    "envdrop": 2_000_000,
-    "scalevln": 3_000_000,
-    "scalevln_150k": 4_000_000,
-}
-
-
 class DAggerCollectionError(RuntimeError):
     pass
 
@@ -149,10 +138,23 @@ def image_root(output_root: str, dagger_dataset_name: str) -> str:
     return os.path.join(output_root, "images", dagger_dataset_name)
 
 
+def annotation_episode_id(annotation: Dict) -> str:
+    episode_id = annotation.get("episode_id")
+    if not isinstance(episode_id, str) or not episode_id:
+        raise ValueError("DAgger annotation has no string episode_id")
+    return episode_id
+
+
 def annotation_image_id(annotation: Dict) -> str:
+    episode_id = annotation_episode_id(annotation)
     trajectory_id = annotation.get("trajectory_id")
     if not isinstance(trajectory_id, str) or not trajectory_id:
         raise ValueError("DAgger annotation has no trajectory_id")
+    if trajectory_id != episode_id:
+        raise ValueError(
+            "DAgger annotation episode_id and trajectory_id must match: "
+            f"episode_id={episode_id!r}, trajectory_id={trajectory_id!r}"
+        )
     return trajectory_id
 
 
@@ -182,7 +184,7 @@ def remove_if_exists(path: str) -> None:
         os.remove(path)
 
 
-def load_jsonl_index(path: str, tolerate_trailing_corrupt: bool = True) -> Dict[int, Dict]:
+def load_jsonl_index(path: str, tolerate_trailing_corrupt: bool = True) -> Dict[str, Dict]:
     index = {}
     if not os.path.exists(path):
         return index
@@ -208,11 +210,16 @@ def load_jsonl_index(path: str, tolerate_trailing_corrupt: bool = True) -> Dict[
                     )
                     break
                 raise
-            index[int(item["episode_id"])] = item
+            episode_id = annotation_episode_id(item)
+            if episode_id in index:
+                raise ValueError(
+                    f"Duplicate DAgger episode_id={episode_id!r} in {path}"
+                )
+            index[episode_id] = item
     return index
 
 
-def write_jsonl_index(path: str, index: Dict[int, Dict]) -> None:
+def write_jsonl_index(path: str, index: Dict[str, Dict]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -227,6 +234,68 @@ def write_jsonl_item(handle, item: Dict) -> None:
     handle.write(json.dumps(item, ensure_ascii=False) + "\n")
     handle.flush()
     os.fsync(handle.fileno())
+
+
+def repair_jsonl_for_append(path: str) -> bool:
+    """Make an interrupted JSONL journal safe to append to.
+
+    A killed worker can leave a partial final JSON object.  Merely ignoring
+    that object while reading is insufficient: the next append would be
+    concatenated to the partial line.  Drop only a corrupt final non-empty
+    line and ensure the last valid record is newline-terminated before the
+    worker resumes writing.
+    """
+
+    if not os.path.exists(path):
+        return False
+
+    with open(path, "rb") as handle:
+        raw_content = handle.read()
+    if not raw_content:
+        return False
+
+    lines = raw_content.splitlines(keepends=True)
+    non_empty_indices = [
+        line_index
+        for line_index, line in enumerate(lines)
+        if line.strip()
+    ]
+    if not non_empty_indices:
+        repaired_content = b""
+    else:
+        last_non_empty_index = non_empty_indices[-1]
+        corrupt_final_line = False
+        for line_index in non_empty_indices:
+            try:
+                json.loads(lines[line_index])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if line_index != last_non_empty_index:
+                    raise
+                corrupt_final_line = True
+
+        if corrupt_final_line:
+            repaired_content = b"".join(lines[:last_non_empty_index])
+        else:
+            repaired_content = raw_content
+
+        repaired_content = repaired_content.rstrip(b" \t\r\n")
+        if repaired_content:
+            repaired_content += b"\n"
+
+    if repaired_content == raw_content:
+        return False
+
+    tmp_path = f"{path}.repair-{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "wb") as handle:
+            handle.write(repaired_content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    return True
 
 
 def count_saved_frames(episode_image_dir: str, image_format: str) -> int:
@@ -385,10 +454,10 @@ def is_raw_episode_complete(
 
 
 def validate_safe_dataset_name(name: str, arg_name: str = "dagger_dataset_name") -> None:
-    if not name or not SAFE_DATASET_NAME_PATTERN.fullmatch(name):
+    if name != DEFAULT_DAGGER_DATASET_NAME:
         raise ValueError(
-            f"{arg_name} must be a non-empty basename containing only "
-            f"letters, digits, '_', '-', or '.', got {name!r}"
+            f"{arg_name} must be exactly {DEFAULT_DAGGER_DATASET_NAME!r}; "
+            f"custom DAgger dataset names are not supported, got {name!r}"
         )
 
 
@@ -399,6 +468,16 @@ def assert_path_inside(path: str, parent: str) -> None:
         resolved_path.relative_to(resolved_parent)
     except ValueError as exc:
         raise ValueError(f"Refusing to operate on path outside {resolved_parent}: {resolved_path}") from exc
+
+
+def assert_path_strictly_inside(path: str, parent: str) -> None:
+    resolved_path = Path(path).resolve()
+    resolved_parent = Path(parent).resolve()
+    assert_path_inside(str(resolved_path), str(resolved_parent))
+    if resolved_path == resolved_parent:
+        raise ValueError(
+            f"Refusing to operate on parent directory itself: {resolved_path}"
+        )
 
 
 def process_is_alive(pid: int) -> bool:
@@ -466,19 +545,6 @@ def assert_no_active_progress_lock(progress_dir: str) -> None:
             f"{lock_path} (pid={lock_pid})."
         )
     os.remove(lock_path)
-
-
-def dagger_episode_id(source_dataset: str, source_episode_id) -> int:
-    try:
-        source_id = int(source_episode_id)
-    except (TypeError, ValueError):
-        digest = hashlib.sha1(f"{source_dataset}:{source_episode_id}".encode("utf-8")).hexdigest()
-        source_id = int(digest[:8], 16)
-    offset = DEFAULT_DAGGER_ID_OFFSETS.get(source_dataset)
-    if offset is None:
-        dataset_index = int(hashlib.sha1(source_dataset.encode("utf-8")).hexdigest()[:4], 16)
-        offset = 10_000_000 + dataset_index * 1_000_000
-    return offset + source_id
 
 
 def dagger_trajectory_id(source_dataset: str, source_episode_id) -> str:
@@ -600,6 +666,46 @@ def target_reached_radius(
     return float(midgoal_radius)
 
 
+def geodesic_distance_to_target(
+    env,
+    current_position: Sequence[float],
+    target_position: Sequence[float],
+) -> float:
+    """Return Habitat's navigable distance between two positions.
+
+    ``inf`` is a valid result for an unreachable target.  NaN and negative
+    distances indicate a simulator failure and must not silently turn into an
+    oracle STOP or a successful DAgger episode.
+    """
+
+    distance = float(
+        env.sim.geodesic_distance(
+            list(current_position),
+            list(target_position),
+        )
+    )
+    if math.isnan(distance) or distance < 0.0:
+        raise DAggerCollectionError(
+            "Habitat returned an invalid geodesic distance: "
+            f"distance={distance}, start={list(current_position)}, "
+            f"target={list(target_position)}"
+        )
+    return distance
+
+
+def target_within_geodesic_radius(
+    env,
+    current_position: Sequence[float],
+    target_position: Sequence[float],
+    radius: float,
+) -> bool:
+    return geodesic_distance_to_target(
+        env,
+        current_position,
+        target_position,
+    ) <= float(radius)
+
+
 def advance_target_index(
     env,
     target_positions,
@@ -615,7 +721,8 @@ def advance_target_index(
             midgoal_radius,
             goal_radius,
         )
-        if not position_within_radius(
+        if not target_within_geodesic_radius(
+            env,
             current_position,
             target_positions[next_target_index],
             radius,
@@ -640,16 +747,26 @@ def restore_agent_state(env, state) -> None:
 
 def next_oracle_action(env, follower, target_position, goal_radius: float) -> int:
     current_position = to_position_list(env.sim.get_agent_state().position)
-    if position_within_radius(current_position, target_position, goal_radius):
+    distance_to_target = geodesic_distance_to_target(
+        env,
+        current_position,
+        target_position,
+    )
+    if distance_to_target <= float(goal_radius):
         return STOP_ACTION
 
     action = action_to_int(follower.get_next_action(target_position))
     if action == STOP_ACTION:
         current_position = to_position_list(env.sim.get_agent_state().position)
-        if not position_within_radius(current_position, target_position, goal_radius):
+        distance_to_target = geodesic_distance_to_target(
+            env,
+            current_position,
+            target_position,
+        )
+        if distance_to_target > float(goal_radius):
             raise DAggerCollectionError(
                 "ShortestPathFollower returned stop before target: "
-                f"distance={euclidean_distance(current_position, target_position):.3f}, "
+                f"geodesic_distance={distance_to_target:.3f}, "
                 f"goal_radius={goal_radius}"
             )
     if action not in SUPPORTED_ACTION_IDS:
@@ -699,14 +816,27 @@ def oracle_action_for_current_state(
 
 def preview_oracle_sequence(
     env,
-    midgoal_follower,
-    goal_follower,
     target_positions,
     next_target_index: int,
     midgoal_radius: float,
     goal_radius: float,
     action_horizon: int,
 ) -> List[int]:
+    # GreedyGeodesicFollower records every queried action for anti-thrashing.
+    # A preview executes counterfactual actions and then rewinds the simulator,
+    # so its followers must be private to this preview and discarded with it.
+    midgoal_follower = ShortestPathFollower(
+        env.sim,
+        goal_radius=midgoal_radius,
+        return_one_hot=False,
+        stop_on_error=True,
+    )
+    goal_follower = ShortestPathFollower(
+        env.sim,
+        goal_radius=goal_radius,
+        return_one_hot=False,
+        stop_on_error=True,
+    )
     saved_state = capture_agent_state(env)
     preview_target_index = next_target_index
     actions: List[int] = []
@@ -776,16 +906,16 @@ def action_sequence_requests_stop(
 def is_successful_dagger_termination(
     status: str,
     executed_actions: Sequence[int],
-    final_distance_to_goal: float,
+    final_geodesic_distance_to_goal: float,
     goal_radius: float,
 ) -> bool:
-    """Accept only a real STOP at the single configured final-goal radius."""
+    """Accept only a real STOP within the final-goal geodesic radius."""
 
     return bool(
         status == "terminal"
         and executed_actions
         and int(executed_actions[-1]) == STOP_ACTION
-        and float(final_distance_to_goal) <= float(goal_radius)
+        and float(final_geodesic_distance_to_goal) <= float(goal_radius)
     )
 
 
@@ -830,7 +960,7 @@ def collect_raw_dagger_episode(
     agent: PanoVLN_Agent,
     source_dataset: str,
     episode,
-    dagger_id: int,
+    dagger_id: str,
     output_root: str,
     dagger_dataset_name: str,
     reference_steps: int,
@@ -849,18 +979,6 @@ def collect_raw_dagger_episode(
     env.current_episode = episode
     observation = env.reset()
     agent.reset()
-    midgoal_follower = ShortestPathFollower(
-        env.sim,
-        goal_radius=midgoal_radius,
-        return_one_hot=False,
-        stop_on_error=True,
-    )
-    goal_follower = ShortestPathFollower(
-        env.sim,
-        goal_radius=goal_radius,
-        return_one_hot=False,
-        stop_on_error=True,
-    )
 
     instruction = extract_instruction(episode)
     if not instruction and "instruction" in observation:
@@ -920,8 +1038,6 @@ def collect_raw_dagger_episode(
         )
         oracle_sequence = preview_oracle_sequence(
             env=env,
-            midgoal_follower=midgoal_follower,
-            goal_follower=goal_follower,
             target_positions=target_positions,
             next_target_index=next_target_index,
             midgoal_radius=midgoal_radius,
@@ -970,18 +1086,20 @@ def collect_raw_dagger_episode(
             if env_steps >= max_steps_per_episode:
                 break
 
-            oracle_action, next_target_index = oracle_action_for_current_state(
+            # Only update reachability state here. Querying a persistent expert
+            # follower while executing model actions would record expert actions
+            # that were never executed and corrupt its anti-thrashing history.
+            next_target_index = advance_target_index(
                 env,
-                midgoal_follower,
-                goal_follower,
                 target_positions,
                 next_target_index,
                 midgoal_radius,
                 goal_radius,
             )
+            oracle_requests_stop_now = next_target_index >= len(target_positions)
 
             action_to_execute = int(selected_action)
-            if oracle_action == STOP_ACTION and not oracle_requests_stop:
+            if oracle_requests_stop_now and not oracle_requests_stop:
                 terminal_decision_step = frame_index - 1
                 if terminal_decision_step <= decision_step:
                     raise DAggerCollectionError(
@@ -995,9 +1113,14 @@ def collect_raw_dagger_episode(
                         "oracle_actions": [STOP_ACTION] * action_horizon,
                     }
                 )
-            if action_to_execute == STOP_ACTION and oracle_action != STOP_ACTION:
-                action_to_execute = int(oracle_action)
-            if oracle_action == STOP_ACTION:
+            if action_to_execute == STOP_ACTION and not oracle_requests_stop_now:
+                raise DAggerCollectionError(
+                    "Oracle preview requested STOP before the real trajectory "
+                    "entered the final geodesic radius: "
+                    f"decision_step={decision_step}, "
+                    f"current_step={frame_index - 1}"
+                )
+            if oracle_requests_stop_now:
                 action_to_execute = STOP_ACTION
 
             executed_actions.append(action_to_execute)
@@ -1027,7 +1150,11 @@ def collect_raw_dagger_episode(
         replan_index += 1
 
     final_position = to_position_list(env.sim.get_agent_state().position)
-    final_distance_to_goal = euclidean_distance(final_position, final_goal_position)
+    final_distance_to_goal = geodesic_distance_to_target(
+        env,
+        final_position,
+        final_goal_position,
+    )
     terminated_by_stop = bool(
         status == "terminal"
         and executed_actions
@@ -1036,10 +1163,14 @@ def collect_raw_dagger_episode(
     episode_success = is_successful_dagger_termination(
         status=status,
         executed_actions=executed_actions,
-        final_distance_to_goal=final_distance_to_goal,
+        final_geodesic_distance_to_goal=final_distance_to_goal,
         goal_radius=goal_radius,
     )
-    start_goal_distance = euclidean_distance(start_position, final_goal_position)
+    start_goal_distance = geodesic_distance_to_target(
+        env,
+        start_position,
+        final_goal_position,
+    )
     path_efficiency = start_goal_distance / max(start_goal_distance, executed_path_length, 1e-8)
 
     if not episode_success:
@@ -1049,7 +1180,7 @@ def collect_raw_dagger_episode(
             status = f"not_saved_outside_goal_radius:{status}"
         remove_if_exists(episode_image_dir)
         summary = {
-            "episode_id": int(dagger_id),
+            "episode_id": dagger_id,
             "source_dataset": source_dataset,
             "source_episode_id": str(episode.episode_id),
             "scene_id": getattr(episode, "scene_id", ""),
@@ -1075,7 +1206,7 @@ def collect_raw_dagger_episode(
         return None, summary
 
     annotation = {
-        "episode_id": int(dagger_id),
+        "episode_id": dagger_id,
         "trajectory_id": trajectory_id,
         "instruction": instruction,
         # Complete mixed-policy trajectory for image/history/PBO alignment.
@@ -1084,7 +1215,7 @@ def collect_raw_dagger_episode(
         "oracle_chunks": oracle_chunks,
     }
     summary = {
-        "episode_id": int(dagger_id),
+        "episode_id": dagger_id,
         "source_dataset": source_dataset,
         "source_episode_id": str(episode.episode_id),
         "scene_id": getattr(episode, "scene_id", ""),
@@ -1208,11 +1339,16 @@ def dagger_worker(
             env = habitat.Env(config=env_config.habitat, dataset=dataset)
 
         os.makedirs(os.path.dirname(partial_annotation_path), exist_ok=True)
+        if repair_jsonl_for_append(partial_annotation_path):
+            tqdm.write(
+                f"[dagger:{source_dataset}] repaired interrupted JSONL journal "
+                f"before resume: {partial_annotation_path}"
+            )
         rng = random.Random(seed + worker_index)
         with open(partial_annotation_path, "a", encoding="utf-8") as annotation_handle:
             for episode in dataset.episodes:
                 episode_start_time = time.time()
-                dagger_id = int(dagger_ids[int(episode.episode_id)])
+                dagger_id = str(dagger_ids[int(episode.episode_id)])
                 try:
                     reference_steps = infer_reference_steps(
                         episode,
@@ -1338,7 +1474,7 @@ def load_complete_existing_annotations(
     image_format,
     progress_dir=None,
 ):
-    existing: Dict[int, Dict] = {}
+    existing: Dict[str, Dict] = {}
     for annotation in load_jsonl_index(annotation_path(output_root, dagger_dataset_name)).values():
         if is_raw_episode_complete(
             output_root,
@@ -1346,7 +1482,7 @@ def load_complete_existing_annotations(
             annotation,
             image_format,
         ):
-            existing[int(annotation["episode_id"])] = annotation
+            existing[annotation_episode_id(annotation)] = annotation
     if progress_dir is not None:
         for path in list_rank_annotation_paths(progress_dir):
             for annotation in load_jsonl_index(path).values():
@@ -1357,7 +1493,7 @@ def load_complete_existing_annotations(
                     image_format,
                 ):
                     continue
-                episode_id = int(annotation["episode_id"])
+                episode_id = annotation_episode_id(annotation)
                 if episode_id in existing and existing[episode_id] != annotation:
                     raise ValueError(
                         f"Conflicting complete annotations for episode_id={episode_id} "
@@ -1368,7 +1504,7 @@ def load_complete_existing_annotations(
 
 
 def add_complete_annotation(
-    merged_annotations: Dict[int, Dict],
+    merged_annotations: Dict[str, Dict],
     output_root: str,
     dagger_dataset_name: str,
     annotation: Dict,
@@ -1386,7 +1522,7 @@ def add_complete_annotation(
             f"{annotation.get('episode_id')} from {source_path}"
         )
         return
-    episode_id = int(annotation["episode_id"])
+    episode_id = annotation_episode_id(annotation)
     existing = merged_annotations.get(episode_id)
     if existing is not None and existing != annotation:
         raise ValueError(
@@ -1400,10 +1536,10 @@ def merge_partial_outputs(
     output_root: str,
     dagger_dataset_name: str,
     progress_dir: str,
-    existing_annotations: Dict[int, Dict],
+    existing_annotations: Dict[str, Dict],
     image_format: str,
 ):
-    merged_annotations: Dict[int, Dict] = {}
+    merged_annotations: Dict[str, Dict] = {}
     for annotation in existing_annotations.values():
         add_complete_annotation(
             merged_annotations=merged_annotations,
@@ -1491,7 +1627,7 @@ def process_source_dataset(
     dagger_ids = {}
     skipped = 0
     for episode in selected_episodes:
-        dagger_id = dagger_episode_id(source_dataset, episode.episode_id)
+        dagger_id = dagger_trajectory_id(source_dataset, episode.episode_id)
         dagger_ids[int(episode.episode_id)] = dagger_id
         if skip_existing_episodes and dagger_id in existing_annotations:
             skipped += 1
@@ -1739,11 +1875,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Collect raw PanoVLN DAgger data with Efficient-VLN dynamic ratio. "
-            "Outputs sub_dataset/<dagger>.jsonl and images/<dagger>/."
+            "Outputs sub_dataset/dagger.jsonl and images/dagger/."
         )
     )
+    parser.set_defaults(dagger_dataset_name=DEFAULT_DAGGER_DATASET_NAME)
     parser.add_argument("--source_dataset_name", nargs="+", default=list(DEFAULT_SOURCE_DATASETS))
-    parser.add_argument("--dagger_dataset_name", type=str, default=DEFAULT_DAGGER_DATASET_NAME)
     parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--reference_input_root", type=str, default=DEFAULT_OUTPUT_ROOT)
@@ -1835,16 +1971,25 @@ def main() -> None:
         raise ValueError("--num_processes_per_gpu requires --gpu_ids")
 
     selected_episode_ids = parse_episode_ids(args.episode_ids)
-    os.makedirs(os.path.join(args.output_root, "sub_dataset"), exist_ok=True)
+    sub_dataset_root = os.path.join(args.output_root, "sub_dataset")
+    images_root = os.path.join(args.output_root, "images")
+    os.makedirs(sub_dataset_root, exist_ok=True)
+    os.makedirs(images_root, exist_ok=True)
+    assert_path_strictly_inside(
+        annotation_path(args.output_root, args.dagger_dataset_name),
+        sub_dataset_root,
+    )
+    assert_path_strictly_inside(
+        image_root(args.output_root, args.dagger_dataset_name),
+        images_root,
+    )
     os.makedirs(image_root(args.output_root, args.dagger_dataset_name), exist_ok=True)
-    assert_path_inside(annotation_path(args.output_root, args.dagger_dataset_name), args.output_root)
-    assert_path_inside(image_root(args.output_root, args.dagger_dataset_name), args.output_root)
 
     progress_dir = progress_dir_path(
         output_root=args.output_root,
         dagger_dataset_name=args.dagger_dataset_name,
     )
-    assert_path_inside(progress_dir, args.output_root)
+    assert_path_strictly_inside(progress_dir, sub_dataset_root)
     if args.skip_existing_episodes:
         os.makedirs(progress_dir, exist_ok=True)
         lock_path = acquire_progress_lock(progress_dir)
