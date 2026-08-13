@@ -28,7 +28,6 @@ DEFAULT_TRAINABLE_MODULES = {
     "language_model": True,
     "panovggt_mlp": True,
     "pbo_head": True,
-    "forward_dynamics_head": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -76,7 +75,6 @@ def set_model(cfg, model):
         ),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
         "pbo_head": getattr(model, "pbo_head", None),
-        "forward_dynamics_head": getattr(model, "forward_dynamics_head", None),
         "language_model": language_model,
     }
 
@@ -112,6 +110,12 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
+    checkpoint_pbo_enabled = bool(getattr(config, "pbo_enabled", False))
+    checkpoint_pbo_input_vector_count = getattr(
+        config,
+        "pbo_input_vector_count",
+        None,
+    )
     erp_crop_fields = (
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
@@ -129,10 +133,6 @@ def _load_model_config(cfg):
         "pbo_enabled",
         "pbo_loss_weight",
         "pbo_head_hidden_size",
-    )
-    forward_dynamics_fields = (
-        "forward_dynamics_enabled",
-        "forward_dynamics_loss_weight",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -160,10 +160,11 @@ def _load_model_config(cfg):
         setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     apply_module_fields_preserve_checkpoint(bool(cfg.model.pbo_enabled), pbo_fields)
-    apply_module_fields_preserve_checkpoint(
-        bool(cfg.model.forward_dynamics_enabled),
-        forward_dynamics_fields,
-    )
+    # The input width is part of the saved PBO head architecture. Preserve
+    # explicit legacy metadata here; model loading also infers it from local
+    # PBO weights for older checkpoints that predate this config field.
+    if checkpoint_pbo_enabled and checkpoint_pbo_input_vector_count is not None:
+        config.pbo_input_vector_count = int(checkpoint_pbo_input_vector_count)
     return config
 
 

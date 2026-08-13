@@ -2,7 +2,6 @@ import json
 import math
 import os
 import random
-import re
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -403,32 +402,10 @@ def _extract_real_action_count(
     return int(value)
 
 
-def _forward_target_observation_path(
-    current_path: str,
-    action_sequence: List[str],
-) -> str:
-    directory, filename = os.path.split(current_path)
-    match = re.fullmatch(r"frame_(\d+)(\.[^.]+)", filename)
-    if match is None:
-        raise ValueError(
-            "Forward dynamics requires frame_<step> image names, got "
-            f"{current_path!r}"
-        )
-    # Each non-STOP action produces one stored observation.  A real STOP in the
-    # fourth slot is an identity transition, so its conceptual t+4 state reuses
-    # the stored t+3 panorama.
-    target_offset = sum(action != "stop" for action in action_sequence)
-    target_filename = (
-        f"frame_{int(match.group(1)) + target_offset}{match.group(2)}"
-    )
-    return os.path.join(directory, target_filename)
-
-
 def apply_vln_memory_policy(
     example: Dict[str, Any],
     *,
     pbo_enabled: bool = False,
-    forward_dynamics_enabled: bool = False,
 ) -> Dict[str, Any]:
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
@@ -449,7 +426,7 @@ def apply_vln_memory_policy(
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example)
     history_actions = _extract_vln_history_actions(example, current_step)
-    real_action_count = _extract_real_action_count(example, action_sequence)
+    _extract_real_action_count(example, action_sequence)
 
     has_pbo_target = bool(
         pbo_enabled
@@ -496,16 +473,6 @@ def apply_vln_memory_policy(
     normalized["_pbo_valid"] = pbo_valid
     normalized["_pbo_start_image_index"] = pbo_start_image_index
     normalized["_pbo_action_labels"] = pbo_action_labels
-    forward_dynamics_valid = bool(
-        forward_dynamics_enabled
-        and real_action_count == VLN_ACTION_SEQUENCE_LENGTH
-    )
-    normalized["_forward_dynamics_valid"] = forward_dynamics_valid
-    normalized["_forward_target_image"] = (
-        _forward_target_observation_path(raw_images[-1], action_sequence)
-        if forward_dynamics_valid
-        else None
-    )
     normalized["messages"] = [
         {
             "role": "system",
@@ -589,7 +556,6 @@ class SupervisedDataset(Dataset):
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
         pbo_enabled: bool = False,
-        forward_dynamics_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -608,7 +574,6 @@ class SupervisedDataset(Dataset):
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
         self.pbo_enabled = bool(pbo_enabled)
-        self.forward_dynamics_enabled = bool(forward_dynamics_enabled)
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -679,7 +644,6 @@ class SupervisedDataset(Dataset):
         example = apply_vln_memory_policy(
             self._load_example(index),
             pbo_enabled=self.pbo_enabled,
-            forward_dynamics_enabled=self.forward_dynamics_enabled,
         )
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
@@ -765,10 +729,6 @@ class SupervisedDataset(Dataset):
             [example["_pbo_start_image_index"]],
             dtype=torch.long,
         )
-        item["forward_dynamics_valid_mask"] = torch.tensor(
-            [example["_forward_dynamics_valid"]],
-            dtype=torch.bool,
-        )
 
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
@@ -777,21 +737,6 @@ class SupervisedDataset(Dataset):
             item["panovggt_pixel_values"] = preprocess_panovggt_current_image(
                 raw_images[-1]
             ).unsqueeze(0)
-
-        if example["_forward_dynamics_valid"]:
-            target_path = _resolve_image_path(
-                example["_forward_target_image"],
-                self.image_root,
-            )
-            current_path = vision_paths[-1]
-            if os.path.abspath(target_path) == os.path.abspath(current_path):
-                target_raw_image = raw_images[-1]
-            else:
-                with Image.open(target_path) as image:
-                    target_raw_image = image.convert("RGB")
-            item["forward_target_panovggt_pixel_values"] = (
-                preprocess_panovggt_current_image(target_raw_image).unsqueeze(0)
-            )
 
         for key in STACKABLE_KEYS:
             if key in encoded:
@@ -810,6 +755,4 @@ STACKABLE_KEYS = (
     "pbo_action_labels",
     "pbo_valid_mask",
     "pbo_start_image_index",
-    "forward_dynamics_valid_mask",
-    "forward_target_panovggt_pixel_values",
 )

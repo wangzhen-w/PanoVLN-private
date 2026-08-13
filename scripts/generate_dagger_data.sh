@@ -13,9 +13,9 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
-OUTPUT_ROOT="/workspace/data2/dataset/PanoVLN"
-REFERENCE_INPUT_ROOT="/workspace/data2/dataset/PanoVLN"
+MODEL_PATH="/workspace/data2/model/ablation_new/pbo_fd/panovggt_0.20_lr2e-5_singlepoint_8card_66.4pbo"
+OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
+REFERENCE_INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 DAGGER_DATASET_NAME="dagger"
 SOURCE_DATASET_NAMES=(r2r rxr)
 GPU_IDS="0,1,2,3,4,5,6,7"
@@ -23,18 +23,18 @@ PROCESSES_PER_GPU="4"
 MAX_EPISODES=""
 EPISODE_IDS=""
 MAX_STEPS_PER_EPISODE="500"
-# Expert/ShortestPathFollower waypoint tolerance for oracle action labels.
-GOAL_RADIUS="0.25"
-# Final distance-to-goal threshold for considering a mixed-policy rollout successful.
-SUCCESS_RADIUS="0.5"
+# Intermediate reference-waypoint tolerance, matching StreamVLN/JanusVLN.
+MIDGOAL_RADIUS="1.8"
+# Single final-goal tolerance for both oracle STOP and saved-episode success.
+GOAL_RADIUS="0.3"
 ALPHA="0.5"
 SEED="42"
 ATTN_IMPLEMENTATION="sdpa"
 SKIP_EXISTING_EPISODES="true"
 SKIP_FAILED_EPISODES="false"
-IMAGE_FORMAT="png"  # DAgger 默认保存无损 PNG；也可改为 jpeg。
+IMAGE_FORMAT="jpeg"  # 当前保存 JPEG；如需无损图像可改为 png。
 PNG_COMPRESS_LEVEL="6"
-JPEG_QUALITY="75"
+JPEG_QUALITY="95"
 JPEG_SUBSAMPLING="2"
 
 mkdir -p "${OUTPUT_ROOT}"
@@ -46,8 +46,8 @@ echo "DAGGER_DATASET_NAME: ${DAGGER_DATASET_NAME}"
 echo "SOURCE_DATASET_NAMES: ${SOURCE_DATASET_NAMES[*]}"
 echo "GPU_IDS: ${GPU_IDS}"
 echo "PROCESSES_PER_GPU: ${PROCESSES_PER_GPU}"
+echo "MIDGOAL_RADIUS: ${MIDGOAL_RADIUS}"
 echo "GOAL_RADIUS: ${GOAL_RADIUS}"
-echo "SUCCESS_RADIUS: ${SUCCESS_RADIUS}"
 echo "ALPHA: ${ALPHA}"
 echo "IMAGE_FORMAT: ${IMAGE_FORMAT}"
 if [[ "${IMAGE_FORMAT,,}" == "png" ]]; then
@@ -77,8 +77,8 @@ CMD=(
     --num_thread "${NUM_THREAD}"
     --num_processes_per_gpu "${PROCESSES_PER_GPU}"
     --max_steps_per_episode "${MAX_STEPS_PER_EPISODE}"
+    --midgoal_radius "${MIDGOAL_RADIUS}"
     --goal_radius "${GOAL_RADIUS}"
-    --success_radius "${SUCCESS_RADIUS}"
     --alpha "${ALPHA}"
     --seed "${SEED}"
     --attn_implementation "${ATTN_IMPLEMENTATION}"

@@ -13,10 +13,10 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="/opt/conda/bin/python"  # 当前训练环境；需迁移时改这一处。
-INPUT_ROOT="/workspace/data2/dataset/PanoVLN"
-OUTPUT_PATH="/workspace/data2/dataset/ablation/ebs/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
-DATASET_NAMES=(r2r rxr)
-MAX_EPISODES_PER_SUBSET=""        # 当前 canonical EBS 使用两个子集的全部episode。
+INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
+OUTPUT_PATH="/workspace/data2/dataset/ablation/data/train_r2r_rxr_ebs_event050_bg005_tail080_dagger.jsonl"
+DATASET_NAMES=(r2r rxr dagger)           # DAgger 保留全部 oracle decision，不做 EBS 采样。
+MAX_EPISODES_PER_SUBSET=""        # 当前使用三个子集的全部 episode。
 SUBSET_SEED="42"                # 固定episode随机排列；不同规模取同一排列的前缀。
 PAD_STOP_TO_HORIZON="true"
 SEED="42"                       # EBS action chunk采样seed，与episode抽样相互独立。

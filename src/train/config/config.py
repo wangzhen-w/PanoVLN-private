@@ -26,8 +26,6 @@ class ModelConfig:
     pbo_enabled: bool = False
     pbo_loss_weight: float = 0.1
     pbo_head_hidden_size: int = 512
-    forward_dynamics_enabled: bool = False
-    forward_dynamics_loss_weight: float = 0.1
 
 
 @dataclass
@@ -74,7 +72,6 @@ class TrainingConfig:
     visual_merger_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
     pbo_head_lr: Optional[float] = None
-    forward_dynamics_head_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10

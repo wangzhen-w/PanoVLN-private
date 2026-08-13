@@ -134,6 +134,7 @@ def load_episode_images(
     frame_index_fn,
     input_root: str,
     num_actions: int,
+    append_terminal_frame: bool = True,
 ) -> List[str]:
     episode_image_list = os.listdir(episode_image_path)
     episode_image_list = sorted(
@@ -145,6 +146,14 @@ def load_episode_images(
         for image in episode_image_list
     ]
 
+    if not append_terminal_frame:
+        if len(episode_image_list) != num_actions:
+            raise ValueError(
+                f"Unexpected number of DAgger frames in {episode_image_path}: "
+                f"{len(episode_image_list)} vs actions={num_actions}"
+            )
+        return episode_image_list
+
     if len(episode_image_list) == num_actions:
         episode_image_list.append(episode_image_list[-1])
     elif len(episode_image_list) != num_actions + 1:
@@ -154,6 +163,102 @@ def load_episode_images(
         )
 
     return episode_image_list
+
+
+def is_chunk_relabelled_dagger(annotation: Dict[str, Any]) -> bool:
+    return bool(annotation.get("trajectory_id")) and isinstance(
+        annotation.get("oracle_chunks"), list
+    )
+
+
+def build_dagger_oracle_action_chunks(
+    annotation: Dict[str, Any],
+    action_horizon: int = DEFAULT_ACTION_HORIZON,
+) -> List[Dict[str, Any]]:
+    actions = [int(action_id) for action_id in annotation["actions"]]
+    if not actions or actions[-1] != STOP_ACTION_ID:
+        raise ValueError("DAgger trajectory must end with stop")
+    if STOP_ACTION_ID in actions[:-1]:
+        raise ValueError("DAgger trajectory contains an early stop")
+
+    raw_chunks = annotation.get("oracle_chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise ValueError("DAgger annotation has no oracle_chunks")
+
+    action_chunks = []
+    previous_step = -1
+    for chunk_index, raw_chunk in enumerate(raw_chunks):
+        step_index = raw_chunk.get("step_index")
+        action_ids = [int(action_id) for action_id in raw_chunk.get("oracle_actions", [])]
+        step_gap = (
+            step_index - previous_step
+            if isinstance(step_index, int) and previous_step >= 0
+            else None
+        )
+        if (
+            isinstance(step_index, bool)
+            or not isinstance(step_index, int)
+            or step_index <= previous_step
+            or step_index >= len(actions)
+        ):
+            raise ValueError(f"Invalid DAgger oracle chunk step_index: {step_index}")
+        if len(action_ids) != action_horizon:
+            raise ValueError(
+                f"DAgger oracle chunk must contain {action_horizon} actions, "
+                f"got {len(action_ids)} at step {step_index}"
+            )
+        try:
+            first_stop_index = action_ids.index(STOP_ACTION_ID)
+        except ValueError:
+            real_action_count = action_horizon
+        else:
+            if chunk_index != len(raw_chunks) - 1:
+                raise ValueError(
+                    "Only the final DAgger oracle chunk may contain stop"
+                )
+            real_action_count = first_stop_index + 1
+            if any(
+                action_id != STOP_ACTION_ID
+                for action_id in action_ids[first_stop_index:]
+            ):
+                raise ValueError(
+                    f"DAgger oracle chunk has an action after stop at step {step_index}"
+                )
+        if step_gap is not None and step_gap != action_horizon:
+            non_stop_action_count = len(actions) - 1
+            is_early_terminal_replan = bool(
+                0 < step_gap < action_horizon
+                and step_index == non_stop_action_count
+                and action_ids[0] == STOP_ACTION_ID
+            )
+            if not is_early_terminal_replan:
+                raise ValueError(f"Invalid DAgger oracle chunk step_index: {step_index}")
+        action_chunks.append(
+            {
+                "action_ids": action_ids,
+                "start_step": step_index,
+                "end_step": step_index + real_action_count - 1,
+                "real_action_count": real_action_count,
+                "texts": [action_id_to_str(action_id) for action_id in action_ids],
+            }
+        )
+        previous_step = step_index
+    if action_chunks[0]["start_step"] != 0:
+        raise ValueError("The first DAgger oracle chunk must start at step 0")
+    non_stop_action_count = len(actions) - 1
+    last_action_ids = action_chunks[-1]["action_ids"]
+    if STOP_ACTION_ID not in last_action_ids:
+        raise ValueError(
+            "The final DAgger oracle chunk must contain stop"
+        )
+    if previous_step + last_action_ids.index(STOP_ACTION_ID) != non_stop_action_count:
+        raise ValueError(
+            "DAgger final oracle stop is not aligned with the executed trajectory: "
+            f"last_step={previous_step}, oracle_stop_offset="
+            f"{last_action_ids.index(STOP_ACTION_ID)}, "
+            f"non_stop_actions={non_stop_action_count}"
+        )
+    return action_chunks
 
 
 def pad_terminal_action_ids(
@@ -232,6 +337,8 @@ def compute_ebs_candidate_counts(
     candidate_counts = Counter()
     for annotation in annotations_by_subset.values():
         for episode_item in annotation:
+            if is_chunk_relabelled_dagger(episode_item):
+                continue
             actions = [int(action_id) for action_id in episode_item["actions"]]
             num_actions = len(actions)
             dense_start = max(0, num_actions - action_horizon)
@@ -403,6 +510,12 @@ def process_dataset(
         for episode_item in progress:
             episode_id = episode_item["episode_id"]
             instruction = episode_item["instruction"]
+            chunk_relabelled_dagger = is_chunk_relabelled_dagger(episode_item)
+            if subset == "dagger" and not chunk_relabelled_dagger:
+                raise ValueError(
+                    f"DAgger episode {episode_id} has no four-action oracle relabels; "
+                    "recollect it with the current collector."
+                )
             actions = [int(action_id) for action_id in episode_item["actions"]]
             assert actions[-1] == 0
 
@@ -414,17 +527,25 @@ def process_dataset(
                 frame_index_fn=frame_index_fn,
                 input_root=input_root,
                 num_actions=len(actions),
+                append_terminal_frame=not chunk_relabelled_dagger,
             )
 
-            action_chunks = build_action_chunks(
-                actions,
-                event_keep_prob=event_keep_prob,
-                background_keep_prob=background_keep_prob,
-                tail_dense_keep_prob=tail_dense_keep_prob,
-                body_keep_advance=body_keep_advance,
-                pad_stop_to_horizon=pad_stop_to_horizon,
-                rng=rng,
-            )
+            if chunk_relabelled_dagger:
+                # Collection already records one correctly relabelled oracle
+                # chunk per real model decision (normally stride 4).  Preserve
+                # all raw DAgger decisions here; never rebuild labels by
+                # slicing the mixed-policy executed trajectory.
+                action_chunks = build_dagger_oracle_action_chunks(episode_item)
+            else:
+                action_chunks = build_action_chunks(
+                    actions,
+                    event_keep_prob=event_keep_prob,
+                    background_keep_prob=background_keep_prob,
+                    tail_dense_keep_prob=tail_dense_keep_prob,
+                    body_keep_advance=body_keep_advance,
+                    pad_stop_to_horizon=pad_stop_to_horizon,
+                    rng=rng,
+                )
 
             for action_chunk in action_chunks:
                 sample_key = (subset, str(episode_id), action_chunk["start_step"])

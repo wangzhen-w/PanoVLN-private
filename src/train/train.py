@@ -38,7 +38,6 @@ class PanoVLNTrainer(Trainer):
         "visual_merger",
         "panovggt_mlp",
         "pbo_head",
-        "forward_dynamics_head",
     )
 
     def get_decay_parameter_names(self, model):
@@ -68,8 +67,6 @@ class PanoVLNTrainer(Trainer):
             return "panovggt_mlp"
         if self._name_has_module(name, "pbo_head"):
             return "pbo_head"
-        if self._name_has_module(name, "forward_dynamics_head"):
-            return "forward_dynamics_head"
         if self._name_has_module(name, "visual"):
             return "visual"
         if (
@@ -195,13 +192,6 @@ def validate_training_config(cfg) -> None:
         raise ValueError("model.pbo_loss_weight must be non-negative")
     if int(cfg.model.pbo_head_hidden_size) <= 0:
         raise ValueError("model.pbo_head_hidden_size must be positive")
-    if float(cfg.model.forward_dynamics_loss_weight) < 0.0:
-        raise ValueError("model.forward_dynamics_loss_weight must be non-negative")
-    if cfg.model.forward_dynamics_enabled and not cfg.model.panovggt_enabled:
-        raise ValueError(
-            "FutureNav-style forward dynamics requires model.panovggt_enabled=true "
-            "for its frozen spatial-feature target"
-        )
 
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
@@ -251,8 +241,6 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"pbo_enabled: {_config_value(cfg.model.pbo_enabled)}")
     rank0_print(RANK, f"pbo_loss_weight: {_config_value(cfg.model.pbo_loss_weight)}")
     rank0_print(RANK, f"pbo_head_hidden_size: {_config_value(cfg.model.pbo_head_hidden_size)}")
-    rank0_print(RANK, f"forward_dynamics_enabled: {_config_value(cfg.model.forward_dynamics_enabled)}")
-    rank0_print(RANK, f"forward_dynamics_loss_weight: {_config_value(cfg.model.forward_dynamics_loss_weight)}")
     rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
     rank0_print(RANK, f"panoworld_enabled: {_config_value(cfg.data.panoworld.enabled)}")
     if cfg.data.panoworld.enabled:
@@ -268,11 +256,6 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"pbo_head_lr: {_config_value(cfg.training.pbo_head_lr)}")
-    rank0_print(
-        RANK,
-        "forward_dynamics_head_lr: "
-        f"{_config_value(cfg.training.forward_dynamics_head_lr)}",
-    )
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -328,9 +311,6 @@ def main():
     model_config = model.config
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
     effective_pbo_enabled = bool(getattr(model_config, "pbo_enabled", cfg.model.pbo_enabled))
-    effective_forward_dynamics_enabled = bool(
-        getattr(model_config, "forward_dynamics_enabled", cfg.model.forward_dynamics_enabled)
-    )
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
     )
@@ -348,8 +328,6 @@ def main():
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
         rank0_print(RANK, f"pbo_enabled: {_config_value(effective_pbo_enabled)}")
         rank0_print(RANK, f"pbo_loss_weight: {_config_value(getattr(model_config, 'pbo_loss_weight', None))}")
-        rank0_print(RANK, f"forward_dynamics_enabled: {_config_value(effective_forward_dynamics_enabled)}")
-        rank0_print(RANK, f"forward_dynamics_loss_weight: {_config_value(getattr(model_config, 'forward_dynamics_loss_weight', None))}")
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
     eval_image_root = cfg.data.eval_image_root or train_image_root
@@ -366,7 +344,6 @@ def main():
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
         pbo_enabled=effective_pbo_enabled,
-        forward_dynamics_enabled=effective_forward_dynamics_enabled,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
         prompt_format=cfg.data.prompt_format,
@@ -423,7 +400,6 @@ def main():
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,
             pbo_enabled=effective_pbo_enabled,
-            forward_dynamics_enabled=effective_forward_dynamics_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
@@ -487,7 +463,6 @@ def main():
             "visual_merger": cfg.training.visual_merger_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
             "pbo_head": cfg.training.pbo_head_lr,
-            "forward_dynamics_head": cfg.training.forward_dynamics_head_lr,
         },
         compute_metrics=(
             build_action_accuracy(

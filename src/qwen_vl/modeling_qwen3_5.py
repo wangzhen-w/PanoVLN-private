@@ -17,8 +17,10 @@ PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
 PBO_ACTION_HORIZON = 4
 PBO_NUM_ACTIONS = 4
+# Six is the current endpoint-only PBO input. Legacy checkpoints may store
+# pbo_input_vector_count=7 and prepend one LLM instruction-context vector.
 PBO_INPUT_VECTOR_COUNT = 6
-FORWARD_DYNAMICS_TARGET_DIM = 2048
+PBO_SUPPORTED_INPUT_VECTOR_COUNTS = {6, 7}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
@@ -43,13 +45,12 @@ def ensure_panovggt_config(config) -> None:
             setattr(config, field_name, default_value)
 
 
-def ensure_auxiliary_dynamics_config(config) -> None:
+def ensure_pbo_config(config) -> None:
     defaults = {
         "pbo_enabled": False,
         "pbo_loss_weight": 0.1,
         "pbo_head_hidden_size": 512,
-        "forward_dynamics_enabled": False,
-        "forward_dynamics_loss_weight": 0.1,
+        "pbo_input_vector_count": PBO_INPUT_VECTOR_COUNT,
     }
     for field_name, default_value in defaults.items():
         if not hasattr(config, field_name):
@@ -641,7 +642,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.output_norm.weight",
     )
     def __init__(self, config):
-        ensure_auxiliary_dynamics_config(config)
+        ensure_pbo_config(config)
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
         if panovggt_enabled:
             ensure_panovggt_config(config)
@@ -653,12 +654,20 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
         text_hidden_size = int(config.text_config.hidden_size)
         pbo_hidden_size = int(getattr(config, "pbo_head_hidden_size", 512))
+        pbo_input_vector_count = int(
+            getattr(config, "pbo_input_vector_count", PBO_INPUT_VECTOR_COUNT)
+        )
+        if pbo_input_vector_count not in PBO_SUPPORTED_INPUT_VECTOR_COUNTS:
+            raise ValueError(
+                "pbo_input_vector_count must be 6 or 7, "
+                f"got {pbo_input_vector_count}"
+            )
         self.pbo_head = None
         if bool(getattr(config, "pbo_enabled", False)):
             self.pbo_head = nn.Sequential(
-                nn.LayerNorm(text_hidden_size * PBO_INPUT_VECTOR_COUNT),
+                nn.LayerNorm(text_hidden_size * pbo_input_vector_count),
                 nn.Linear(
-                    text_hidden_size * PBO_INPUT_VECTOR_COUNT,
+                    text_hidden_size * pbo_input_vector_count,
                     pbo_hidden_size,
                 ),
                 nn.GELU(),
@@ -668,16 +677,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 ),
             )
             self.pbo_head.apply(self._init_weights)
-
-        self.forward_dynamics_head = None
-        if bool(getattr(config, "forward_dynamics_enabled", False)):
-            self.forward_dynamics_head = nn.Sequential(
-                nn.LayerNorm(text_hidden_size * 2),
-                nn.Linear(text_hidden_size * 2, text_hidden_size),
-                nn.GELU(),
-                nn.Linear(text_hidden_size, FORWARD_DYNAMICS_TARGET_DIM),
-            )
-            self.forward_dynamics_head.apply(self._init_weights)
 
         self.panovggt = None
         self._panovggt_weights_ready = False
@@ -708,11 +707,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
     def _pbo_enabled(self) -> bool:
         return self.pbo_head is not None and bool(getattr(self.config, "pbo_enabled", False))
-
-    def _forward_dynamics_enabled(self) -> bool:
-        return self.forward_dynamics_head is not None and bool(
-            getattr(self.config, "forward_dynamics_enabled", False)
-        )
 
     @staticmethod
     def _distributed_masked_mean(
@@ -1383,46 +1377,22 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         )
         return torch.cat((zero_order, cosine_order, sine_order), dim=-1)
 
-    def _last_action_token_index(self, sample_labels: torch.Tensor) -> int:
+    @staticmethod
+    def _first_supervised_token_index(sample_labels: torch.Tensor) -> int:
         supervised_positions = torch.nonzero(
             sample_labels != -100,
             as_tuple=False,
         ).flatten()
         if supervised_positions.numel() == 0:
             return -1
-
-        eos_token_id = getattr(self.config, "eos_token_id", None)
-        if eos_token_id is None:
-            text_config = getattr(self.config, "text_config", None)
-            eos_token_id = getattr(text_config, "eos_token_id", None)
-        if eos_token_id is None:
-            raise AssertionError(
-                "Forward dynamics requires eos_token_id to isolate action tokens"
-            )
-        eos_ids = torch.as_tensor(
-            eos_token_id,
-            device=sample_labels.device,
-            dtype=sample_labels.dtype,
-        ).flatten()
-        supervised_token_ids = sample_labels.index_select(
-            0,
-            supervised_positions,
-        )
-        is_eos = torch.isin(supervised_token_ids, eos_ids)
-        if not bool(is_eos[-1].item()):
-            raise AssertionError(
-                "Forward dynamics expects the supervised response to end with EOS"
-            )
-        supervised_positions = supervised_positions[~is_eos]
-        if supervised_positions.numel() == 0:
-            return -1
-        return int(supervised_positions[-1].item())
+        return int(supervised_positions[0].item())
 
     def _compute_pbo_loss(
         self,
         *,
         hidden_states: torch.Tensor,
         image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
+        labels: torch.Tensor,
         image_current_index: torch.Tensor,
         pbo_action_labels: torch.Tensor | None,
         pbo_valid_mask: torch.Tensor | None,
@@ -1432,9 +1402,17 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             return hidden_states.sum() * 0.0
 
         batch_size, _, hidden_size = hidden_states.shape
+        pbo_input_vector_count = int(
+            getattr(self.config, "pbo_input_vector_count", PBO_INPUT_VECTOR_COUNT)
+        )
+        if pbo_input_vector_count not in PBO_SUPPORTED_INPUT_VECTOR_COUNTS:
+            raise AssertionError(
+                "Unsupported PBO input vector count: "
+                f"{pbo_input_vector_count}"
+            )
         head_dtype = next(self.pbo_head.parameters()).dtype
         features = torch.zeros(
-            (batch_size, hidden_size * PBO_INPUT_VECTOR_COUNT),
+            (batch_size, hidden_size * pbo_input_vector_count),
             device=hidden_states.device,
             dtype=head_dtype,
         )
@@ -1479,13 +1457,21 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 current_geometry,
                 merge_size,
             )
-            pbo_feature = torch.cat(
-                (
-                    previous_fourier,
-                    current_fourier,
-                ),
-                dim=-1,
-            )
+            feature_vectors = [previous_fourier, current_fourier]
+            if pbo_input_vector_count == 7:
+                context_index = (
+                    self._first_supervised_token_index(labels[batch_index]) - 1
+                )
+                if context_index < 0:
+                    raise AssertionError(
+                        f"PBO sample {batch_index} has no prompt token before "
+                        "the assistant response"
+                    )
+                feature_vectors.insert(
+                    0,
+                    hidden_states[batch_index, context_index].float(),
+                )
+            pbo_feature = torch.cat(feature_vectors, dim=-1)
             features[batch_index] = pbo_feature.to(dtype=head_dtype)
 
         logits = self.pbo_head(features).reshape(
@@ -1506,133 +1492,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             local_loss_sum = F.cross_entropy(
                 logits[valid_mask].reshape(-1, PBO_NUM_ACTIONS).float(),
                 valid_targets,
-                reduction="sum",
-            )
-        return self._distributed_masked_mean(
-            local_loss_sum,
-            local_target_count,
-        )
-
-    def _panovggt_spatial_targets(
-        self,
-        panovggt_pixel_values: torch.Tensor,
-        *,
-        output_device: torch.device,
-    ) -> torch.Tensor:
-        if panovggt_pixel_values.ndim != 4:
-            raise AssertionError(
-                "Expected forward target panoramas [B,3,H,W], got "
-                f"{tuple(panovggt_pixel_values.shape)}"
-            )
-        panovggt_model = self._ensure_panovggt_model(
-            device=output_device,
-            dtype=next(self.forward_dynamics_head.parameters()).dtype,
-        )
-        if panovggt_model is None:
-            raise AssertionError("Forward dynamics requires an enabled PanoVGGT encoder")
-        encoder_param = next(panovggt_model.parameters())
-        images = panovggt_pixel_values.to(
-            device=encoder_param.device,
-            dtype=encoder_param.dtype,
-        ).unsqueeze(1)
-        with torch.no_grad():
-            aggregated = panovggt_model.aggregator(images)
-            if isinstance(aggregated, (list, tuple)):
-                token_list = aggregated[0]
-                patch_start_idx = int(aggregated[1])
-                tokens = token_list[-1] if isinstance(token_list, list) else token_list
-            else:
-                tokens = aggregated
-                patch_start_idx = 0
-            if tokens.ndim != 4:
-                raise AssertionError(
-                    "Expected PanoVGGT spatial tokens [B,S,P,C], got "
-                    f"{tuple(tokens.shape)}"
-                )
-            tokens = tokens[:, -1, patch_start_idx:, :]
-            if int(tokens.shape[-1]) != FORWARD_DYNAMICS_TARGET_DIM:
-                raise AssertionError(
-                    "Unexpected PanoVGGT target dimension: "
-                    f"expected={FORWARD_DYNAMICS_TARGET_DIM}, got={int(tokens.shape[-1])}"
-                )
-            targets = tokens.float().mean(dim=1)
-        return targets.to(device=output_device)
-
-    def _compute_forward_dynamics_loss(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
-        labels: torch.Tensor,
-        image_current_index: torch.Tensor,
-        forward_dynamics_valid_mask: torch.Tensor | None,
-        forward_target_panovggt_pixel_values: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if self.forward_dynamics_head is None:
-            return hidden_states.sum() * 0.0
-
-        batch_size, _, hidden_size = hidden_states.shape
-        head_dtype = next(self.forward_dynamics_head.parameters()).dtype
-        features = torch.zeros(
-            (batch_size, hidden_size * 2),
-            device=hidden_states.device,
-            dtype=head_dtype,
-        )
-        if forward_dynamics_valid_mask is None:
-            valid_mask = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.bool)
-        else:
-            valid_mask = forward_dynamics_valid_mask.to(
-                device=hidden_states.device,
-                dtype=torch.bool,
-            )
-        current_indices = image_current_index.to(device="cpu", dtype=torch.long)
-        for batch_index in torch.nonzero(valid_mask, as_tuple=False).flatten().tolist():
-            current_index = int(current_indices[batch_index].item())
-            sample_groups = image_groups[batch_index]
-            if not (0 <= current_index < len(sample_groups)):
-                raise AssertionError(
-                    "Forward dynamics current image index is invalid: "
-                    f"sample={batch_index}, index={current_index}, num_images={len(sample_groups)}"
-                )
-            current_observation_hidden = sample_groups[current_index][0][-1]
-            # The target is the state after the complete four-action chunk.  The
-            # last action-token hidden is causal, so it encodes all four actions.
-            action_token_index = self._last_action_token_index(labels[batch_index])
-            if action_token_index < 0:
-                raise AssertionError(
-                    f"Forward dynamics sample {batch_index} has no non-EOS action token"
-                )
-            action_hidden = hidden_states[batch_index, action_token_index]
-            features[batch_index] = torch.cat(
-                (current_observation_hidden, action_hidden),
-                dim=-1,
-            ).to(dtype=head_dtype)
-
-        predictions = self.forward_dynamics_head(features)
-        local_loss_sum = predictions.sum() * 0.0
-        local_target_count = 0
-        if bool(valid_mask.any().item()):
-            if forward_target_panovggt_pixel_values is None:
-                raise AssertionError(
-                    "Forward dynamics has valid samples but next-observation "
-                    "PanoVGGT targets are missing"
-                )
-            valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
-            target_pixels = forward_target_panovggt_pixel_values.index_select(
-                0,
-                valid_indices.to(
-                    device=forward_target_panovggt_pixel_values.device,
-                ),
-            )
-            targets = self._panovggt_spatial_targets(
-                target_pixels,
-                output_device=predictions.device,
-            )
-            valid_predictions = predictions.index_select(0, valid_indices).float()
-            local_target_count = int(valid_predictions.numel())
-            local_loss_sum = F.mse_loss(
-                valid_predictions,
-                targets.float(),
                 reduction="sum",
             )
         return self._distributed_masked_mean(
@@ -1661,8 +1520,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         pbo_action_labels: torch.LongTensor | None = None,
         pbo_valid_mask: torch.BoolTensor | None = None,
         pbo_start_image_index: torch.LongTensor | None = None,
-        forward_dynamics_valid_mask: torch.BoolTensor | None = None,
-        forward_target_panovggt_pixel_values: torch.Tensor | None = None,
         **kwargs,
     ):
         if self._panovggt_enabled():
@@ -1675,7 +1532,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             )
         auxiliary_enabled = bool(
             labels is not None
-            and (self._pbo_enabled() or self._forward_dynamics_enabled())
+            and self._pbo_enabled()
         )
         self._capture_auxiliary_hidden = auxiliary_enabled
         self._auxiliary_last_hidden = None
@@ -1701,7 +1558,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if hidden_states is None:
                 raise AssertionError("Failed to capture the final LLM hidden states")
             if input_ids is None or labels is None:
-                raise AssertionError("Auxiliary dynamics losses require input_ids and labels")
+                raise AssertionError("PBO loss requires input_ids and labels")
 
             batch_size = int(hidden_states.shape[0])
             if image_num_images is None:
@@ -1729,6 +1586,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 pbo_loss = self._compute_pbo_loss(
                     hidden_states=hidden_states,
                     image_groups=image_groups,
+                    labels=labels,
                     image_current_index=image_current_index,
                     pbo_action_labels=pbo_action_labels,
                     pbo_valid_mask=pbo_valid_mask,
@@ -1737,20 +1595,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 auxiliary_loss = auxiliary_loss + float(
                     getattr(self.config, "pbo_loss_weight", 0.1)
                 ) * pbo_loss
-            if self._forward_dynamics_enabled():
-                forward_dynamics_loss = self._compute_forward_dynamics_loss(
-                    hidden_states=hidden_states,
-                    image_groups=image_groups,
-                    labels=labels,
-                    image_current_index=image_current_index,
-                    forward_dynamics_valid_mask=forward_dynamics_valid_mask,
-                    forward_target_panovggt_pixel_values=(
-                        forward_target_panovggt_pixel_values
-                    ),
-                )
-                auxiliary_loss = auxiliary_loss + float(
-                    getattr(self.config, "forward_dynamics_loss_weight", 0.1)
-                ) * forward_dynamics_loss
 
             outputs.loss = auxiliary_loss if outputs.loss is None else outputs.loss + auxiliary_loss
             return outputs
@@ -1787,6 +1631,70 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
         return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.PANOVGGT_STATE_KEYS)
+
+    @classmethod
+    def _local_pbo_head_input_width(cls, pretrained_model_name_or_path) -> int | None:
+        checkpoint_dir = Path(str(pretrained_model_name_or_path))
+        if not checkpoint_dir.is_dir():
+            return None
+
+        tensor_key = "pbo_head.0.weight"
+        safetensors_path = checkpoint_dir / "model.safetensors"
+        if not safetensors_path.exists():
+            index_path = checkpoint_dir / "model.safetensors.index.json"
+            if not index_path.exists():
+                return None
+            try:
+                weight_map = json.loads(index_path.read_text())["weight_map"]
+                shard_name = weight_map.get(tensor_key)
+            except (KeyError, OSError, TypeError, ValueError):
+                return None
+            if not shard_name:
+                return None
+            safetensors_path = checkpoint_dir / shard_name
+
+        try:
+            from safetensors import safe_open
+
+            with safe_open(
+                str(safetensors_path),
+                framework="pt",
+                device="cpu",
+            ) as handle:
+                if tensor_key not in handle.keys():
+                    return None
+                shape = tuple(handle.get_slice(tensor_key).get_shape())
+        except Exception:
+            return None
+        if len(shape) != 1:
+            return None
+        return int(shape[0])
+
+    @classmethod
+    def _configure_pbo_input_width_from_checkpoint(
+        cls,
+        pretrained_model_name_or_path,
+        config,
+    ) -> int | None:
+        input_width = cls._local_pbo_head_input_width(
+            pretrained_model_name_or_path
+        )
+        if input_width is None:
+            return None
+        hidden_size = int(config.text_config.hidden_size)
+        if input_width % hidden_size != 0:
+            raise ValueError(
+                "PBO checkpoint input width is not divisible by the text hidden "
+                f"size: width={input_width}, hidden_size={hidden_size}"
+            )
+        vector_count = input_width // hidden_size
+        if vector_count not in PBO_SUPPORTED_INPUT_VECTOR_COUNTS:
+            raise ValueError(
+                "Unsupported PBO checkpoint input width: "
+                f"{vector_count} vectors ({input_width} features)"
+            )
+        config.pbo_input_vector_count = vector_count
+        return vector_count
 
     @classmethod
     def _checkpoint_has_any_weights(cls, pretrained_model_name_or_path, state_keys) -> bool | None:
@@ -1834,6 +1742,33 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        checkpoint_pbo_width = cls._local_pbo_head_input_width(
+            pretrained_model_name_or_path
+        )
+        if checkpoint_pbo_width is not None:
+            config = kwargs.get("config")
+            if config is None:
+                config_kwargs = {
+                    key: kwargs[key]
+                    for key in (
+                        "cache_dir",
+                        "force_download",
+                        "local_files_only",
+                        "revision",
+                        "token",
+                        "subfolder",
+                    )
+                    if key in kwargs
+                }
+                config = cls.config_class.from_pretrained(
+                    pretrained_model_name_or_path,
+                    **config_kwargs,
+                )
+                kwargs["config"] = config
+            cls._configure_pbo_input_width_from_checkpoint(
+                pretrained_model_name_or_path,
+                config,
+            )
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:
