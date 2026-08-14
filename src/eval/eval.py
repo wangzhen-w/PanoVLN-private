@@ -1,14 +1,34 @@
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Sequence
+
+DEFAULT_EVAL_CPU_THREADS_PER_WORKER = 4
+EVAL_CPU_THREADS_ENV = "VLN_EVAL_CPU_THREADS_PER_WORKER"
+EVAL_CPU_THREADS_PER_WORKER = int(
+    os.environ.get(EVAL_CPU_THREADS_ENV, str(DEFAULT_EVAL_CPU_THREADS_PER_WORKER))
+)
+if EVAL_CPU_THREADS_PER_WORKER <= 0:
+    raise ValueError(
+        f"{EVAL_CPU_THREADS_ENV} must be positive, "
+        f"got {EVAL_CPU_THREADS_PER_WORKER}"
+    )
+for variable_name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[variable_name] = str(EVAL_CPU_THREADS_PER_WORKER)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import torch
 import numpy as np
 # Import torch before habitat to avoid CUDA runtime conflicts during module loading.
 from habitat import Env
 from habitat.core.agent import Agent
 from tqdm import tqdm
-import os
 import re
 from habitat.utils.visualizations import maps
 from habitat.utils.visualizations.utils import images_to_video
@@ -50,6 +70,12 @@ DEFAULT_EVAL_GENERATION_KWARGS = {
     "top_p": None,
     "num_beams": 1,
 }
+
+
+def configure_eval_torch_threads() -> None:
+    torch.set_num_threads(EVAL_CPU_THREADS_PER_WORKER)
+    torch.set_num_interop_threads(1)
+
 
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)
 logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
@@ -522,16 +548,23 @@ class PanoVLN_Agent(Agent):
             ).unsqueeze(0)
 
         prompt_inputs = prompt_inputs.to(self.device)
+        do_sample = generation_kwargs["temperature"] > 0
+        model_generation_kwargs = {
+            "do_sample": do_sample,
+            "num_beams": generation_kwargs["num_beams"],
+            "max_new_tokens": generation_kwargs["max_new_tokens"],
+        }
+        if do_sample:
+            model_generation_kwargs.update(
+                temperature=generation_kwargs["temperature"],
+                top_p=generation_kwargs["top_p"],
+            )
         with torch.inference_mode():
             cont = self.model.generate(
                 **prompt_inputs,
                 eos_token_id=self.eos_token_id,
                 pad_token_id=self.pad_token_id,
-                do_sample=True if generation_kwargs["temperature"] > 0 else False,
-                temperature=generation_kwargs["temperature"],
-                top_p=generation_kwargs["top_p"],
-                num_beams=generation_kwargs["num_beams"],
-                max_new_tokens=generation_kwargs["max_new_tokens"],
+                **model_generation_kwargs,
             )
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(prompt_inputs.input_ids, cont)
@@ -642,6 +675,7 @@ class PanoVLN_Agent(Agent):
 
 
 def main():
+    configure_eval_torch_threads()
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--exp-config",type=str,required=True,help="path to config yaml containing info about experiment")

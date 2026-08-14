@@ -73,6 +73,14 @@ DEFAULT_DAGGER_GOAL_RADIUS = 0.3
 DEFAULT_MODEL_PATH = "/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
 DEFAULT_OUTPUT_ROOT = "/workspace/data2/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
+DEFAULT_CPU_THREADS_PER_WORKER = 2
+DAGGER_CPU_THREADS_ENV = "VLN_DAGGER_CPU_THREADS_PER_WORKER"
+CPU_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 DEFAULT_SOURCE_DATASETS = ("r2r", "rxr")
 QUEUE_POLL_TIMEOUT_SECONDS = 5
 SUPPORTED_ACTION_IDS = {
@@ -91,6 +99,31 @@ def seed_all(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def configure_worker_thread_environment(cpu_threads_per_worker: int) -> None:
+    cpu_threads_per_worker = int(cpu_threads_per_worker)
+    if cpu_threads_per_worker <= 0:
+        raise ValueError(
+            "cpu_threads_per_worker must be positive, "
+            f"got {cpu_threads_per_worker}"
+        )
+    thread_count = str(cpu_threads_per_worker)
+    os.environ[DAGGER_CPU_THREADS_ENV] = thread_count
+    for variable_name in CPU_THREAD_ENV_VARS:
+        os.environ[variable_name] = thread_count
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def configure_worker_torch_threads() -> None:
+    cpu_threads_per_worker = int(
+        os.environ.get(
+            DAGGER_CPU_THREADS_ENV,
+            str(DEFAULT_CPU_THREADS_PER_WORKER),
+        )
+    )
+    torch.set_num_threads(cpu_threads_per_worker)
+    torch.set_num_interop_threads(1)
 
 
 def arm_linux_parent_death_signal(expected_parent_pid: int) -> None:
@@ -1293,6 +1326,7 @@ def dagger_worker(
     env = None
     try:
         arm_linux_parent_death_signal(expected_parent_pid)
+        configure_worker_torch_threads()
         seed_all(seed + worker_index)
         if torch.cuda.is_available():
             torch.cuda.set_device(local_gpu_id)
@@ -1845,6 +1879,11 @@ def validate_args(args) -> None:
         raise ValueError(
             f"num_processes_per_gpu must be positive, got {args.num_processes_per_gpu}"
         )
+    if args.cpu_threads_per_worker <= 0:
+        raise ValueError(
+            "cpu_threads_per_worker must be positive, "
+            f"got {args.cpu_threads_per_worker}"
+        )
     if args.action_horizon != ACTION_SEQUENCE_LENGTH:
         raise ValueError(
             f"action_horizon must be {ACTION_SEQUENCE_LENGTH} to match "
@@ -1886,6 +1925,15 @@ def parse_args():
     parser.add_argument("--gpu_ids", type=str, default=None)
     parser.add_argument("--num_thread", type=int, default=1)
     parser.add_argument("--num_processes_per_gpu", type=int, default=None)
+    parser.add_argument(
+        "--cpu_threads_per_worker",
+        type=int,
+        default=DEFAULT_CPU_THREADS_PER_WORKER,
+        help=(
+            "Maximum PyTorch/OpenMP CPU threads per spawned collector worker. "
+            "Keep this small when running many GPU workers."
+        ),
+    )
     parser.add_argument("--episode_ids", nargs="*", default=None)
     parser.add_argument("--max_episodes", type=int, default=None)
     parser.add_argument("--max_steps_per_episode", type=int, default=500)
@@ -1960,6 +2008,7 @@ def parse_args():
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    configure_worker_thread_environment(args.cpu_threads_per_worker)
     seed_all(args.seed)
 
     requested_gpu_ids = parse_gpu_ids(args.gpu_ids)
@@ -2022,6 +2071,7 @@ def main() -> None:
     print(
         f"gpu_ids={args.gpu_ids}, num_thread={args.num_thread}, "
         f"num_processes_per_gpu={args.num_processes_per_gpu}, "
+        f"cpu_threads_per_worker={args.cpu_threads_per_worker}, "
         f"midgoal_radius={args.midgoal_radius}, goal_radius={args.goal_radius}, "
         f"progress_dir={progress_dir}, lock={lock_path}"
     )
