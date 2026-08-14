@@ -33,7 +33,6 @@ from src.data.habitat_shortest_path import (
     TURN_LEFT_ACTION,
     TURN_RIGHT_ACTION,
     CONFIG as DATASET_CONFIG,
-    ERP_IMAGE_SIZE,
     action_to_int,
     build_locality_balanced_episode_splits,
     build_worker_assignments,
@@ -91,6 +90,10 @@ SUPPORTED_ACTION_IDS = {
 }
 class DAggerCollectionError(RuntimeError):
     pass
+
+
+class RecoverableEpisodeNavigationError(DAggerCollectionError):
+    """An episode-local follower failure that must not become an oracle label."""
 
 
 def seed_all(seed: int) -> None:
@@ -269,6 +272,18 @@ def write_jsonl_item(handle, item: Dict) -> None:
     os.fsync(handle.fileno())
 
 
+def jsonl_ends_with_item(path: str, item: Dict) -> bool:
+    """Return whether the last non-empty JSONL row is fully persisted as item."""
+
+    try:
+        with open(path, "rb") as handle:
+            lines = handle.read().splitlines()
+        last_line = next(line for line in reversed(lines) if line.strip())
+        return json.loads(last_line) == item
+    except (OSError, StopIteration, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
 def repair_jsonl_for_append(path: str) -> bool:
     """Make an interrupted JSONL journal safe to append to.
 
@@ -352,23 +367,6 @@ def expected_frame_path(
         episode_image_dir,
         frame_image_filename(frame_index, image_format),
     )
-
-
-def image_file_is_valid(path: str, image_format: str) -> bool:
-    if not os.path.exists(path) or os.path.getsize(path) <= 0:
-        return False
-    try:
-        with Image.open(path) as image:
-            image.verify()
-        with Image.open(path) as image:
-            expected_pil_format = "PNG" if image_format == "png" else "JPEG"
-            return (
-                image.format == expected_pil_format
-                and image.size == ERP_IMAGE_SIZE
-                and image.mode == "RGB"
-            )
-    except Exception:
-        return False
 
 
 def is_raw_episode_complete(
@@ -478,10 +476,12 @@ def is_raw_episode_complete(
     if len(frame_names) != action_count:
         return False
     for frame_index in range(action_count):
-        if not image_file_is_valid(
-            expected_frame_path(episode_image_dir, frame_index, image_format),
+        frame_path = expected_frame_path(
+            episode_image_dir,
+            frame_index,
             image_format,
-        ):
+        )
+        if not os.path.isfile(frame_path) or os.path.getsize(frame_path) <= 0:
             return False
     return True
 
@@ -797,7 +797,7 @@ def next_oracle_action(env, follower, target_position, goal_radius: float) -> in
             target_position,
         )
         if distance_to_target > float(goal_radius):
-            raise DAggerCollectionError(
+            raise RecoverableEpisodeNavigationError(
                 "ShortestPathFollower returned stop before target: "
                 f"geodesic_distance={distance_to_target:.3f}, "
                 f"goal_radius={goal_radius}"
@@ -1324,6 +1324,8 @@ def dagger_worker(
     png_compress_level,
 ):
     env = None
+    active_source_episode_id = None
+    active_dagger_id = None
     try:
         arm_linux_parent_death_signal(expected_parent_pid)
         configure_worker_torch_threads()
@@ -1383,6 +1385,10 @@ def dagger_worker(
             for episode in dataset.episodes:
                 episode_start_time = time.time()
                 dagger_id = str(dagger_ids[int(episode.episode_id)])
+                active_source_episode_id = int(episode.episode_id)
+                active_dagger_id = dagger_id
+                annotation = None
+                annotation_committed = False
                 try:
                     reference_steps = infer_reference_steps(
                         episode,
@@ -1415,6 +1421,7 @@ def dagger_worker(
                         sample_count = 0
                     else:
                         write_jsonl_item(annotation_handle, annotation)
+                        annotation_committed = True
                         result_status = "ok"
                         sample_count = len(annotation["actions"])
                     result_queue.put(
@@ -1431,15 +1438,35 @@ def dagger_worker(
                             "time_per_episode": time.time() - episode_start_time,
                         }
                     )
-                except Exception:
+                except Exception as episode_error:
                     error = traceback.format_exc()
-                    remove_if_exists(
-                        os.path.join(
-                            image_root(output_root, dagger_dataset_name),
-                            dagger_trajectory_id(source_dataset, episode.episode_id),
+                    if annotation is not None and not annotation_committed:
+                        # A flush/fsync failure can occur after the complete row
+                        # reached the journal.  Close first so buffered bytes
+                        # cannot appear after deciding whether images are safe
+                        # to remove, then verify the exact persisted tail row.
+                        try:
+                            annotation_handle.close()
+                        except OSError:
+                            pass
+                        annotation_committed = jsonl_ends_with_item(
+                            partial_annotation_path,
+                            annotation,
                         )
-                    )
-                    if not skip_failed_episodes:
+                    if not annotation_committed:
+                        remove_if_exists(
+                            os.path.join(
+                                image_root(output_root, dagger_dataset_name),
+                                dagger_trajectory_id(source_dataset, episode.episode_id),
+                            )
+                        )
+                    if not (
+                        skip_failed_episodes
+                        and isinstance(
+                            episode_error,
+                            RecoverableEpisodeNavigationError,
+                        )
+                    ):
                         raise
                     result_queue.put(
                         {
@@ -1452,6 +1479,7 @@ def dagger_worker(
                             "episode_id": dagger_id,
                             "time_per_episode": time.time() - episode_start_time,
                             "error": error,
+                            "error_message": str(episode_error),
                         }
                     )
     except Exception:
@@ -1461,6 +1489,9 @@ def dagger_worker(
                 "worker_index": worker_index,
                 "display_gpu_id": display_gpu_id,
                 "process_index_on_gpu": process_index_on_gpu,
+                "source_dataset": source_dataset,
+                "source_episode_id": active_source_episode_id,
+                "episode_id": active_dagger_id,
                 "error": traceback.format_exc(),
             }
         )
@@ -1520,6 +1551,10 @@ def load_complete_existing_annotations(
     if progress_dir is not None:
         for path in list_rank_annotation_paths(progress_dir):
             for annotation in load_jsonl_index(path).values():
+                episode_id = annotation_episode_id(annotation)
+                current = existing.get(episode_id)
+                if current == annotation:
+                    continue
                 if not is_raw_episode_complete(
                     output_root,
                     dagger_dataset_name,
@@ -1527,8 +1562,7 @@ def load_complete_existing_annotations(
                     image_format,
                 ):
                     continue
-                episode_id = annotation_episode_id(annotation)
-                if episode_id in existing and existing[episode_id] != annotation:
+                if current is not None:
                     raise ValueError(
                         f"Conflicting complete annotations for episode_id={episode_id} "
                         f"while loading existing progress from {path}"
@@ -1545,6 +1579,10 @@ def add_complete_annotation(
     source_path: str,
     image_format: str,
 ) -> None:
+    episode_id = annotation_episode_id(annotation)
+    existing = merged_annotations.get(episode_id)
+    if existing == annotation:
+        return
     if not is_raw_episode_complete(
         output_root,
         dagger_dataset_name,
@@ -1556,8 +1594,6 @@ def add_complete_annotation(
             f"{annotation.get('episode_id')} from {source_path}"
         )
         return
-    episode_id = annotation_episode_id(annotation)
-    existing = merged_annotations.get(episode_id)
     if existing is not None and existing != annotation:
         raise ValueError(
             f"Conflicting complete annotations for episode_id={episode_id} "
@@ -1573,16 +1609,7 @@ def merge_partial_outputs(
     existing_annotations: Dict[str, Dict],
     image_format: str,
 ):
-    merged_annotations: Dict[str, Dict] = {}
-    for annotation in existing_annotations.values():
-        add_complete_annotation(
-            merged_annotations=merged_annotations,
-            output_root=output_root,
-            dagger_dataset_name=dagger_dataset_name,
-            annotation=annotation,
-            source_path="existing_annotations",
-            image_format=image_format,
-        )
+    merged_annotations: Dict[str, Dict] = dict(existing_annotations)
     for path in list_rank_annotation_paths(progress_dir):
         for annotation in load_jsonl_index(path).values():
             add_complete_annotation(
@@ -1610,6 +1637,7 @@ def process_source_dataset(
     max_episodes,
     episode_ids,
     progress_dir,
+    existing_annotations,
     midgoal_radius,
     goal_radius,
     alpha,
@@ -1651,12 +1679,6 @@ def process_source_dataset(
         f"{len(allowed_episode_ids)}, selected_after_filter={len(selected_episodes)}"
     )
 
-    existing_annotations = load_complete_existing_annotations(
-        output_root,
-        dagger_dataset_name,
-        image_format,
-        progress_dir=progress_dir,
-    )
     pending_episodes = []
     dagger_ids = {}
     skipped = 0
@@ -1768,6 +1790,7 @@ def process_source_dataset(
 
     completed = skipped
     failed = 0
+    failed_episode_ids = []
     not_saved = 0
     success = False
     try:
@@ -1785,17 +1808,35 @@ def process_source_dataset(
                         f"[dagger:{source_dataset}] worker crashed: "
                         f"{[(process.pid, process.exitcode) for process in crashed_processes]}"
                     )
+                if processes and all(not process.is_alive() for process in processes):
+                    raise RuntimeError(
+                        f"[dagger:{source_dataset}] all workers exited before reporting "
+                        f"all episodes: received={completed}/{total_count}, "
+                        f"workers={[(process.pid, process.exitcode) for process in processes]}"
+                    )
                 continue
 
             if result["status"] == "error":
+                episode_context = ""
+                if result.get("episode_id") is not None:
+                    episode_context = (
+                        f" episode={result['episode_id']}"
+                        f" source_episode={result.get('source_episode_id')}"
+                    )
                 raise RuntimeError(
                     f"[dagger:{source_dataset}] worker "
                     f"gpu{result['display_gpu_id']} "
-                    f"p{result['process_index_on_gpu']} failed:\n{result['error']}"
+                    f"p{result['process_index_on_gpu']}{episode_context} failed:\n"
+                    f"{result['error']}"
                 )
 
             if result["status"] == "skipped":
                 failed += 1
+                failed_episode_ids.append(result["episode_id"])
+                tqdm.write(
+                    f"[dagger:{source_dataset}] skipped recoverable episode "
+                    f"{result['episode_id']}: {result.get('error_message', 'unknown error')}"
+                )
             if result["status"] == "not_saved":
                 not_saved += 1
 
@@ -1822,6 +1863,12 @@ def process_source_dataset(
                     f"[dagger:{source_dataset}] worker pid={process.pid} "
                     f"exited with code {process.exitcode}"
                 )
+        if failed_episode_ids:
+            preview = failed_episode_ids[:20]
+            tqdm.write(
+                f"[dagger:{source_dataset}] recoverable failures={len(failed_episode_ids)}, "
+                f"episode_ids={preview}"
+            )
         success = True
     finally:
         if not success:
@@ -1981,6 +2028,10 @@ def parse_args():
         const=True,
         default=False,
         type=str2bool,
+        help=(
+            "Skip only recognized episode-local navigation failures. "
+            "Unexpected model, CUDA, I/O, and code errors always remain fatal."
+        ),
     )
     parser.add_argument(
         "--image_format",
@@ -2009,6 +2060,7 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     configure_worker_thread_environment(args.cpu_threads_per_worker)
+    configure_worker_torch_threads()
     seed_all(args.seed)
 
     requested_gpu_ids = parse_gpu_ids(args.gpu_ids)
@@ -2093,6 +2145,7 @@ def main() -> None:
                 max_episodes=args.max_episodes,
                 episode_ids=selected_episode_ids,
                 progress_dir=progress_dir,
+                existing_annotations=existing_annotations,
                 midgoal_radius=args.midgoal_radius,
                 goal_radius=args.goal_radius,
                 alpha=args.alpha,
