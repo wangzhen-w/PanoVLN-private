@@ -1,20 +1,26 @@
 model:
-  name_or_path: "/workspace/data2/model/ablation_new/data/panovggt_0.20_lr2e-5_singlepoint_8card_66.4pbo"
+  name_or_path: "/workspace/code/a_property/model/Qwen3.5-4B"
   trust_remote_code: false
   torch_dtype: "bfloat16"
   attn_implementation: "flash_attention_2"
   cache_dir: null
   image_token: "<|image_pad|>"
   model_max_length: null
+  action_sequence_length: 1       # ablation: 1 / 2 / 4 / 8 / 16; saved to model config.json
+  view_mode: "panorama"           # "panorama" or runtime ERP-to-"perspective" projection
+  perspective_xfov_degrees: 90.0
+  perspective_yfov_degrees: 90.0
+  perspective_image_width: 320
+  perspective_image_height: 320
   trainable_modules:
     visual: true
     visual_merger: true
     language_model: true
-    panovggt_mlp: true
+    panovggt_mlp: false
     pbo_head: false
   erp_top_crop_degrees: 20.0
   erp_bottom_crop_degrees: 20.0
-  panovggt_enabled: true
+  panovggt_enabled: false
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.20
   panovggt_feature_source: "aggregator"  #"aggregator"共享主干2048维latent / "point_hidden"point decoder后的1024维hidden
@@ -26,7 +32,7 @@ model:
   pbo_head_hidden_size: 512
 
 data:
-  train_jsonl: "/workspace/data2/dataset/ablation/data/train_r2r_rxr_ebs_event050_bg005_tail080.jsonl"
+  train_jsonl: "/workspace/data2/dataset/ablation/action_sequence/train_r2r_rxr_action_sequence_length_1.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -38,13 +44,13 @@ data:
   prompt_format: "chat_template"
   panoworld:
     enabled: false
-    jsonl: "/workspace/data1/dataset/Panoworld/train_outdoor.jsonl"
-    image_root: "/workspace/data1/dataset/Panoworld"
+    jsonl: "/workspace/data2/dataset/ablation/data/train_panowrold.jsonl"
+    image_root: "/workspace/data2/dataset/Panoworld"
     keep_ratio: 1.0
-    mixing_strategy: "sample"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
+    mixing_strategy: "task"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/ablation_new/data/r2r_rxr_double"
+  output_dir: "/workspace/data2/model/ablation_new/action_sequence/erp_length1"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4

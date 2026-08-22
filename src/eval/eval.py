@@ -45,23 +45,30 @@ from habitat.config.default_structured_configs import (
 from PIL import Image
 from peft import PeftModel
 from src.train.data.data import (
+    DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
+    DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    DEFAULT_PERSPECTIVE_YFOV_DEGREES,
     DEFAULT_ERP_BOTTOM_CROP_DEGREES,
     DEFAULT_ERP_TOP_CROP_DEGREES,
+    DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
     DEFAULT_VLN_MAX_MEMORY_IMAGES as DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES as DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
-    VLN_SYSTEM_PROMPT,
-    build_erp_image_geometry_batch,
+    DEFAULT_VLN_VIEW_MODE,
+    build_vln_image_geometry_batch,
     build_vln_image_selection,
+    build_vln_system_prompt,
     build_vln_user_content,
+    normalize_vln_view_mode,
     preprocess_panovggt_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
+    validate_action_sequence_length,
 )
 from src.qwen_vl import Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.utils import build_prompt_and_target
 
-SYSTEM_PROMPT = VLN_SYSTEM_PROMPT
 TARGET_KEYS = ("success", "spl", "oracle_success", "distance_to_goal", "path_length", "ndtw")
 CHECKPOINT_DIR_PATTERN = re.compile(r"^checkpoint-\d+$")
 DEFAULT_EVAL_GENERATION_KWARGS = {
@@ -83,7 +90,7 @@ logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
 STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
-ACTION_SEQUENCE_LENGTH = 4
+ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
 ATOMIC_ACTION_VARIANTS = {
     "stop": ("stop",),
     "forward": ("forward", "move_forward", "move forward", "move-forward"),
@@ -124,16 +131,27 @@ def validate_eval_model_path(model_path: str) -> str:
     return resolved_model_path
 
 
-def build_eval_messages(instruction: str, images: List[Image.Image]):
+def build_eval_messages(
+    instruction: str,
+    images: List[Image.Image],
+    action_sequence_length: int = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+):
     user_content_template = build_vln_user_content(
         instruction=instruction,
         num_images=len(images),
+        view_mode=view_mode,
     )
 
     messages = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+            "content": [
+                {
+                    "type": "text",
+                    "text": build_vln_system_prompt(action_sequence_length),
+                }
+            ],
         }
     ]
 
@@ -177,6 +195,11 @@ def preprocess_vln_eval_images(
     selected_indices: Sequence[int],
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+    perspective_xfov_degrees: float = DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    perspective_yfov_degrees: float = DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+    perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
 ) -> List[Image.Image]:
     selected_images = []
     for image_position, frame_index in enumerate(selected_indices):
@@ -188,6 +211,11 @@ def preprocess_vln_eval_images(
                     raw_image,
                     top_crop_degrees=top_crop_degrees,
                     bottom_crop_degrees=bottom_crop_degrees,
+                    view_mode=view_mode,
+                    perspective_xfov_degrees=perspective_xfov_degrees,
+                    perspective_yfov_degrees=perspective_yfov_degrees,
+                    perspective_image_width=perspective_image_width,
+                    perspective_image_height=perspective_image_height,
                 )
             )
         else:
@@ -196,6 +224,11 @@ def preprocess_vln_eval_images(
                     raw_image,
                     top_crop_degrees=top_crop_degrees,
                     bottom_crop_degrees=bottom_crop_degrees,
+                    view_mode=view_mode,
+                    perspective_xfov_degrees=perspective_xfov_degrees,
+                    perspective_yfov_degrees=perspective_yfov_degrees,
+                    perspective_image_width=perspective_image_width,
+                    perspective_image_height=perspective_image_height,
                 )
             )
     return selected_images
@@ -465,6 +498,44 @@ class PanoVLN_Agent(Agent):
         self.erp_bottom_crop_degrees = float(
             getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
         )
+        self.action_sequence_length = validate_action_sequence_length(
+            getattr(
+                self.model.config,
+                "action_sequence_length",
+                DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
+            )
+        )
+        self.view_mode = normalize_vln_view_mode(
+            getattr(self.model.config, "view_mode", DEFAULT_VLN_VIEW_MODE)
+        )
+        self.perspective_xfov_degrees = float(
+            getattr(
+                self.model.config,
+                "perspective_xfov_degrees",
+                DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+            )
+        )
+        self.perspective_yfov_degrees = float(
+            getattr(
+                self.model.config,
+                "perspective_yfov_degrees",
+                DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+            )
+        )
+        self.perspective_image_width = int(
+            getattr(
+                self.model.config,
+                "perspective_image_width",
+                DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+            )
+        )
+        self.perspective_image_height = int(
+            getattr(
+                self.model.config,
+                "perspective_image_height",
+                DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
+            )
+        )
         self.pbo_enabled = bool(getattr(self.model.config, "pbo_enabled", False))
         self.device = 'cuda'
         self.model.to(self.device)
@@ -503,7 +574,8 @@ class PanoVLN_Agent(Agent):
         print(
             "Initialization Complete "
             f"(attn_implementation={self.attn_implementation}, "
-            f"pbo_enabled={self.pbo_enabled})"
+            f"action_sequence_length={self.action_sequence_length}, "
+            f"view_mode={self.view_mode}, pbo_enabled={self.pbo_enabled})"
         )
         
         self.rgb_history = []
@@ -521,6 +593,10 @@ class PanoVLN_Agent(Agent):
         generation_kwargs = dict(DEFAULT_EVAL_GENERATION_KWARGS)
         if gen_kwargs is not None:
             generation_kwargs.update(gen_kwargs)
+        generation_kwargs["max_new_tokens"] = max(
+            int(generation_kwargs["max_new_tokens"]),
+            self.action_sequence_length * 2 + 4,
+        )
 
         texts = [build_eval_generation_prompt(self.processor, self.conversations)]
 
@@ -531,12 +607,14 @@ class PanoVLN_Agent(Agent):
             padding=True,
         )
         image_count = len(self.current_images)
-        image_erp_geometry = build_erp_image_geometry_batch(
+        image_erp_geometry = build_vln_image_geometry_batch(
             image_count,
+            view_mode=self.view_mode,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
-        prompt_inputs["image_erp_geometry"] = image_erp_geometry
+        if image_erp_geometry is not None:
+            prompt_inputs["image_erp_geometry"] = image_erp_geometry
         prompt_inputs["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         prompt_inputs["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],
@@ -544,7 +622,12 @@ class PanoVLN_Agent(Agent):
         )
         if bool(getattr(self.model.config, "panovggt_enabled", False)) and self.rgb_history:
             prompt_inputs["panovggt_pixel_values"] = preprocess_panovggt_current_image(
-                self.rgb_history[-1]
+                self.rgb_history[-1],
+                view_mode=self.view_mode,
+                perspective_xfov_degrees=self.perspective_xfov_degrees,
+                perspective_yfov_degrees=self.perspective_yfov_degrees,
+                perspective_image_width=self.perspective_image_width,
+                perspective_image_height=self.perspective_image_height,
             ).unsqueeze(0)
 
         prompt_inputs = prompt_inputs.to(self.device)
@@ -590,6 +673,11 @@ class PanoVLN_Agent(Agent):
             selected_indices=selected_indices,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
+            view_mode=self.view_mode,
+            perspective_xfov_degrees=self.perspective_xfov_degrees,
+            perspective_yfov_degrees=self.perspective_yfov_degrees,
+            perspective_image_width=self.perspective_image_width,
+            perspective_image_height=self.perspective_image_height,
         )
 
     def _predict_action_sequence_from_images(
@@ -601,16 +689,21 @@ class PanoVLN_Agent(Agent):
         self.conversations = build_eval_messages(
             instruction=instruction,
             images=selected_images,
+            action_sequence_length=self.action_sequence_length,
+            view_mode=self.view_mode,
         )
 
         navigation = self.predict_inference()
         self.model_generated_actions.append(navigation)
-        action_ids = parse_action_sequence(navigation)
+        action_ids = parse_action_sequence(
+            navigation,
+            max_actions=self.action_sequence_length,
+        )
         self.model_parsed_action_sequences.append(list(action_ids))
         return navigation, action_ids
 
     def _build_pending_action_queue(self, action_ids):
-        action_ids = list(action_ids[:ACTION_SEQUENCE_LENGTH])
+        action_ids = list(action_ids[:self.action_sequence_length])
         if not action_ids:
             return [STOP_ACTION_ID]
         if STOP_ACTION_ID in action_ids:

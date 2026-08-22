@@ -38,8 +38,10 @@ DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_HISTORY_LIMIT = DEFAULT_MEMORY_POOL_WINDOW_FRAMES + DEFAULT_MAX_MEMORY_IMAGES + 10
 DEFAULT_UPLOAD_IMAGE_MODE = "resize"
 DEFAULT_UPLOAD_IMAGE_SIZE = (1280, 640)
-DEFAULT_ACTIONS_PER_REPLAN = 4
-DEFAULT_PREFETCH_AFTER_ACTIONS = 2
+# Zero means follow the action-sequence length advertised by the server.  This
+# keeps real-world execution aligned with length-ablation checkpoints.
+DEFAULT_ACTIONS_PER_REPLAN = 0
+DEFAULT_PREFETCH_AFTER_ACTIONS = 0
 DEFAULT_COMMAND_PERIOD_S = 0.05
 DEFAULT_SETTLE_TIME_S = 0.25
 DEFAULT_POST_CAPTURE_SETTLE_TIME_S = 0.25
@@ -1143,7 +1145,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upload-max-memory-images", type=int, default=DEFAULT_MAX_MEMORY_IMAGES)
     parser.add_argument("--upload-memory-pool-window-frames", type=int, default=DEFAULT_MEMORY_POOL_WINDOW_FRAMES)
     parser.add_argument("--max-replans", type=int, default=50, help="0 means unlimited.")
-    parser.add_argument("--actions-per-replan", type=int, default=DEFAULT_ACTIONS_PER_REPLAN)
+    parser.add_argument(
+        "--actions-per-replan",
+        type=int,
+        default=DEFAULT_ACTIONS_PER_REPLAN,
+        help="Maximum actions to execute per plan; 0 uses the server model's action_sequence_length.",
+    )
     parser.add_argument(
         "--prefetch-after-actions",
         type=int,
@@ -1209,8 +1216,8 @@ def main() -> None:
         raise ValueError("Instruction is empty")
     if args.control_backend != "dry-run" and args.real_robot_ack != "yes":
         raise ValueError("Set REAL_ROBOT_ACK=\"yes\" in run_go2_client.sh before using ros2")
-    if args.actions_per_replan <= 0:
-        raise ValueError(f"actions_per_replan must be > 0, got {args.actions_per_replan}")
+    if args.actions_per_replan < 0:
+        raise ValueError(f"actions_per_replan must be >= 0, got {args.actions_per_replan}")
     if args.prefetch_after_actions < 0:
         raise ValueError(f"prefetch_after_actions must be >= 0, got {args.prefetch_after_actions}")
     requested_save_contents = parse_save_contents(args.save_contents)
@@ -1309,7 +1316,8 @@ def main() -> None:
             "max_memory_images": args.upload_max_memory_images,
             "memory_pool_window_frames": args.upload_memory_pool_window_frames,
         },
-        "actions_per_replan": args.actions_per_replan,
+        "configured_actions_per_replan": args.actions_per_replan,
+        "effective_actions_per_replan": None,
         "prefetch_after_actions": args.prefetch_after_actions,
         "server_ready": None,
         "predictions": [],
@@ -1343,6 +1351,25 @@ def main() -> None:
         ready = client.ready()
         print({"server_ready": ready}, flush=True)
         run_log["server_ready"] = ready
+        if args.actions_per_replan > 0:
+            effective_actions_per_replan = args.actions_per_replan
+        else:
+            server_action_sequence_length = ready.get("action_sequence_length")
+            if (
+                isinstance(server_action_sequence_length, bool)
+                or not isinstance(server_action_sequence_length, int)
+                or server_action_sequence_length <= 0
+            ):
+                raise ValueError(
+                    "Server /ready must return a positive integer "
+                    "action_sequence_length when --actions-per-replan=0"
+                )
+            effective_actions_per_replan = server_action_sequence_length
+        run_log["effective_actions_per_replan"] = effective_actions_per_replan
+        print(
+            {"effective_actions_per_replan": effective_actions_per_replan},
+            flush=True,
+        )
         backend.stand()
         replans = 0
         pending_prediction: Optional[PendingPrediction] = None
@@ -1401,7 +1428,7 @@ def main() -> None:
 
             should_stop = False
             for action_index, action in enumerate(actions):
-                if action_index >= args.actions_per_replan:
+                if action_index >= effective_actions_per_replan:
                     break
                 print(
                     {

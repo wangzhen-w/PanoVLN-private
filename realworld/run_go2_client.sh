@@ -45,8 +45,10 @@ UPLOAD_HEIGHT="640"
 
 # Safety / replanning
 MAX_REPLANS="100"
-ACTIONS_PER_REPLAN="4"
-PREDICT_PREFETCH_AFTER_ACTIONS="2"
+# 0 follows action_sequence_length reported by the model server.
+ACTIONS_PER_REPLAN="0"
+# Disable speculative replanning so every horizon is evaluated from fresh observations.
+PREDICT_PREFETCH_AFTER_ACTIONS="0"
 
 # Motion primitives. Start conservatively on the real robot.
 FORWARD_DISTANCE="0.25"

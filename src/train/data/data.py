@@ -2,9 +2,11 @@ import json
 import math
 import os
 import random
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
@@ -22,6 +24,17 @@ DEFAULT_VLN_MAX_MEMORY_IMAGES = 10
 DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES = 100
 DEFAULT_ERP_TOP_CROP_DEGREES = 20
 DEFAULT_ERP_BOTTOM_CROP_DEGREES = 20
+DEFAULT_VLN_ACTION_SEQUENCE_LENGTH = 4
+# Backward-compatible name used by the existing DAgger collector.  Policy
+# training/evaluation use the value stored in model.config instead.
+VLN_ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
+PBO_ACTION_SEQUENCE_LENGTH = 4
+VLN_VIEW_MODES = {"panorama", "perspective"}
+DEFAULT_VLN_VIEW_MODE = "panorama"
+DEFAULT_PERSPECTIVE_XFOV_DEGREES = 90.0
+DEFAULT_PERSPECTIVE_YFOV_DEGREES = 90.0
+DEFAULT_PERSPECTIVE_IMAGE_WIDTH = 320
+DEFAULT_PERSPECTIVE_IMAGE_HEIGHT = 320
 VLN_ACTION_WORDS = {"forward", "left", "right", "stop"}
 VLN_ACTION_ALIASES = {
     "move_forward": "forward",
@@ -35,22 +48,154 @@ VLN_ACTION_ALIASES = {
     "turn-right": "right",
     "stop": "stop",
 }
-VLN_ACTION_SEQUENCE_LENGTH = 4
 VLN_ACTION_TO_ID = {
     "stop": 0,
     "forward": 1,
     "left": 2,
     "right": 3,
 }
-VLN_SYSTEM_PROMPT = (
-    "You are an autonomous navigation assistant. "
-    "Your task is to follow the navigation instruction. "
-    "Given the instruction, your recent observations, and your current observation, "
-    "devise an action sequence using the four actions: left or right by 15 degrees, "
-    "forward by 25 centimeters, or stop once the task is complete. "
-    "Return exactly four action words in execution order, separated by spaces. "
-    "If the task is complete before four actions, fill the remaining positions with stop."
-)
+ACTION_COUNT_WORDS = {
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+    11: "eleven",
+    12: "twelve",
+    13: "thirteen",
+    14: "fourteen",
+    15: "fifteen",
+    16: "sixteen",
+}
+
+
+def validate_action_sequence_length(action_sequence_length: int) -> int:
+    if isinstance(action_sequence_length, bool):
+        raise ValueError("action_sequence_length must be a positive integer")
+    action_sequence_length = int(action_sequence_length)
+    if action_sequence_length <= 0:
+        raise ValueError(
+            "action_sequence_length must be a positive integer, "
+            f"got {action_sequence_length}"
+        )
+    return action_sequence_length
+
+
+def normalize_vln_view_mode(view_mode: str) -> str:
+    normalized = str(view_mode).strip().lower()
+    if normalized not in VLN_VIEW_MODES:
+        raise ValueError(
+            f"view_mode must be one of {sorted(VLN_VIEW_MODES)}, got {view_mode!r}"
+        )
+    return normalized
+
+
+def build_vln_system_prompt(
+    action_sequence_length: int = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
+) -> str:
+    action_sequence_length = validate_action_sequence_length(action_sequence_length)
+    count_text = ACTION_COUNT_WORDS.get(
+        action_sequence_length,
+        str(action_sequence_length),
+    )
+    action_word = "action word" if action_sequence_length == 1 else "action words"
+    action_count_noun = "action" if action_sequence_length == 1 else "actions"
+    return (
+        "You are an autonomous navigation assistant. "
+        "Your task is to follow the navigation instruction. "
+        "Given the instruction, your recent observations, and your current observation, "
+        "devise an action sequence using the four actions: left or right by 15 degrees, "
+        "forward by 25 centimeters, or stop once the task is complete. "
+        f"Return exactly {count_text} {action_word} in execution order, separated by spaces. "
+        f"If the task is complete before {count_text} {action_count_noun}, "
+        "fill the remaining positions "
+        "with stop."
+    )
+
+
+VLN_SYSTEM_PROMPT = build_vln_system_prompt()
+
+
+@lru_cache(maxsize=32)
+def _perspective_sampling_grid(
+    output_width: int,
+    output_height: int,
+    xfov_degrees: float,
+    yfov_degrees: float,
+) -> torch.Tensor:
+    output_width = int(output_width)
+    output_height = int(output_height)
+    xfov_degrees = float(xfov_degrees)
+    yfov_degrees = float(yfov_degrees)
+    if output_width <= 0 or output_height <= 0:
+        raise ValueError(
+            "Perspective output dimensions must be positive, "
+            f"got {output_width}x{output_height}"
+        )
+    if not 0.0 < xfov_degrees < 180.0 or not 0.0 < yfov_degrees < 180.0:
+        raise ValueError(
+            "Perspective FOV values must be in (0, 180) degrees, "
+            f"got xfov={xfov_degrees}, yfov={yfov_degrees}"
+        )
+
+    x = (
+        (torch.arange(output_width, dtype=torch.float32) + 0.5)
+        / float(output_width)
+        * 2.0
+        - 1.0
+    )
+    y = 1.0 - (
+        (torch.arange(output_height, dtype=torch.float32) + 0.5)
+        / float(output_height)
+        * 2.0
+    )
+    ray_x = x * math.tan(math.radians(xfov_degrees) * 0.5)
+    ray_y = y * math.tan(math.radians(yfov_degrees) * 0.5)
+    ray_x = ray_x.unsqueeze(0).expand(output_height, output_width)
+    ray_y = ray_y.unsqueeze(1).expand(output_height, output_width)
+    longitude = torch.atan2(ray_x, torch.ones_like(ray_x))
+    latitude = torch.atan2(ray_y, torch.sqrt(1.0 + ray_x.square()))
+    return torch.stack(
+        [
+            longitude / math.pi,
+            -2.0 * latitude / math.pi,
+        ],
+        dim=-1,
+    ).unsqueeze(0)
+
+
+def project_equirectangular_to_perspective(
+    image: Image.Image,
+    *,
+    xfov_degrees: float = DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    yfov_degrees: float = DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+    output_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    output_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
+) -> Image.Image:
+    """Project the forward-facing center of an ERP panorama at runtime."""
+
+    source = TF.to_tensor(image.convert("RGB")).unsqueeze(0)
+    grid = _perspective_sampling_grid(
+        int(output_width),
+        int(output_height),
+        float(xfov_degrees),
+        float(yfov_degrees),
+    ).to(device=source.device)
+    projected = F.grid_sample(
+        source,
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )[0].clamp_(0.0, 1.0)
+    return TF.to_pil_image(projected)
+
+
 def crop_erp_latitude(
     image: Image.Image,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
@@ -123,7 +268,20 @@ def preprocess_vln_current_image(
     image: Image.Image,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+    perspective_xfov_degrees: float = DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    perspective_yfov_degrees: float = DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+    perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
 ) -> Image.Image:
+    if normalize_vln_view_mode(view_mode) == "perspective":
+        return project_equirectangular_to_perspective(
+            image,
+            xfov_degrees=perspective_xfov_degrees,
+            yfov_degrees=perspective_yfov_degrees,
+            output_width=perspective_image_width,
+            output_height=perspective_image_height,
+        )
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
     return crop_erp_latitude(
         processed_image,
@@ -136,7 +294,20 @@ def preprocess_vln_memory_image(
     image: Image.Image,
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+    perspective_xfov_degrees: float = DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    perspective_yfov_degrees: float = DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+    perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
 ) -> Image.Image:
+    if normalize_vln_view_mode(view_mode) == "perspective":
+        return project_equirectangular_to_perspective(
+            image,
+            xfov_degrees=perspective_xfov_degrees,
+            yfov_degrees=perspective_yfov_degrees,
+            output_width=perspective_image_width,
+            output_height=perspective_image_height,
+        )
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_MEMORY_IMAGE_SIZE)
     return crop_erp_latitude(
         processed_image,
@@ -145,12 +316,50 @@ def preprocess_vln_memory_image(
     )
 
 
-def preprocess_panovggt_current_image(image: Image.Image) -> torch.Tensor:
-    processed_image = image.convert("RGB").resize(
-        DEFAULT_PANOVGGT_IMAGE_SIZE,
-        Image.Resampling.LANCZOS,
-    )
+def preprocess_panovggt_current_image(
+    image: Image.Image,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+    perspective_xfov_degrees: float = DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    perspective_yfov_degrees: float = DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+    perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
+) -> torch.Tensor:
+    processed_image = image.convert("RGB")
+    if normalize_vln_view_mode(view_mode) == "perspective":
+        # Never expose the original 360-degree image to the auxiliary visual
+        # encoder during a perspective-view ablation.  Keep the configured
+        # 320x320 projection for every visual branch.
+        processed_image = project_equirectangular_to_perspective(
+            processed_image,
+            xfov_degrees=perspective_xfov_degrees,
+            yfov_degrees=perspective_yfov_degrees,
+            output_width=perspective_image_width,
+            output_height=perspective_image_height,
+        )
+    else:
+        processed_image = processed_image.resize(
+            DEFAULT_PANOVGGT_IMAGE_SIZE,
+            Image.Resampling.LANCZOS,
+        )
     return TF.to_tensor(processed_image)
+
+
+def build_vln_image_geometry_batch(
+    num_images: int,
+    *,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+    top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
+    bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
+) -> Optional[torch.Tensor]:
+    if normalize_vln_view_mode(view_mode) == "perspective":
+        # The PanoVGGT/Qwen alignment uses the full normalized image plane for
+        # perspective inputs; ERP latitude/longitude metadata does not apply.
+        return None
+    return build_erp_image_geometry_batch(
+        num_images,
+        top_crop_degrees=top_crop_degrees,
+        bottom_crop_degrees=bottom_crop_degrees,
+    )
 
 
 def build_vln_image_selection(
@@ -208,24 +417,30 @@ def image_content() -> Dict[str, str]:
     return {"type": "image"}
 
 
-def build_vln_user_content(instruction: str, num_images: int) -> List[Dict[str, str]]:
+def build_vln_user_content(
+    instruction: str,
+    num_images: int,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
+) -> List[Dict[str, str]]:
     if num_images <= 0:
         raise ValueError("VLN samples require at least one image")
 
+    view_mode = normalize_vln_view_mode(view_mode)
+    view_name = "panoramic" if view_mode == "panorama" else "perspective"
     num_memory_images = max(0, num_images - 1)
     content = [text_content(f"Instruction: {instruction.strip()}")]
 
     if num_memory_images > 0:
         content.append(
             text_content(
-                "\nHistory memory observations are panoramic views ordered from older to newer:"
+                f"\nHistory memory observations are {view_name} views ordered from older to newer:"
             )
         )
         content.extend(image_content() for _ in range(num_memory_images))
 
     content.extend(
         [
-            text_content("\nCurrent observation (panoramic view):"),
+            text_content(f"\nCurrent observation ({view_name} view):"),
             image_content(),
             text_content("\nDevise the next action sequence."),
         ]
@@ -315,14 +530,18 @@ def _normalize_vln_action(action: Any) -> Optional[str]:
     return VLN_ACTION_ALIASES.get(stripped_action.lower())
 
 
-def _extract_vln_action_sequence(example: Dict[str, Any]) -> List[str]:
+def _extract_vln_action_sequence(
+    example: Dict[str, Any],
+    action_sequence_length: int,
+) -> List[str]:
+    action_sequence_length = validate_action_sequence_length(action_sequence_length)
     action_sequence = example.get("action_sequence")
     if not isinstance(action_sequence, list):
         raise ValueError("VLN example field 'action_sequence' must be a list")
-    if len(action_sequence) != VLN_ACTION_SEQUENCE_LENGTH:
+    if len(action_sequence) != action_sequence_length:
         raise ValueError(
             "VLN example field 'action_sequence' must contain exactly "
-            f"{VLN_ACTION_SEQUENCE_LENGTH} actions, got {len(action_sequence)}"
+            f"{action_sequence_length} actions, got {len(action_sequence)}"
         )
 
     normalized_actions = []
@@ -371,6 +590,7 @@ def _extract_vln_history_actions(
 def _extract_real_action_count(
     example: Dict[str, Any],
     action_sequence: List[str],
+    action_sequence_length: int,
 ) -> int:
     try:
         first_stop_index = action_sequence.index("stop")
@@ -388,9 +608,10 @@ def _extract_real_action_count(
         return expected_count
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("VLN example field 'real_action_count' must be an integer")
-    if value < 1 or value > VLN_ACTION_SEQUENCE_LENGTH:
+    if value < 1 or value > action_sequence_length:
         raise ValueError(
-            "VLN example field 'real_action_count' must be in [1, 4], "
+            "VLN example field 'real_action_count' must be in "
+            f"[1, {action_sequence_length}], "
             f"got {value}"
         )
     if value != expected_count:
@@ -406,7 +627,11 @@ def apply_vln_memory_policy(
     example: Dict[str, Any],
     *,
     pbo_enabled: bool = False,
+    action_sequence_length: int = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
+    view_mode: str = DEFAULT_VLN_VIEW_MODE,
 ) -> Dict[str, Any]:
+    action_sequence_length = validate_action_sequence_length(action_sequence_length)
+    view_mode = normalize_vln_view_mode(view_mode)
     raw_images = example.get("images", [])
     if not isinstance(raw_images, list) or not raw_images:
         raise ValueError("VLN example field 'images' must contain the full image history")
@@ -424,18 +649,18 @@ def apply_vln_memory_policy(
         )
 
     instruction = _extract_vln_instruction(example)
-    action_sequence = _extract_vln_action_sequence(example)
+    action_sequence = _extract_vln_action_sequence(example, action_sequence_length)
     history_actions = _extract_vln_history_actions(example, current_step)
-    _extract_real_action_count(example, action_sequence)
+    _extract_real_action_count(example, action_sequence, action_sequence_length)
 
     has_pbo_target = bool(
         pbo_enabled
         and history_actions is not None
-        and len(history_actions) >= VLN_ACTION_SEQUENCE_LENGTH
+        and len(history_actions) >= PBO_ACTION_SEQUENCE_LENGTH
     )
     four_step_memory_anchor = (
-        current_step - VLN_ACTION_SEQUENCE_LENGTH
-        if current_step >= VLN_ACTION_SEQUENCE_LENGTH
+        current_step - PBO_ACTION_SEQUENCE_LENGTH
+        if current_step >= PBO_ACTION_SEQUENCE_LENGTH
         else -1
     )
     selected_indices = build_vln_image_selection(
@@ -458,14 +683,15 @@ def apply_vln_memory_policy(
     if pbo_valid:
         pbo_action_labels = [
             VLN_ACTION_TO_ID[action]
-            for action in history_actions[-VLN_ACTION_SEQUENCE_LENGTH:]
+            for action in history_actions[-PBO_ACTION_SEQUENCE_LENGTH:]
         ]
     else:
-        pbo_action_labels = [-100] * VLN_ACTION_SEQUENCE_LENGTH
+        pbo_action_labels = [-100] * PBO_ACTION_SEQUENCE_LENGTH
 
     user_content = build_vln_user_content(
         instruction=instruction,
         num_images=len(selected_images),
+        view_mode=view_mode,
     )
 
     normalized = dict(example)
@@ -476,7 +702,7 @@ def apply_vln_memory_policy(
     normalized["messages"] = [
         {
             "role": "system",
-            "content": [text_content(VLN_SYSTEM_PROMPT)],
+            "content": [text_content(build_vln_system_prompt(action_sequence_length))],
         },
         {
             "role": "user",
@@ -552,6 +778,12 @@ class SupervisedDataset(Dataset):
         image_root: Optional[str],
         image_token: str,
         model_max_length: Optional[int],
+        action_sequence_length: int = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
+        view_mode: str = DEFAULT_VLN_VIEW_MODE,
+        perspective_xfov_degrees: float = DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+        perspective_yfov_degrees: float = DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+        perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+        perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
@@ -570,6 +802,14 @@ class SupervisedDataset(Dataset):
         else:
             self.image_token = image_token
         self.model_max_length = model_max_length
+        self.action_sequence_length = validate_action_sequence_length(
+            action_sequence_length
+        )
+        self.view_mode = normalize_vln_view_mode(view_mode)
+        self.perspective_xfov_degrees = float(perspective_xfov_degrees)
+        self.perspective_yfov_degrees = float(perspective_yfov_degrees)
+        self.perspective_image_width = int(perspective_image_width)
+        self.perspective_image_height = int(perspective_image_height)
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
@@ -629,12 +869,22 @@ class SupervisedDataset(Dataset):
                         raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                        view_mode=self.view_mode,
+                        perspective_xfov_degrees=self.perspective_xfov_degrees,
+                        perspective_yfov_degrees=self.perspective_yfov_degrees,
+                        perspective_image_width=self.perspective_image_width,
+                        perspective_image_height=self.perspective_image_height,
                     )
                 else:
                     processed_image = preprocess_vln_memory_image(
                         raw_image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                        view_mode=self.view_mode,
+                        perspective_xfov_degrees=self.perspective_xfov_degrees,
+                        perspective_yfov_degrees=self.perspective_yfov_degrees,
+                        perspective_image_width=self.perspective_image_width,
+                        perspective_image_height=self.perspective_image_height,
                     )
                 raw_images.append(raw_image)
                 processed_images.append(processed_image)
@@ -644,6 +894,8 @@ class SupervisedDataset(Dataset):
         example = apply_vln_memory_policy(
             self._load_example(index),
             pbo_enabled=self.pbo_enabled,
+            action_sequence_length=self.action_sequence_length,
+            view_mode=self.view_mode,
         )
         messages, vision_paths = resolve_messages_and_vision_paths(
             example,
@@ -701,8 +953,9 @@ class SupervisedDataset(Dataset):
             labels[:-target_len] = -100
 
         image_count = len(vision_paths)
-        image_erp_geometry = build_erp_image_geometry_batch(
+        image_erp_geometry = build_vln_image_geometry_batch(
             image_count,
+            view_mode=self.view_mode,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
@@ -711,7 +964,8 @@ class SupervisedDataset(Dataset):
             "attention_mask": attention_mask,
             "labels": labels,
         }
-        item["image_erp_geometry"] = image_erp_geometry
+        if image_erp_geometry is not None:
+            item["image_erp_geometry"] = image_erp_geometry
         item["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         item["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],
@@ -735,7 +989,12 @@ class SupervisedDataset(Dataset):
 
         if self.panovggt_enabled and vision_paths:
             item["panovggt_pixel_values"] = preprocess_panovggt_current_image(
-                raw_images[-1]
+                raw_images[-1],
+                view_mode=self.view_mode,
+                perspective_xfov_degrees=self.perspective_xfov_degrees,
+                perspective_yfov_degrees=self.perspective_yfov_degrees,
+                perspective_image_width=self.perspective_image_width,
+                perspective_image_height=self.perspective_image_height,
             ).unsqueeze(0)
 
         for key in STACKABLE_KEYS:

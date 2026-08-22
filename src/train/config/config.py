@@ -13,6 +13,12 @@ class ModelConfig:
     cache_dir: Optional[str] = None
     image_token: str = "<image>"
     model_max_length: Optional[int] = None
+    action_sequence_length: int = 4
+    view_mode: str = "panorama"
+    perspective_xfov_degrees: float = 90.0
+    perspective_yfov_degrees: float = 90.0
+    perspective_image_width: int = 320
+    perspective_image_height: int = 320
     trainable_modules: Optional[Dict[str, bool]] = None
     erp_top_crop_degrees: float = 20.0
     erp_bottom_crop_degrees: float = 20.0

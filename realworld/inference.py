@@ -23,26 +23,34 @@ for _path in (str(REPO_ROOT), str(SRC_ROOT)):
 
 from src.qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
 from src.train.data.data import (
+    DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
+    DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+    DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+    DEFAULT_PERSPECTIVE_YFOV_DEGREES,
     DEFAULT_ERP_BOTTOM_CROP_DEGREES,
     DEFAULT_ERP_TOP_CROP_DEGREES,
+    DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
     DEFAULT_VLN_MAX_MEMORY_IMAGES,
     DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
-    VLN_SYSTEM_PROMPT,
-    build_erp_image_geometry_batch,
+    DEFAULT_VLN_VIEW_MODE,
+    build_vln_image_geometry_batch,
     build_vln_image_selection,
+    build_vln_system_prompt,
     build_vln_user_content,
+    normalize_vln_view_mode,
     preprocess_panovggt_current_image,
     preprocess_vln_current_image,
     preprocess_vln_memory_image,
     resolve_current_image_index,
     text_content,
+    validate_action_sequence_length,
 )
 from src.train.utils import build_prompt_and_target, sync_model_special_tokens
 
 
 DEFAULT_MODEL_PATH = "/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
 ACTION_WORDS = ("stop", "forward", "left", "right")
-ACTION_SEQUENCE_LENGTH = 4
+ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
 DEFAULT_REALWORLD_GENERATION_KWARGS = {
     "max_new_tokens": 24,
     "temperature": 0,
@@ -152,8 +160,11 @@ def parse_action_sequence(text: str, max_actions: int = ACTION_SEQUENCE_LENGTH) 
     return actions
 
 
-def build_executable_action_queue(actions: Iterable[str]) -> list[str]:
-    action_list = list(actions)[:ACTION_SEQUENCE_LENGTH]
+def build_executable_action_queue(
+    actions: Iterable[str],
+    max_actions: int = ACTION_SEQUENCE_LENGTH,
+) -> list[str]:
+    action_list = list(actions)[:validate_action_sequence_length(max_actions)]
     if not action_list:
         return ["stop"]
     if "stop" in action_list:
@@ -170,6 +181,12 @@ class PanoVLNPredictor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.erp_top_crop_degrees = DEFAULT_ERP_TOP_CROP_DEGREES
         self.erp_bottom_crop_degrees = DEFAULT_ERP_BOTTOM_CROP_DEGREES
+        self.action_sequence_length = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
+        self.view_mode = DEFAULT_VLN_VIEW_MODE
+        self.perspective_xfov_degrees = DEFAULT_PERSPECTIVE_XFOV_DEGREES
+        self.perspective_yfov_degrees = DEFAULT_PERSPECTIVE_YFOV_DEGREES
+        self.perspective_image_width = DEFAULT_PERSPECTIVE_IMAGE_WIDTH
+        self.perspective_image_height = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT
         self._load()
 
     @staticmethod
@@ -331,6 +348,44 @@ class PanoVLNPredictor:
             self.erp_bottom_crop_degrees = float(
                 getattr(self.model.config, "erp_bottom_crop_degrees", DEFAULT_ERP_BOTTOM_CROP_DEGREES)
             )
+            self.action_sequence_length = validate_action_sequence_length(
+                getattr(
+                    self.model.config,
+                    "action_sequence_length",
+                    DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
+                )
+            )
+            self.view_mode = normalize_vln_view_mode(
+                getattr(self.model.config, "view_mode", DEFAULT_VLN_VIEW_MODE)
+            )
+            self.perspective_xfov_degrees = float(
+                getattr(
+                    self.model.config,
+                    "perspective_xfov_degrees",
+                    DEFAULT_PERSPECTIVE_XFOV_DEGREES,
+                )
+            )
+            self.perspective_yfov_degrees = float(
+                getattr(
+                    self.model.config,
+                    "perspective_yfov_degrees",
+                    DEFAULT_PERSPECTIVE_YFOV_DEGREES,
+                )
+            )
+            self.perspective_image_width = int(
+                getattr(
+                    self.model.config,
+                    "perspective_image_width",
+                    DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
+                )
+            )
+            self.perspective_image_height = int(
+                getattr(
+                    self.model.config,
+                    "perspective_image_height",
+                    DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
+                )
+            )
             self.pbo_enabled = bool(getattr(self.model.config, "pbo_enabled", False))
             _log_stage(
                 "model moved and initialized "
@@ -338,6 +393,8 @@ class PanoVLNPredictor:
                 f"dtype={next(self.model.parameters()).dtype} "
                 f"crop_top={self.erp_top_crop_degrees} "
                 f"crop_bottom={self.erp_bottom_crop_degrees} "
+                f"action_sequence_length={self.action_sequence_length} "
+                f"view_mode={self.view_mode} "
                 f"pbo_enabled={self.pbo_enabled} "
                 f"in {_format_elapsed(step_start)}"
             )
@@ -362,6 +419,11 @@ class PanoVLNPredictor:
                         image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                        view_mode=self.view_mode,
+                        perspective_xfov_degrees=self.perspective_xfov_degrees,
+                        perspective_yfov_degrees=self.perspective_yfov_degrees,
+                        perspective_image_width=self.perspective_image_width,
+                        perspective_image_height=self.perspective_image_height,
                     )
                 )
             else:
@@ -370,13 +432,25 @@ class PanoVLNPredictor:
                         image,
                         top_crop_degrees=self.erp_top_crop_degrees,
                         bottom_crop_degrees=self.erp_bottom_crop_degrees,
+                        view_mode=self.view_mode,
+                        perspective_xfov_degrees=self.perspective_xfov_degrees,
+                        perspective_yfov_degrees=self.perspective_yfov_degrees,
+                        perspective_image_width=self.perspective_image_width,
+                        perspective_image_height=self.perspective_image_height,
                     )
                 )
 
         panovggt_enabled = bool(getattr(self.model.config, "panovggt_enabled", False))
         panovggt_pixel_values = None
         if panovggt_enabled:
-            panovggt_pixel_values = preprocess_panovggt_current_image(raw_images[-1]).unsqueeze(0)
+            panovggt_pixel_values = preprocess_panovggt_current_image(
+                raw_images[-1],
+                view_mode=self.view_mode,
+                perspective_xfov_degrees=self.perspective_xfov_degrees,
+                perspective_yfov_degrees=self.perspective_yfov_degrees,
+                perspective_image_width=self.perspective_image_width,
+                perspective_image_height=self.perspective_image_height,
+            ).unsqueeze(0)
         return processed_images, panovggt_pixel_values
 
     def _move_batch_to_device(self, batch: dict[str, Any]) -> dict[str, Any]:
@@ -417,13 +491,18 @@ class PanoVLNPredictor:
         messages = [
             {
                 "role": "system",
-                "content": [text_content(VLN_SYSTEM_PROMPT)],
+                "content": [
+                    text_content(
+                        build_vln_system_prompt(self.action_sequence_length)
+                    )
+                ],
             },
             {
                 "role": "user",
                 "content": build_vln_user_content(
                     instruction=instruction,
                     num_images=len(processed_images),
+                    view_mode=self.view_mode,
                 ),
             },
         ]
@@ -441,12 +520,14 @@ class PanoVLNPredictor:
             padding=True,
         )
         image_count = len(processed_images)
-        image_erp_geometry = build_erp_image_geometry_batch(
+        image_erp_geometry = build_vln_image_geometry_batch(
             image_count,
+            view_mode=self.view_mode,
             top_crop_degrees=self.erp_top_crop_degrees,
             bottom_crop_degrees=self.erp_bottom_crop_degrees,
         )
-        encoded["image_erp_geometry"] = image_erp_geometry
+        if image_erp_geometry is not None:
+            encoded["image_erp_geometry"] = image_erp_geometry
         encoded["image_num_images"] = torch.tensor([image_count], dtype=torch.long)
         encoded["image_current_index"] = torch.tensor(
             [resolve_current_image_index(image_count)],
@@ -458,6 +539,10 @@ class PanoVLNPredictor:
         batch = self._move_batch_to_device(dict(encoded))
         input_len = int(batch["input_ids"].shape[-1])
         generation_kwargs = dict(DEFAULT_REALWORLD_GENERATION_KWARGS)
+        generation_kwargs["max_new_tokens"] = max(
+            int(generation_kwargs["max_new_tokens"]),
+            self.action_sequence_length * 2 + 4,
+        )
         _log_stage(
             "generation started "
             f"input_tokens={input_len} "
@@ -486,7 +571,10 @@ class PanoVLNPredictor:
             raw_text = raw_text.split("</think>", 1)[-1]
         raw_text = raw_text.strip()
 
-        actions = parse_action_sequence(raw_text)
+        actions = parse_action_sequence(
+            raw_text,
+            max_actions=self.action_sequence_length,
+        )
         _log_stage(
             "predict finished "
             f"latency_s={time.perf_counter() - start:.3f} "
@@ -494,7 +582,10 @@ class PanoVLNPredictor:
         )
         return PredictionResult(
             actions=actions,
-            executable_actions=build_executable_action_queue(actions),
+            executable_actions=build_executable_action_queue(
+                actions,
+                max_actions=self.action_sequence_length,
+            ),
             raw_text=raw_text,
             prompt_images=image_count,
             latency_s=time.perf_counter() - start,

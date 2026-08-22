@@ -39,6 +39,8 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
             "model_loaded": True,
             "model_path": app.state.settings.model_path,
             "pbo_enabled": app.state.predictor.pbo_enabled,
+            "action_sequence_length": app.state.predictor.action_sequence_length,
+            "view_mode": app.state.predictor.view_mode,
         }
 
     @app.get("/ready")
@@ -49,6 +51,8 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
             "model_loaded": True,
             "model_path": app.state.settings.model_path,
             "pbo_enabled": app.state.predictor.pbo_enabled,
+            "action_sequence_length": app.state.predictor.action_sequence_length,
+            "view_mode": app.state.predictor.view_mode,
         }
 
     @app.post("/predict")

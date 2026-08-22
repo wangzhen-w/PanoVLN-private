@@ -11,7 +11,11 @@ import yaml
 
 from config.config import load_config
 from data.collator import MultiModalDataCollator
-from data.data import SupervisedDataset
+from data.data import (
+    SupervisedDataset,
+    normalize_vln_view_mode,
+    validate_action_sequence_length,
+)
 from data.mixed import MixedSupervisedDataset, SourceGroupedSampler
 from data.panoworld import PanoWorldSupervisedDataset
 from utils import (
@@ -188,6 +192,16 @@ def save_resolved_experiment_config(cfg, overrides) -> None:
 
 
 def validate_training_config(cfg) -> None:
+    validate_action_sequence_length(cfg.model.action_sequence_length)
+    view_mode = normalize_vln_view_mode(cfg.model.view_mode)
+    if not 0.0 < float(cfg.model.perspective_xfov_degrees) < 180.0:
+        raise ValueError("model.perspective_xfov_degrees must be in (0, 180)")
+    if not 0.0 < float(cfg.model.perspective_yfov_degrees) < 180.0:
+        raise ValueError("model.perspective_yfov_degrees must be in (0, 180)")
+    if int(cfg.model.perspective_image_width) <= 0:
+        raise ValueError("model.perspective_image_width must be positive")
+    if int(cfg.model.perspective_image_height) <= 0:
+        raise ValueError("model.perspective_image_height must be positive")
     if float(cfg.model.pbo_loss_weight) < 0.0:
         raise ValueError("model.pbo_loss_weight must be non-negative")
     if int(cfg.model.pbo_head_hidden_size) <= 0:
@@ -196,6 +210,10 @@ def validate_training_config(cfg) -> None:
     panoworld_cfg = cfg.data.panoworld
     if not panoworld_cfg.enabled:
         return
+    if view_mode != "panorama":
+        raise ValueError(
+            "data.panoworld.enabled must be false for the perspective-view VLN ablation"
+        )
     if not panoworld_cfg.jsonl:
         raise ValueError("data.panoworld.jsonl is required when data.panoworld.enabled=true")
     if not panoworld_cfg.image_root:
@@ -227,6 +245,15 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, "===== Ablation config =====")
     rank0_print(RANK, f"torch_dtype: {_config_value(cfg.model.torch_dtype)}")
     rank0_print(RANK, f"attn_implementation: {_config_value(cfg.model.attn_implementation)}")
+    rank0_print(RANK, f"action_sequence_length: {cfg.model.action_sequence_length}")
+    rank0_print(RANK, f"view_mode: {cfg.model.view_mode}")
+    rank0_print(RANK, f"perspective_xfov_degrees: {cfg.model.perspective_xfov_degrees}")
+    rank0_print(RANK, f"perspective_yfov_degrees: {cfg.model.perspective_yfov_degrees}")
+    rank0_print(
+        RANK,
+        "perspective_image_size: "
+        f"{cfg.model.perspective_image_width}x{cfg.model.perspective_image_height}",
+    )
     rank0_print(RANK, "trainable_modules:")
     for name, enabled in (cfg.model.trainable_modules or {}).items():
         rank0_print(RANK, f"  {name}: {_config_value(enabled)}")
@@ -311,6 +338,44 @@ def main():
     model_config = model.config
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
     effective_pbo_enabled = bool(getattr(model_config, "pbo_enabled", cfg.model.pbo_enabled))
+    effective_action_sequence_length = validate_action_sequence_length(
+        getattr(
+            model_config,
+            "action_sequence_length",
+            cfg.model.action_sequence_length,
+        )
+    )
+    effective_view_mode = normalize_vln_view_mode(
+        getattr(model_config, "view_mode", cfg.model.view_mode)
+    )
+    effective_perspective_xfov_degrees = float(
+        getattr(
+            model_config,
+            "perspective_xfov_degrees",
+            cfg.model.perspective_xfov_degrees,
+        )
+    )
+    effective_perspective_yfov_degrees = float(
+        getattr(
+            model_config,
+            "perspective_yfov_degrees",
+            cfg.model.perspective_yfov_degrees,
+        )
+    )
+    effective_perspective_image_width = int(
+        getattr(
+            model_config,
+            "perspective_image_width",
+            cfg.model.perspective_image_width,
+        )
+    )
+    effective_perspective_image_height = int(
+        getattr(
+            model_config,
+            "perspective_image_height",
+            cfg.model.perspective_image_height,
+        )
+    )
     effective_erp_top_crop_degrees = float(
         getattr(model_config, "erp_top_crop_degrees", cfg.model.erp_top_crop_degrees)
     )
@@ -319,6 +384,16 @@ def main():
     )
     if RANK == 0:
         rank0_print(RANK, "===== Effective model config =====")
+        rank0_print(RANK, f"action_sequence_length: {effective_action_sequence_length}")
+        rank0_print(RANK, f"view_mode: {effective_view_mode}")
+        rank0_print(
+            RANK,
+            "perspective_fov_and_size: "
+            f"{effective_perspective_xfov_degrees}x"
+            f"{effective_perspective_yfov_degrees} degrees, "
+            f"{effective_perspective_image_width}x"
+            f"{effective_perspective_image_height}",
+        )
         rank0_print(RANK, f"panovggt_enabled: {_config_value(effective_panovggt_enabled)}")
         rank0_print(RANK, f"panovggt_alpha_value: {_config_value(getattr(model_config, 'panovggt_alpha_value', None))}")
         rank0_print(RANK, f"panovggt_feature_source: {_config_value(getattr(model_config, 'panovggt_feature_source', None))}")
@@ -340,6 +415,12 @@ def main():
         image_root=train_image_root,
         image_token=cfg.model.image_token,
         model_max_length=cfg.model.model_max_length,
+        action_sequence_length=effective_action_sequence_length,
+        view_mode=effective_view_mode,
+        perspective_xfov_degrees=effective_perspective_xfov_degrees,
+        perspective_yfov_degrees=effective_perspective_yfov_degrees,
+        perspective_image_width=effective_perspective_image_width,
+        perspective_image_height=effective_perspective_image_height,
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
@@ -396,6 +477,12 @@ def main():
             image_root=eval_image_root,
             image_token=cfg.model.image_token,
             model_max_length=cfg.model.model_max_length,
+            action_sequence_length=effective_action_sequence_length,
+            view_mode=effective_view_mode,
+            perspective_xfov_degrees=effective_perspective_xfov_degrees,
+            perspective_yfov_degrees=effective_perspective_yfov_degrees,
+            perspective_image_width=effective_perspective_image_width,
+            perspective_image_height=effective_perspective_image_height,
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,
@@ -469,6 +556,7 @@ def main():
                 tokenizer,
                 cfg.data.action_vocab,
                 cfg.data.f1_action_weight,
+                effective_action_sequence_length,
             )
             if eval_dataset is not None else None
         ),

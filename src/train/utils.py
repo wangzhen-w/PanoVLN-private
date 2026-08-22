@@ -116,6 +116,14 @@ def _load_model_config(cfg):
         "pbo_input_vector_count",
         None,
     )
+    behavior_fields = (
+        "action_sequence_length",
+        "view_mode",
+        "perspective_xfov_degrees",
+        "perspective_yfov_degrees",
+        "perspective_image_width",
+        "perspective_image_height",
+    )
     erp_crop_fields = (
         "erp_top_crop_degrees",
         "erp_bottom_crop_degrees",
@@ -156,7 +164,7 @@ def _load_model_config(cfg):
             return
         apply_module_fields(False, field_names)
 
-    for field_name in erp_crop_fields:
+    for field_name in behavior_fields + erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
     apply_module_fields_preserve_checkpoint(bool(cfg.model.pbo_enabled), pbo_fields)
@@ -474,6 +482,7 @@ def build_action_accuracy(
     tokenizer,
     action_vocab: Optional[List[str]] = None,
     f1_action_weight: Optional[List[float]] = None,
+    action_sequence_length: int = 4,
 ):
     if action_vocab is None:
         action_vocab = ["stop", "forward", "left", "right"]
@@ -534,8 +543,8 @@ def build_action_accuracy(
         correct = 0
         sequence_total = 0
         sequence_correct = 0
-        position_total = [0, 0, 0, 0]
-        position_correct = [0, 0, 0, 0]
+        position_total = [0] * int(action_sequence_length)
+        position_correct = [0] * int(action_sequence_length)
         per_action_total = {action: 0 for action in action_vocab}
         per_action_correct = {action: 0 for action in action_vocab}
         per_action_tp = {action: 0 for action in action_vocab}
