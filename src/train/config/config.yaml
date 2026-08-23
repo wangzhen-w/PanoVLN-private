@@ -55,11 +55,11 @@ training:
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 4
-  learning_rate: 1.0e-5
-  language_model_lr: 1.0e-5
-  visual_lr: 1.0e-6
-  visual_merger_lr: 5.0e-6
-  panovggt_mlp_lr: 1.0e-5
+  learning_rate: 2.0e-5
+  language_model_lr: 2.0e-5
+  visual_lr: 2.0e-6
+  visual_merger_lr: 1.0e-5
+  panovggt_mlp_lr: 2.0e-5
   pbo_head_lr: 2.0e-5
   weight_decay: 0.01
   num_train_epochs: 1
