@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 DEFAULT_EVAL_CPU_THREADS_PER_WORKER = 4
 EVAL_CPU_THREADS_ENV = "VLN_EVAL_CPU_THREADS_PER_WORKER"
@@ -129,6 +129,18 @@ def validate_eval_model_path(model_path: str) -> str:
             f"not an intermediate Trainer checkpoint: {resolved_model_path}"
         )
     return resolved_model_path
+
+
+def resolve_actions_per_replan(
+    model_action_sequence_length: int,
+    actions_per_replan: Optional[int],
+) -> int:
+    model_action_sequence_length = validate_action_sequence_length(
+        model_action_sequence_length
+    )
+    if actions_per_replan is None:
+        return model_action_sequence_length
+    return validate_action_sequence_length(actions_per_replan)
 
 
 def build_eval_messages(
@@ -375,6 +387,7 @@ def evaluate_agent(
     save_topdown,
     attn_implementation,
     early_stop_max_steps,
+    actions_per_replan,
 ) -> None:
     done_pairs = _load_done_pairs(result_path)
     pending_episodes = _filter_pending_episodes(list(dataset.episodes), done_pairs)
@@ -401,6 +414,7 @@ def evaluate_agent(
         memory_pool_window_frames,
         save_topdown=save_topdown,
         attn_implementation=attn_implementation,
+        actions_per_replan=actions_per_replan,
     )
 
     early_stop_max_steps = max(0, int(early_stop_max_steps))
@@ -461,6 +475,7 @@ class PanoVLN_Agent(Agent):
         memory_pool_window_frames,
         save_topdown=False,
         attn_implementation="sdpa",
+        actions_per_replan=None,
     ):
         
         print("Initialize PanoVLN")
@@ -504,6 +519,10 @@ class PanoVLN_Agent(Agent):
                 "action_sequence_length",
                 DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
             )
+        )
+        self.actions_per_replan = resolve_actions_per_replan(
+            self.action_sequence_length,
+            actions_per_replan,
         )
         self.view_mode = normalize_vln_view_mode(
             getattr(self.model.config, "view_mode", DEFAULT_VLN_VIEW_MODE)
@@ -575,6 +594,7 @@ class PanoVLN_Agent(Agent):
             "Initialization Complete "
             f"(attn_implementation={self.attn_implementation}, "
             f"action_sequence_length={self.action_sequence_length}, "
+            f"actions_per_replan={self.actions_per_replan}, "
             f"view_mode={self.view_mode}, pbo_enabled={self.pbo_enabled})"
         )
         
@@ -703,7 +723,7 @@ class PanoVLN_Agent(Agent):
         return navigation, action_ids
 
     def _build_pending_action_queue(self, action_ids):
-        action_ids = list(action_ids[:self.action_sequence_length])
+        action_ids = list(action_ids[:self.actions_per_replan])
         if not action_ids:
             return [STOP_ACTION_ID]
         if STOP_ACTION_ID in action_ids:
@@ -800,6 +820,15 @@ def main():
                         help="attention backend used to load the model")
     parser.add_argument("--early-stop-max-steps", type=int, default=0,
                         help="optional hard cap on env steps per episode; 0 relies on habitat.environment.max_episode_steps")
+    parser.add_argument(
+        "--actions-per-replan",
+        type=int,
+        default=None,
+        help=(
+            "maximum number of generated actions to execute before replanning; "
+            "when omitted, use model.config.action_sequence_length"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="random seed for python, numpy, and torch")
     args = parser.parse_args()
 
@@ -847,7 +876,7 @@ def main():
     evaluate_agent(config, args.split_id, dataset_split, args.model_path, args.lora_path, args.result_path,
                 args.forward_distance, args.turn_angle, args.max_memory_images,
                 args.memory_pool_window_frames, args.save_topdown, args.attn_implementation,
-                args.early_stop_max_steps)
+                args.early_stop_max_steps, args.actions_per_replan)
 
 if __name__ == "__main__":
     main()

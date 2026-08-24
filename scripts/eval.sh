@@ -17,6 +17,9 @@ SAVE_PATH="/workspace/code/vln_result/ablation_new/panovggt_pre_merger/panovggt_
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
+# Maximum generated actions to execute before replanning. Leave empty to use
+# action_sequence_length from the model's config.json.
+ACTIONS_PER_REPLAN=""
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 
@@ -43,6 +46,15 @@ if [ ! -d "$MODEL_PATH" ]; then
     exit 1
 fi
 
+actions_per_replan_args=()
+if [[ -n "$ACTIONS_PER_REPLAN" ]]; then
+    if [[ ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ACTIONS_PER_REPLAN must be empty or a positive integer: $ACTIONS_PER_REPLAN" >&2
+        exit 1
+    fi
+    actions_per_replan_args=(--actions-per-replan "$ACTIONS_PER_REPLAN")
+fi
+
 echo "MODEL_PATH=$MODEL_PATH"
 echo "CONFIG_PATH=$CONFIG_PATH"
 echo "SAVE_PATH=$SAVE_PATH"
@@ -56,6 +68,7 @@ echo "SEED=$SEED"
 echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
 echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
 echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
+echo "ACTIONS_PER_REPLAN=${ACTIONS_PER_REPLAN:-model_config}"
 echo "EARLY_STOP_MAX_STEPS=$EARLY_STOP_MAX_STEPS"
 echo "Total processes: $CHUNKS"
 
@@ -95,6 +108,7 @@ for gpu_id in "${gpu_ids[@]}"; do
             --turn-angle 15 \
             --max-memory-images "$MAX_MEMORY_IMAGES" \
             --memory-pool-window-frames "$MEMORY_POOL_WINDOW_FRAMES" \
+            "${actions_per_replan_args[@]}" \
             --model-path "$MODEL_PATH" \
             --max-episodes "$MAX_EPISODES" \
             --total-max-episodes "$TOTAL_MAX_EPISODES" \
