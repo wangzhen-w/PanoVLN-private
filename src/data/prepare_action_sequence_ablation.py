@@ -25,7 +25,7 @@ from typing import Any, Iterable, Sequence
 DEFAULT_INPUT_ROOT = Path("/workspace/code/a_property/dataset/PanoVLN")
 DEFAULT_OUTPUT_DIR = Path("/workspace/data2/dataset/ablation/action_sequence")
 DEFAULT_DATASETS = ("r2r", "rxr")
-DEFAULT_ACTION_SEQUENCE_LENGTHS = (1, 2, 4, 8, 16)
+DEFAULT_ACTION_SEQUENCE_LENGTHS = (1, 2, 4, 6, 8, 10, 12, 14, 16)
 DEFAULT_SAMPLE_COUNT = 512_000
 DEFAULT_SEED = 42
 STOP_ACTION_ID = 0
@@ -529,6 +529,85 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_reusable_dataset_summary(
+    *,
+    summary_path: Path,
+    manifest_path: Path,
+    output_paths: dict[int, Path],
+    existing_lengths: Sequence[int],
+    sample_count: int,
+    seed: int,
+) -> dict[str, Any]:
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            "Existing ablation datasets require dataset_summary.json for safe reuse: "
+            f"{summary_path}"
+        )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Existing ablation datasets require the original manifest: {manifest_path}"
+        )
+    with summary_path.open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+
+    expected_metadata = {
+        "manifest": str(manifest_path),
+        "manifest_sha256": sha256_file(manifest_path),
+        "seed": int(seed),
+        "sample_count_per_length": int(sample_count),
+    }
+    for field_name, expected_value in expected_metadata.items():
+        if summary.get(field_name) != expected_value:
+            raise ValueError(
+                f"Cannot safely reuse existing datasets: {field_name} mismatch; "
+                f"expected={expected_value!r}, actual={summary.get(field_name)!r}"
+            )
+
+    recorded_paths = summary.get("datasets", {})
+    recorded_hashes = summary.get("dataset_sha256", {})
+    for key, recorded_path in recorded_paths.items():
+        dataset_path = Path(recorded_path).resolve()
+        if not recorded_hashes.get(key):
+            raise ValueError(
+                f"Cannot safely reuse length={key}: missing recorded SHA256"
+            )
+        if not dataset_path.is_file() or dataset_path.stat().st_size <= 0:
+            raise ValueError(
+                f"Cannot safely reuse missing or empty dataset: {dataset_path}"
+            )
+    for length in existing_lengths:
+        key = str(length)
+        output_path = output_paths[length]
+        recorded_path = recorded_paths.get(key)
+        if recorded_path is None or Path(recorded_path).resolve() != output_path:
+            raise ValueError(
+                f"Cannot safely reuse length={length}: dataset_summary.json path mismatch"
+            )
+    return summary
+
+
+def merge_dataset_summaries(
+    existing_summary: dict[str, Any] | None,
+    new_summary: dict[str, Any],
+) -> dict[str, Any]:
+    if existing_summary is None:
+        return new_summary
+
+    merged_summary = dict(new_summary)
+    for field_name in (
+        "stop_padded_sample_counts",
+        "datasets",
+        "dataset_sha256",
+    ):
+        merged_values = dict(existing_summary.get(field_name, {}))
+        merged_values.update(new_summary.get(field_name, {}))
+        merged_summary[field_name] = merged_values
+    merged_summary["action_sequence_lengths"] = sorted(
+        int(length) for length in merged_summary["datasets"]
+    )
+    return merged_summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create matched R2R/RxR action-sequence-length ablation data."
@@ -562,6 +641,47 @@ def main() -> None:
         if args.manifest_path is not None
         else output_dir / "manifest.json"
     )
+    summary_path = output_dir / "dataset_summary.json"
+    output_paths = {
+        length: output_dir / f"train_r2r_rxr_action_sequence_length_{length}.jsonl"
+        for length in lengths
+    }
+    existing_summary = None
+    lengths_to_materialize = lengths
+    if not args.manifest_only and not args.overwrite:
+        existing_lengths = tuple(
+            length for length, path in output_paths.items() if path.is_file()
+        )
+        missing_lengths = tuple(
+            length for length, path in output_paths.items() if not path.is_file()
+        )
+        if existing_lengths or summary_path.is_file():
+            if args.overwrite_manifest:
+                raise ValueError(
+                    "--overwrite-manifest cannot reuse existing datasets; "
+                    "also pass --overwrite to regenerate the requested lengths"
+                )
+            existing_summary = load_reusable_dataset_summary(
+                summary_path=summary_path,
+                manifest_path=manifest_path,
+                output_paths=output_paths,
+                existing_lengths=existing_lengths,
+                sample_count=args.sample_count,
+                seed=args.seed,
+            )
+            if existing_lengths:
+                print(
+                    f"Reusing completed datasets for lengths={existing_lengths}",
+                    flush=True,
+                )
+        if not missing_lengths:
+            print("All requested action-sequence datasets already exist; nothing to do.")
+            return
+        lengths_to_materialize = missing_lengths
+        print(
+            f"Materializing only missing lengths={lengths_to_materialize}",
+            flush=True,
+        )
 
     print(
         "Scanning image-only start-index population "
@@ -606,7 +726,7 @@ def main() -> None:
         catalog=catalog,
         annotations=annotations,
         output_dir=output_dir,
-        action_sequence_lengths=lengths,
+        action_sequence_lengths=lengths_to_materialize,
         overwrite=args.overwrite,
     )
     summary.update(
@@ -620,7 +740,7 @@ def main() -> None:
         length: sha256_file(Path(path))
         for length, path in summary["datasets"].items()
     }
-    summary_path = output_dir / "dataset_summary.json"
+    summary = merge_dataset_summaries(existing_summary, summary)
     _atomic_json_dump(summary_path, summary)
     print(f"Wrote dataset summary: {summary_path}", flush=True)
 
