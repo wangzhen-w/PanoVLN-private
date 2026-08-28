@@ -1,775 +1,572 @@
+#!/usr/bin/env python3
+"""Generate the R2R+RxR 12-action maneuver-phase training JSONL."""
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import os
-import random
+import re
 import tempfile
 from collections import Counter
-from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, MutableMapping, Sequence
 
 from tqdm import tqdm
 
 
-DEFAULT_ACTION_HORIZON = 4
+ACTION_HORIZON = 12
 DEFAULT_SEED = 42
-DEFAULT_SUBSET_SEED = 42
-EBS_SAMPLER = "ebs"
-DEFAULT_EVENT_KEEP_PROB = 0.60
-DEFAULT_BACKGROUND_KEEP_PROB = 0.11
-DEFAULT_TAIL_DENSE_KEEP_PROB = 0.50
-DEFAULT_BODY_KEEP_ADVANCE = DEFAULT_ACTION_HORIZON
-STOP_ACTION_ID = 0
-EVENT_ACTION_IDS = {2, 3}
-
-DATASET_SPECS = {
-    "r2r": {"image_dir": "r2r", "annotation_name": "r2r.jsonl"},
-    "rxr": {"image_dir": "rxr", "annotation_name": "rxr.jsonl"},
-    "envdrop": {"image_dir": "envdrop", "annotation_name": "envdrop.jsonl"},
-    "scalevln": {
-        "image_dir": "scalevln",
-        "annotation_name": "scalevln.jsonl",
-        "dataset_label": "scalevln",
-    },
-    # Instruction-only ablation: reuse the exact ScaleVLN trajectories/images.
-    "scalevln_rewrite": {
-        "image_dir": "scalevln",
-        "annotation_name": "scalevln_rewrite.jsonl",
-        "dataset_label": "scalevln",
-    },
-    "panovln": {
-        "image_dir": "panovln",
-        "annotation_name": "panovln.jsonl",
-        "dataset_label": "panovln",
-    },
-    "scalevln_150k": {
-        "image_dir": "scalevln_150k",
-        "annotation_name": "scalevln_150k.jsonl",
-    },
-    "dagger": {"image_dir": "dagger", "annotation_name": "dagger.jsonl"},
+STOP, FORWARD, LEFT, RIGHT = 0, 1, 2, 3
+TURN_ACTIONS = frozenset({LEFT, RIGHT})
+ACTION_NAMES = {
+    STOP: "stop",
+    FORWARD: "forward",
+    LEFT: "left",
+    RIGHT: "right",
 }
+ACTION_CHARS = {
+    STOP: "S",
+    FORWARD: "F",
+    LEFT: "L",
+    RIGHT: "R",
+}
+DATASET_ORDER = ("r2r", "rxr")
+STOP_BINS = (
+    (1, 2),
+    (3, 4),
+    (5, 6),
+    (7, 8),
+    (9, 10),
+    (11, 12),
+)
+REASON_ORDER = {
+    "episode_start": 0,
+    "turn_onset": 1,
+    "complete_centered": 2,
+    "long_turn_entry": 3,
+    "long_turn_exit": 4,
+    "forward_center": 5,
+}
+FRAME_PATTERN = re.compile(r"frame_(\d+)\.png")
 
-INSTRUCTION_ABLATION_VARIANTS = frozenset(
-    {"scalevln", "scalevln_rewrite"}
+EXPECTED_SOURCES = {
+    "r2r": {
+        "sha256": "7338528cb9ffe55283c7c9faf817c75e02be3e24a51da35ef6dfd40c0a38aaaa",
+        "bytes": 3_340_690,
+        "episodes": 10_692,
+        "starts": 660_055,
+    },
+    "rxr": {
+        "sha256": "b04f348f2e5d9ca3d5e037e762f7ecd87adc63891568d0202df088cc8dc78891",
+        "bytes": 14_259_993,
+        "episodes": 18_057,
+        "starts": 1_897_951,
+    },
+}
+DELETED_RXR_EPISODES = frozenset(
+    {"18639", "18640", "18641", "19236", "19243", "19244"}
+)
+EXPECTED_ROWS = 788_847
+EXPECTED_SELECTION_SHA256 = (
+    "a0d3a213f2ae586673e79a3a971ab1b2ce799a33dc5e1ed61048fb71c6ef5eeb"
+)
+EXPECTED_TRAINING_SHA256 = (
+    "859186155df5cf778076802c3ea82500f6c1dd7184bc4637b7a2a4841784a609"
 )
 
 
-def action_id_to_str(action_id: int) -> str:
-    # id: 0-stop, 1 move forward, 2 turn left, 3 turn right
-    if action_id == 0:
-        return "stop"
-    if action_id == 1:
-        return "forward"
-    if action_id == 2:
-        return "left"
-    if action_id == 3:
-        return "right"
-    raise ValueError(f"Invalid action ID: {action_id}")
+@dataclass(frozen=True)
+class Episode:
+    dataset: str
+    episode_id: str
+    instruction: str
+    actions: tuple[int, ...]
+    image_id: str
 
 
-def frame_index_from_filename(filename: str) -> str:
-    return filename.split("_")[1].split(".")[0]
+@dataclass(frozen=True)
+class ActionBlock:
+    """A half-open maximal same-action run: [start, end)."""
+
+    start: int
+    end: int
+    action: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
 
 
-def annotation_image_id(episode_item: Dict[str, Any]) -> str:
-    """Resolve shared trajectory images while preserving old episode-keyed data."""
-
-    image_id = episode_item.get("trajectory_id")
-    if image_id is None:
-        image_id = episode_item.get("episode_id", episode_item.get("video_id"))
-    if image_id is None or isinstance(image_id, bool) or not str(image_id).strip():
-        raise ValueError("Annotation has no usable trajectory_id/episode_id/video_id")
-    return str(image_id)
+def canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
-def to_relative_path(path: str, root: str) -> str:
-    return os.path.relpath(path, root).replace(os.sep, "/")
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def write_jsonl_item(handle, item: Dict) -> None:
-    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+def stable_choice(options: Sequence[int], *parts: object) -> int:
+    ordered = tuple(sorted(int(option) for option in options))
+    if not ordered:
+        raise ValueError("stable_choice requires at least one option")
+    payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    return ordered[value % len(ordered)]
 
 
-def build_dataset_config(input_root: str) -> Dict[str, Dict[str, str]]:
-    return {
-        dataset_name: {
-            "image_path": os.path.join(input_root, "images", spec["image_dir"]),
-            "annotation_path": os.path.join(
-                input_root,
-                "sub_dataset",
-                spec["annotation_name"],
-            ),
-            "dataset_label": spec.get("dataset_label", dataset_name),
-            "frame_index_fn": frame_index_from_filename,
-        }
-        for dataset_name, spec in DATASET_SPECS.items()
-    }
+def maximal_blocks(
+    actions: Sequence[int], accepted_actions: frozenset[int]
+) -> Iterable[ActionBlock]:
+    stop_index = len(actions) - 1
+    index = 0
+    while index < stop_index:
+        action = int(actions[index])
+        if action not in accepted_actions:
+            index += 1
+            continue
+        end = index + 1
+        while end < stop_index and int(actions[end]) == action:
+            end += 1
+        yield ActionBlock(index, end, action)
+        index = end
 
 
-def validate_selected_subsets(
-    selected_subset_list: List[str],
-    dataset_config: Dict[str, Dict[str, str]],
+def validate_actions(actions: Sequence[int], context: str) -> None:
+    if len(actions) < ACTION_HORIZON + 1:
+        raise ValueError(
+            f"{context}: expected at least {ACTION_HORIZON + 1} actions, "
+            f"got {len(actions)}"
+        )
+    invalid = sorted(set(int(value) for value in actions) - set(ACTION_NAMES))
+    if invalid:
+        raise ValueError(f"{context}: invalid action IDs {invalid}")
+    if int(actions[-1]) != STOP or STOP in actions[:-1]:
+        raise ValueError(f"{context}: actions must contain exactly one final stop")
+    for index, (left, right) in enumerate(zip(actions, actions[1:])):
+        if left in TURN_ACTIONS and right in TURN_ACTIONS and left != right:
+            raise ValueError(
+                f"{context}: immediate L/R reversal at action boundary {index}"
+            )
+    turn_lengths = [
+        block.length for block in maximal_blocks(actions, TURN_ACTIONS)
+    ]
+    if turn_lengths and max(turn_lengths) > ACTION_HORIZON:
+        raise ValueError(
+            f"{context}: turn block length {max(turn_lengths)} exceeds "
+            f"{ACTION_HORIZON}"
+        )
+
+
+def action_target(actions: Sequence[int], start: int) -> tuple[int, ...]:
+    target = tuple(int(value) for value in actions[start : start + ACTION_HORIZON])
+    if len(target) < ACTION_HORIZON:
+        if not target or target[-1] != STOP:
+            raise ValueError(
+                "Only a terminal target ending in stop may be padded: "
+                f"start={start}, target={target}"
+            )
+        target += (STOP,) * (ACTION_HORIZON - len(target))
+    return target
+
+
+def add_reason(
+    selected: MutableMapping[int, set[str]],
+    actions: Sequence[int],
+    start: int,
+    reason: str,
 ) -> None:
-    if not selected_subset_list:
-        raise ValueError("At least one dataset name is required")
-    duplicates = sorted(
-        name for name, count in Counter(selected_subset_list).items() if count > 1
-    )
-    if duplicates:
-        raise ValueError(f"Duplicate dataset names are not allowed: {duplicates}")
-    unsupported = sorted(set(selected_subset_list) - set(dataset_config))
-    if unsupported:
-        raise ValueError(
-            f"Unsupported dataset names: {unsupported}; "
-            f"supported={sorted(dataset_config)}"
-        )
-    if INSTRUCTION_ABLATION_VARIANTS.issubset(selected_subset_list):
-        raise ValueError(
-            "scalevln and scalevln_rewrite are paired instruction variants over the same "
-            "trajectories. Generate them in separate runs with the same seed and "
-            "sampling parameters; do not mix both into one training JSONL."
-        )
+    if not 0 <= start < len(actions):
+        raise ValueError(f"Invalid start {start} for {len(actions)} actions")
+    selected.setdefault(start, set()).add(reason)
 
 
-def load_episode_images(
-    episode_image_path: str,
-    frame_index_fn,
-    input_root: str,
-    num_actions: int,
-    append_terminal_frame: bool = True,
-) -> List[str]:
-    episode_image_list = os.listdir(episode_image_path)
-    episode_image_list = sorted(
-        episode_image_list,
-        key=lambda file_name: int(frame_index_fn(file_name)),
+def centered_turn_options(
+    actions: Sequence[int], block: ActionBlock
+) -> tuple[int, ...]:
+    if block.length > ACTION_HORIZON - 2:
+        return ()
+    stop_index = len(actions) - 1
+    if (
+        block.start == 0
+        or block.end >= stop_index
+        or actions[block.start - 1] != FORWARD
+        or actions[block.end] != FORWARD
+    ):
+        return ()
+
+    low = max(0, block.end - (ACTION_HORIZON - 1))
+    high = block.start - 1
+    candidates: list[tuple[int, int]] = []
+    for start in range(low, high + 1):
+        before = block.start - start
+        after = start + ACTION_HORIZON - block.end
+        if before >= 1 and after >= 1:
+            candidates.append((start, abs(before - after)))
+    if not candidates:
+        return ()
+    best = min(score for _, score in candidates)
+    return tuple(start for start, score in candidates if score == best)
+
+
+def centered_forward_options(block: ActionBlock) -> tuple[int, ...]:
+    if block.action != FORWARD or block.length < ACTION_HORIZON:
+        return ()
+    candidates = tuple(range(block.start, block.end - ACTION_HORIZON + 1))
+    best = min(
+        abs((start - block.start) - (block.end - start - ACTION_HORIZON))
+        for start in candidates
     )
-    episode_image_list = [
-        to_relative_path(os.path.join(episode_image_path, image), input_root)
-        for image in episode_image_list
+    return tuple(
+        start
+        for start in candidates
+        if abs((start - block.start) - (block.end - start - ACTION_HORIZON))
+        == best
+    )
+
+
+def reason_sort_key(reason: str) -> tuple[int, str]:
+    if reason.startswith("stop_bin_"):
+        return (6, reason)
+    return (REASON_ORDER[reason], reason)
+
+
+def select_starts(
+    dataset: str,
+    episode_id: str,
+    actions: Sequence[int],
+    seed: int,
+) -> tuple[dict[int, set[str]], Counter]:
+    """Apply only the final H=12 maneuver-phase sampling strategy."""
+
+    validate_actions(actions, f"{dataset}:{episode_id}")
+    selected: dict[int, set[str]] = {}
+    audit = Counter()
+
+    add_reason(selected, actions, 0, "episode_start")
+    audit["episode_start"] += 1
+
+    for block in maximal_blocks(actions, TURN_ACTIONS):
+        audit["turn_blocks"] += 1
+        add_reason(selected, actions, block.start, "turn_onset")
+        audit["turn_onset"] += 1
+
+        if block.length <= 10:
+            options = centered_turn_options(actions, block)
+            if not options:
+                continue
+            center = stable_choice(
+                options,
+                seed,
+                dataset,
+                episode_id,
+                block.start,
+                block.end - 1,
+                "center_tie",
+            )
+            keep_center = block.length > 1
+            if block.length == 1:
+                approach = actions[center:block.start]
+                keep_center = bool(approach) and all(
+                    action == FORWARD for action in approach
+                )
+                audit[
+                    "length1_direct_center"
+                    if keep_center
+                    else "length1_center_skipped"
+                ] += 1
+            if keep_center:
+                add_reason(selected, actions, center, "complete_centered")
+                audit["complete_centered"] += 1
+        else:
+            entry = block.start - 1
+            if entry >= 0 and actions[entry] == FORWARD:
+                add_reason(selected, actions, entry, "long_turn_entry")
+                audit["long_turn_entry"] += 1
+            if block.length == 12:
+                exit_start = block.end - 11
+                if block.end < len(actions) - 1 and actions[block.end] == FORWARD:
+                    add_reason(selected, actions, exit_start, "long_turn_exit")
+                    audit["long_turn_exit"] += 1
+
+    for block in maximal_blocks(actions, frozenset({FORWARD})):
+        options = centered_forward_options(block)
+        if not options:
+            continue
+        center = stable_choice(
+            options,
+            seed,
+            dataset,
+            episode_id,
+            block.start,
+            block.end - 1,
+            "forward_center_ge12",
+        )
+        add_reason(selected, actions, center, "forward_center")
+        audit["forward_center"] += 1
+
+    for bin_index, positions in enumerate(STOP_BINS):
+        starts = tuple(len(actions) - position for position in positions)
+        existing = tuple(start for start in starts if start in selected)
+        if existing:
+            audit["stop_bin_precovered"] += 1
+            audit["stop_bin_multiple"] += len(existing) > 1
+            continue
+        position = stable_choice(
+            positions,
+            seed,
+            dataset,
+            episode_id,
+            "stop_pair6",
+            bin_index,
+        )
+        start = len(actions) - position
+        add_reason(
+            selected,
+            actions,
+            start,
+            f"stop_bin_{bin_index + 1}_pos_{position}",
+        )
+        audit["stop_supplement"] += 1
+
+    return dict(sorted(selected.items())), audit
+
+
+def load_episodes(input_root: Path) -> list[Episode]:
+    episodes: list[Episode] = []
+    seen: set[tuple[str, str]] = set()
+    for dataset in DATASET_ORDER:
+        path = input_root / "sub_dataset" / f"{dataset}.jsonl"
+        raw = path.read_bytes()
+        expected = EXPECTED_SOURCES[dataset]
+        digest = hashlib.sha256(raw).hexdigest()
+        if len(raw) != expected["bytes"] or digest != expected["sha256"]:
+            raise ValueError(
+                f"Source fingerprint mismatch for {path}: "
+                f"bytes={len(raw)} sha256={digest}"
+            )
+
+        starts = 0
+        count = 0
+        for line_number, line in enumerate(raw.splitlines(), 1):
+            row = json.loads(line)
+            episode_id = str(row["episode_id"])
+            key = (dataset, episode_id)
+            if key in seen:
+                raise ValueError(f"Duplicate episode at {path}:{line_number}: {key}")
+            seen.add(key)
+            if dataset == "rxr" and episode_id in DELETED_RXR_EPISODES:
+                raise ValueError(f"Deleted reversal episode remains: {key}")
+
+            actions = tuple(int(value) for value in row["actions"])
+            validate_actions(actions, f"{path}:{line_number}")
+            instruction = row.get("instruction")
+            if not isinstance(instruction, str) or not instruction:
+                raise ValueError(f"Missing instruction at {path}:{line_number}")
+            image_id = str(row.get("trajectory_id", row["episode_id"]))
+            episodes.append(
+                Episode(dataset, episode_id, instruction, actions, image_id)
+            )
+            starts += len(actions)
+            count += 1
+
+        if count != expected["episodes"] or starts != expected["starts"]:
+            raise ValueError(
+                f"Source count mismatch for {dataset}: episodes={count}, "
+                f"starts={starts}, expected={expected}"
+            )
+    return episodes
+
+
+def load_image_paths(input_root: Path, episode: Episode) -> list[str]:
+    directory = input_root / "images" / episode.dataset / episode.image_id
+    if not directory.is_dir():
+        raise ValueError(f"Missing image directory: {directory}")
+    indexed: dict[int, str] = {}
+    for name in os.listdir(directory):
+        match = FRAME_PATTERN.fullmatch(name)
+        if match is None:
+            raise ValueError(f"Unexpected frame filename in {directory}: {name}")
+        index = int(match.group(1))
+        if index in indexed:
+            raise ValueError(f"Duplicate frame index {index} in {directory}")
+        indexed[index] = name
+    if sorted(indexed) != list(range(len(episode.actions))):
+        raise ValueError(
+            f"Frame/action mismatch in {directory}: "
+            f"frames={len(indexed)}, actions={len(episode.actions)}"
+        )
+    return [
+        f"images/{episode.dataset}/{episode.image_id}/{indexed[index]}"
+        for index in range(len(episode.actions))
     ]
 
-    if not append_terminal_frame:
-        if len(episode_image_list) != num_actions:
-            raise ValueError(
-                f"Unexpected number of DAgger frames in {episode_image_path}: "
-                f"{len(episode_image_list)} vs actions={num_actions}"
-            )
-        return episode_image_list
 
-    if len(episode_image_list) == num_actions:
-        episode_image_list.append(episode_image_list[-1])
-    elif len(episode_image_list) != num_actions + 1:
-        raise ValueError(
-            f"Unexpected number of frames in {episode_image_path}: "
-            f"{len(episode_image_list)} vs actions={num_actions}"
-        )
-
-    return episode_image_list
-
-
-def is_chunk_relabelled_dagger(annotation: Dict[str, Any]) -> bool:
-    return bool(annotation.get("trajectory_id")) and isinstance(
-        annotation.get("oracle_chunks"), list
-    )
-
-
-def build_dagger_oracle_action_chunks(
-    annotation: Dict[str, Any],
-    action_horizon: int = DEFAULT_ACTION_HORIZON,
-) -> List[Dict[str, Any]]:
-    actions = [int(action_id) for action_id in annotation["actions"]]
-    if not actions or actions[-1] != STOP_ACTION_ID:
-        raise ValueError("DAgger trajectory must end with stop")
-    if STOP_ACTION_ID in actions[:-1]:
-        raise ValueError("DAgger trajectory contains an early stop")
-
-    raw_chunks = annotation.get("oracle_chunks")
-    if not isinstance(raw_chunks, list) or not raw_chunks:
-        raise ValueError("DAgger annotation has no oracle_chunks")
-
-    action_chunks = []
-    previous_step = -1
-    for chunk_index, raw_chunk in enumerate(raw_chunks):
-        step_index = raw_chunk.get("step_index")
-        action_ids = [int(action_id) for action_id in raw_chunk.get("oracle_actions", [])]
-        step_gap = (
-            step_index - previous_step
-            if isinstance(step_index, int) and previous_step >= 0
-            else None
-        )
-        if (
-            isinstance(step_index, bool)
-            or not isinstance(step_index, int)
-            or step_index <= previous_step
-            or step_index >= len(actions)
-        ):
-            raise ValueError(f"Invalid DAgger oracle chunk step_index: {step_index}")
-        if len(action_ids) != action_horizon:
-            raise ValueError(
-                f"DAgger oracle chunk must contain {action_horizon} actions, "
-                f"got {len(action_ids)} at step {step_index}"
-            )
-        try:
-            first_stop_index = action_ids.index(STOP_ACTION_ID)
-        except ValueError:
-            real_action_count = action_horizon
-        else:
-            if chunk_index != len(raw_chunks) - 1:
-                raise ValueError(
-                    "Only the final DAgger oracle chunk may contain stop"
-                )
-            real_action_count = first_stop_index + 1
-            if any(
-                action_id != STOP_ACTION_ID
-                for action_id in action_ids[first_stop_index:]
-            ):
-                raise ValueError(
-                    f"DAgger oracle chunk has an action after stop at step {step_index}"
-                )
-        if step_gap is not None and step_gap != action_horizon:
-            non_stop_action_count = len(actions) - 1
-            is_early_terminal_replan = bool(
-                0 < step_gap < action_horizon
-                and step_index == non_stop_action_count
-                and action_ids[0] == STOP_ACTION_ID
-            )
-            if not is_early_terminal_replan:
-                raise ValueError(f"Invalid DAgger oracle chunk step_index: {step_index}")
-        action_chunks.append(
-            {
-                "action_ids": action_ids,
-                "start_step": step_index,
-                "end_step": step_index + real_action_count - 1,
-                "real_action_count": real_action_count,
-                "texts": [action_id_to_str(action_id) for action_id in action_ids],
-            }
-        )
-        previous_step = step_index
-    if action_chunks[0]["start_step"] != 0:
-        raise ValueError("The first DAgger oracle chunk must start at step 0")
-    non_stop_action_count = len(actions) - 1
-    last_action_ids = action_chunks[-1]["action_ids"]
-    if STOP_ACTION_ID not in last_action_ids:
-        raise ValueError(
-            "The final DAgger oracle chunk must contain stop"
-        )
-    if previous_step + last_action_ids.index(STOP_ACTION_ID) != non_stop_action_count:
-        raise ValueError(
-            "DAgger final oracle stop is not aligned with the executed trajectory: "
-            f"last_step={previous_step}, oracle_stop_offset="
-            f"{last_action_ids.index(STOP_ACTION_ID)}, "
-            f"non_stop_actions={non_stop_action_count}"
-        )
-    return action_chunks
-
-
-def pad_terminal_action_ids(
-    action_ids: List[int],
-    action_horizon: int = DEFAULT_ACTION_HORIZON,
-) -> List[int]:
-    if len(action_ids) >= action_horizon:
-        return action_ids[:action_horizon]
-    if not action_ids or action_ids[-1] != STOP_ACTION_ID:
-        raise ValueError(
-            "Only terminal chunks ending in stop can be padded to "
-            f"{action_horizon} actions, got {action_ids}"
-        )
-    return action_ids + [STOP_ACTION_ID] * (action_horizon - len(action_ids))
-
-
-def load_subset_annotations(
-    selected_subset_list: List[str],
-    dataset_config: Dict[str, Dict[str, str]],
-    max_episodes_per_subset: int = None,
-    subset_seed: int = DEFAULT_SUBSET_SEED,
-) -> Dict[str, List[Dict[str, Any]]]:
-    annotations_by_subset = {}
-    for subset in selected_subset_list:
-        annotation_path = dataset_config[subset]["annotation_path"]
-        annotation = []
-        with open(annotation_path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                annotation.append(json.loads(line))
-        if max_episodes_per_subset is not None:
-            if max_episodes_per_subset <= 0:
-                raise ValueError(
-                    "max_episodes_per_subset must be positive, got "
-                    f"{max_episodes_per_subset}"
-                )
-            if max_episodes_per_subset > len(annotation):
-                raise ValueError(
-                    f"Requested {max_episodes_per_subset} episodes from {subset}, "
-                    f"but only {len(annotation)} are available"
-                )
-            random.Random(subset_seed).shuffle(annotation)
-            annotation = annotation[:max_episodes_per_subset]
-            print(
-                f"[{subset}] selected {len(annotation)} random episodes "
-                f"with subset_seed={subset_seed}"
-            )
-        annotations_by_subset[subset] = annotation
-    return annotations_by_subset
-
-
-def validate_keep_probability(value: float, name: str) -> float:
-    value = float(value)
-    if not 0.0 <= value <= 1.0:
-        raise ValueError(f"{name} must be in [0, 1], got {value}")
-    return value
-
-
-def action_chunk_contains_event(action_ids: List[int]) -> bool:
-    return any(action_id in EVENT_ACTION_IDS for action_id in action_ids)
-
-
-def ebs_action_chunk_keep_probability(
-    action_ids: List[int],
-    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
-    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
-) -> float:
-    if action_chunk_contains_event(action_ids):
-        return event_keep_prob
-    return background_keep_prob
-
-
-def compute_ebs_candidate_counts(
-    annotations_by_subset: Dict[str, List[Dict[str, Any]]],
-    action_horizon: int = DEFAULT_ACTION_HORIZON,
-) -> Counter:
-    candidate_counts = Counter()
-    for annotation in annotations_by_subset.values():
-        for episode_item in annotation:
-            if is_chunk_relabelled_dagger(episode_item):
-                continue
-            actions = [int(action_id) for action_id in episode_item["actions"]]
-            num_actions = len(actions)
-            dense_start = max(0, num_actions - action_horizon)
-            body_stop = max(0, dense_start - action_horizon + 1)
-            candidate_counts["terminal_dense"] += num_actions - dense_start
-            for start_step in range(body_stop):
-                action_ids = actions[start_step:start_step + action_horizon]
-                if action_chunk_contains_event(action_ids):
-                    candidate_counts["event_body"] += 1
-                else:
-                    candidate_counts["background_body"] += 1
-    return candidate_counts
-
-
-def print_ebs_sampling_summary(
-    candidate_counts: Counter,
-    event_keep_prob: float,
-    background_keep_prob: float,
-    tail_dense_keep_prob: float,
-    body_keep_advance: int,
-    action_horizon: int = DEFAULT_ACTION_HORIZON,
-) -> None:
-    print(
-        f"chunk_sampler={EBS_SAMPLER} "
-        f"event_keep_prob={event_keep_prob} "
-        f"background_keep_prob={background_keep_prob} "
-        f"tail_dense_keep_prob={tail_dense_keep_prob} "
-        f"tail_dense={action_horizon} "
-        f"terminal_buffer={action_horizon - 1} "
-        f"body_keep_advance={body_keep_advance}"
-    )
-    for class_name in ("event_body", "background_body", "terminal_dense"):
-        print(f"candidate_class {class_name} candidates={candidate_counts[class_name]}")
-
-
-def build_ebs_action_chunk_starts(
-    actions: List[int],
-    action_horizon: int = DEFAULT_ACTION_HORIZON,
-    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
-    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
-    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
-    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
-    rng: Optional[random.Random] = None,
-) -> List[int]:
-    action_horizon = max(1, int(action_horizon))
-    body_keep_advance = max(1, int(body_keep_advance))
-    event_keep_prob = validate_keep_probability(
-        event_keep_prob,
-        "event_keep_prob",
-    )
-    background_keep_prob = validate_keep_probability(
-        background_keep_prob,
-        "background_keep_prob",
-    )
-    tail_dense_keep_prob = validate_keep_probability(
-        tail_dense_keep_prob,
-        "tail_dense_keep_prob",
-    )
-    if rng is None:
-        rng = random.Random(DEFAULT_SEED)
-
-    num_actions = len(actions)
-    if num_actions <= 0:
-        raise ValueError(f"Episode action count must be positive, got {num_actions}")
-    if actions[-1] != STOP_ACTION_ID:
-        raise ValueError(f"Episode must end with stop, got last action {actions[-1]}")
-
-    dense_start = max(0, num_actions - action_horizon)
-    body_stop = max(0, dense_start - action_horizon + 1)
-    start_steps = set()
-
-    start_step = 0
-    while start_step < body_stop:
-        action_ids = actions[start_step:start_step + action_horizon]
-        keep_prob = ebs_action_chunk_keep_probability(
-            action_ids=action_ids,
-            event_keep_prob=event_keep_prob,
-            background_keep_prob=background_keep_prob,
-        )
-        if rng.random() < keep_prob:
-            start_steps.add(start_step)
-            start_step += body_keep_advance
-        else:
-            start_step += 1
-
-    for start_step in range(dense_start, num_actions):
-        if tail_dense_keep_prob >= 1.0 or rng.random() < tail_dense_keep_prob:
-            start_steps.add(start_step)
-
-    return sorted(start_steps)
-
-
-def build_action_chunks(
-    actions: List[int],
-    action_horizon: int = DEFAULT_ACTION_HORIZON,
-    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
-    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
-    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
-    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
-    pad_stop_to_horizon: bool = False,
-    rng: Optional[random.Random] = None,
-) -> List[Dict[str, Any]]:
-    start_steps = build_ebs_action_chunk_starts(
-        actions=actions,
-        action_horizon=action_horizon,
-        event_keep_prob=event_keep_prob,
-        background_keep_prob=background_keep_prob,
-        tail_dense_keep_prob=tail_dense_keep_prob,
-        body_keep_advance=body_keep_advance,
-        rng=rng,
-    )
-
-    action_chunks = []
-    for start_step in start_steps:
-        action_ids = actions[start_step:start_step + action_horizon]
-        real_action_count = len(action_ids)
-        if pad_stop_to_horizon and len(action_ids) < action_horizon:
-            action_ids = pad_terminal_action_ids(
-                action_ids=action_ids,
-                action_horizon=action_horizon,
-            )
-        action_chunks.append(
-            {
-                "action_ids": action_ids,
-                "start_step": start_step,
-                "end_step": start_step + real_action_count - 1,
-                "real_action_count": real_action_count,
-                "texts": [action_id_to_str(action_id) for action_id in action_ids],
-            }
-        )
-    return action_chunks
-
-
-def build_vln_images(
-    episode_image_list: List[str],
-    current_step: int,
-) -> List[str]:
-    current_frame_index = min(max(0, int(current_step)), len(episode_image_list) - 1)
-    return episode_image_list[:current_frame_index + 1]
-
-
-def process_dataset(
-    selected_subset_list: List[str],
-    dataset_config: Dict[str, Dict[str, str]],
-    annotations_by_subset: Dict[str, List[Dict[str, Any]]],
-    input_root: str,
-    pad_stop_to_horizon: bool = False,
-    seed: int = DEFAULT_SEED,
-    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
-    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
-    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
-    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
-    output_handle=None,
-):
-    data2save = []
-    total_samples = 0
-    rng = random.Random(seed)
-    seen_sample_keys: Set[Tuple[str, str, int]] = set()
-    for subset in selected_subset_list:
-        subset_config = dataset_config[subset]
-        image_path = subset_config["image_path"]
-        dataset_label = subset_config["dataset_label"]
-        frame_index_fn = subset_config["frame_index_fn"]
-        annotation = annotations_by_subset[subset]
-
-        subset_sample_start = total_samples
-        progress = tqdm(annotation, desc=subset, dynamic_ncols=True)
-
-        for episode_item in progress:
-            episode_id = episode_item["episode_id"]
-            instruction = episode_item["instruction"]
-            chunk_relabelled_dagger = is_chunk_relabelled_dagger(episode_item)
-            if subset == "dagger" and not chunk_relabelled_dagger:
-                raise ValueError(
-                    f"DAgger episode {episode_id} has no four-action oracle relabels; "
-                    "recollect it with the current collector."
-                )
-            actions = [int(action_id) for action_id in episode_item["actions"]]
-            assert actions[-1] == 0
-
-            episode_image_dir = annotation_image_id(episode_item)
-            episode_image_path = os.path.join(image_path, episode_image_dir)
-
-            episode_image_list = load_episode_images(
-                episode_image_path=episode_image_path,
-                frame_index_fn=frame_index_fn,
-                input_root=input_root,
-                num_actions=len(actions),
-                append_terminal_frame=not chunk_relabelled_dagger,
-            )
-
-            if chunk_relabelled_dagger:
-                # Collection already records one correctly relabelled oracle
-                # chunk per real model decision (normally stride 4).  Preserve
-                # all raw DAgger decisions here; never rebuild labels by
-                # slicing the mixed-policy executed trajectory.
-                action_chunks = build_dagger_oracle_action_chunks(episode_item)
-            else:
-                action_chunks = build_action_chunks(
-                    actions,
-                    event_keep_prob=event_keep_prob,
-                    background_keep_prob=background_keep_prob,
-                    tail_dense_keep_prob=tail_dense_keep_prob,
-                    body_keep_advance=body_keep_advance,
-                    pad_stop_to_horizon=pad_stop_to_horizon,
-                    rng=rng,
-                )
-
-            for action_chunk in action_chunks:
-                sample_key = (subset, str(episode_id), action_chunk["start_step"])
-                if sample_key in seen_sample_keys:
-                    raise ValueError(
-                        "Duplicate training sample key generated: "
-                        f"dataset={sample_key[0]} episode_id={sample_key[1]} "
-                        f"step_index={sample_key[2]}"
-                    )
-                seen_sample_keys.add(sample_key)
-
-                user_images = build_vln_images(
-                    episode_image_list=episode_image_list,
-                    current_step=action_chunk["start_step"],
-                )
-
-                sample = {
-                    "instruction": instruction,
-                    "action_sequence": list(action_chunk["texts"]),
-                    "images": list(user_images),
-                    "episode_id": str(episode_id),
-                    # Keep the label identical for paired ScaleVLN rewrite
-                    # ablation so the published samples differ only in instruction.
-                    "dataset": dataset_label,
-                    "step_index": action_chunk["start_step"],
-                    "end_step": action_chunk["end_step"],
-                    "real_action_count": action_chunk["real_action_count"],
-                    # Auxiliary transition losses use the executable prefix while
-                    # sharing the normal policy-training row.
-                    "history_actions": [
-                        action_id_to_str(action_id)
-                        for action_id in actions[: action_chunk["start_step"]]
-                    ],
-                }
-                if episode_item.get("trajectory_id") is not None:
-                    sample["trajectory_id"] = str(episode_item["trajectory_id"])
-                if output_handle is None:
-                    data2save.append(sample)
-                else:
-                    write_jsonl_item(output_handle, sample)
-                total_samples += 1
-
-        subset_sample_count = total_samples - subset_sample_start
-        print(
-            f"[{subset}] episodes={len(annotation)} samples={subset_sample_count}"
-        )
-
-    if output_handle is None:
-        return data2save
-    return total_samples
-
-
-def main(
-    selected_subset_list: List[str],
-    input_root: str,
-    output_path: str,
-    max_episodes_per_subset: int = None,
-    subset_seed: int = DEFAULT_SUBSET_SEED,
-    pad_stop_to_horizon: bool = False,
-    seed: int = DEFAULT_SEED,
-    event_keep_prob: float = DEFAULT_EVENT_KEEP_PROB,
-    background_keep_prob: float = DEFAULT_BACKGROUND_KEEP_PROB,
-    tail_dense_keep_prob: float = DEFAULT_TAIL_DENSE_KEEP_PROB,
-    body_keep_advance: int = DEFAULT_BODY_KEEP_ADVANCE,
-) -> None:
-    dataset_config = build_dataset_config(input_root)
-    validate_selected_subsets(selected_subset_list, dataset_config)
-    annotations_by_subset = load_subset_annotations(
-        selected_subset_list=selected_subset_list,
-        dataset_config=dataset_config,
-        max_episodes_per_subset=max_episodes_per_subset,
-        subset_seed=subset_seed,
-    )
-
-    event_keep_prob = validate_keep_probability(
-        event_keep_prob,
-        "event_keep_prob",
-    )
-    background_keep_prob = validate_keep_probability(
-        background_keep_prob,
-        "background_keep_prob",
-    )
-    tail_dense_keep_prob = validate_keep_probability(
-        tail_dense_keep_prob,
-        "tail_dense_keep_prob",
-    )
-    candidate_counts = compute_ebs_candidate_counts(
-        annotations_by_subset=annotations_by_subset,
-    )
-    print_ebs_sampling_summary(
-        candidate_counts=candidate_counts,
-        event_keep_prob=event_keep_prob,
-        background_keep_prob=background_keep_prob,
-        tail_dense_keep_prob=tail_dense_keep_prob,
-        body_keep_advance=body_keep_advance,
-    )
-
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    descriptor, temporary_path = tempfile.mkstemp(
-        prefix=f".{os.path.basename(output_path)}.",
+def create_temp_path(output_path: Path) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
         suffix=".tmp",
-        dir=output_dir or ".",
-        text=True,
+        dir=output_path.parent,
     )
-    total_samples = 0
+    os.close(descriptor)
+    return Path(raw_path)
+
+
+def build_training_jsonl(
+    input_root: Path,
+    output_path: Path,
+    seed: int,
+    overwrite: bool,
+) -> dict[str, object]:
+    if seed != DEFAULT_SEED:
+        raise ValueError(f"This dataset is fixed to seed={DEFAULT_SEED}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite {output_path}; pass --overwrite"
+        )
+
+    episodes = load_episodes(input_root)
+    temporary = create_temp_path(output_path)
+    selection_hash = hashlib.sha256()
+    dataset_counts = Counter()
+    audit = Counter()
+    row_count = 0
+
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output_handle:
-            total_samples += process_dataset(
-                selected_subset_list=selected_subset_list,
-                dataset_config=dataset_config,
-                annotations_by_subset=annotations_by_subset,
-                input_root=input_root,
-                pad_stop_to_horizon=pad_stop_to_horizon,
-                seed=seed,
-                event_keep_prob=event_keep_prob,
-                background_keep_prob=background_keep_prob,
-                tail_dense_keep_prob=tail_dense_keep_prob,
-                body_keep_advance=body_keep_advance,
-                output_handle=output_handle,
+        with temporary.open("wb") as output:
+            for episode in tqdm(
+                episodes,
+                desc="maneuver_h12",
+                dynamic_ncols=True,
+            ):
+                selected, episode_audit = select_starts(
+                    episode.dataset,
+                    episode.episode_id,
+                    episode.actions,
+                    seed,
+                )
+                audit.update(episode_audit)
+                images = load_image_paths(input_root, episode)
+                history = [ACTION_NAMES[action] for action in episode.actions]
+
+                for start, raw_reasons in selected.items():
+                    reasons = sorted(raw_reasons, key=reason_sort_key)
+                    target = action_target(episode.actions, start)
+                    target_chars = "".join(ACTION_CHARS[action] for action in target)
+                    selection_row = {
+                        "action_sequence": target_chars,
+                        "dataset": episode.dataset,
+                        "episode_id": episode.episode_id,
+                        "reasons": reasons,
+                        "step_index": start,
+                    }
+                    selection_hash.update(
+                        (canonical_json(selection_row) + "\n").encode("utf-8")
+                    )
+
+                    real_action_count = (
+                        target.index(STOP) + 1 if STOP in target else ACTION_HORIZON
+                    )
+                    training_row = {
+                        "instruction": episode.instruction,
+                        "action_sequence": [ACTION_NAMES[action] for action in target],
+                        "images": images[: start + 1],
+                        "episode_id": episode.episode_id,
+                        "dataset": episode.dataset,
+                        "step_index": start,
+                        "end_step": start + real_action_count - 1,
+                        "real_action_count": real_action_count,
+                        "history_actions": history[:start],
+                    }
+                    output.write(
+                        (
+                            json.dumps(
+                                training_row,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                    row_count += 1
+                    dataset_counts[episode.dataset] += 1
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, 0o644)
+
+        selection_sha = selection_hash.hexdigest()
+        if row_count != EXPECTED_ROWS:
+            raise AssertionError(f"Row mismatch: {row_count} != {EXPECTED_ROWS}")
+        if selection_sha != EXPECTED_SELECTION_SHA256:
+            raise AssertionError(
+                f"Selection mismatch: {selection_sha} != "
+                f"{EXPECTED_SELECTION_SHA256}"
             )
-            output_handle.flush()
-            os.fsync(output_handle.fileno())
-        os.chmod(temporary_path, 0o644)
-        os.replace(temporary_path, output_path)
+        training_sha = sha256_file(temporary)
+        if training_sha != EXPECTED_TRAINING_SHA256:
+            raise AssertionError(
+                f"Training JSONL mismatch: {training_sha} != "
+                f"{EXPECTED_TRAINING_SHA256}"
+            )
+
+        os.replace(temporary, output_path)
+        result = {
+            "output_path": str(output_path),
+            "rows": row_count,
+            "dataset_counts": dict(dataset_counts),
+            "sha256": training_sha,
+            "selection_sha256": selection_sha,
+            "anchor_events": dict(audit),
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return result
     finally:
-        if os.path.exists(temporary_path):
-            os.remove(temporary_path)
-
-    print(f"total number of samples = {total_samples}")
+        temporary.unlink(missing_ok=True)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dataset_name",
-        nargs="+",
-        default=["r2r"],
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate the final R2R+RxR maneuver-phase H12 JSONL."
     )
     parser.add_argument(
         "--input_root",
-        type=str,
-        default="/workspace/data2/dataset/PanoVLN",
+        type=Path,
+        default=Path("/workspace/data2/dataset/PanoVLN"),
     )
     parser.add_argument(
         "--output_path",
-        type=str,
-        default="panovln_train_data.jsonl",
-    )
-    parser.add_argument(
-        "--max_episodes_per_subset",
-        type=int,
-        default=None,
-        help=(
-            "If set, deterministically shuffle each source annotation with "
-            "subset_seed and keep the requested prefix. Reusing subset_seed "
-            "makes different subset sizes nested."
+        type=Path,
+        default=Path(
+            "/workspace/data2/dataset/ablation/12-action/"
+            "train_r2r_rxr_maneuver_h12_seed42.jsonl"
         ),
     )
-    parser.add_argument(
-        "--subset_seed",
-        type=int,
-        default=DEFAULT_SUBSET_SEED,
-        help="Random seed for deterministic episode subset selection.",
-    )
-    parser.add_argument(
-        "--pad_stop_to_horizon",
-        action="store_true",
-        help="Pad terminal chunks ending in stop to the action horizon with stop.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=DEFAULT_SEED,
-        help="Random seed for EBS chunk sampling.",
-    )
-    parser.add_argument(
-        "--event_keep_prob",
-        type=float,
-        default=DEFAULT_EVENT_KEEP_PROB,
-        help=(
-            "EBS keep probability for body chunks containing left/right events."
-        ),
-    )
-    parser.add_argument(
-        "--background_keep_prob",
-        type=float,
-        default=DEFAULT_BACKGROUND_KEEP_PROB,
-        help=(
-            "EBS keep probability for all-forward body chunks."
-        ),
-    )
-    parser.add_argument(
-        "--tail_dense_keep_prob",
-        type=float,
-        default=DEFAULT_TAIL_DENSE_KEEP_PROB,
-        help=(
-            "Keep probability for each terminal dense chunk, including the "
-            "final stop-only chunk."
-        ),
-    )
-    parser.add_argument(
-        "--body_keep_advance",
-        type=int,
-        default=DEFAULT_BODY_KEEP_ADVANCE,
-        help=(
-            "Number of start steps to advance after keeping a body chunk. "
-            "Defaults to the action horizon, preserving the original "
-            "non-overlapping body sampling behavior."
-        ),
-    )
-    args = parser.parse_args()
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--overwrite", action="store_true")
+    return parser.parse_args()
 
-    main(
-        selected_subset_list=args.dataset_name,
-        input_root=args.input_root,
-        output_path=args.output_path,
-        max_episodes_per_subset=args.max_episodes_per_subset,
-        subset_seed=args.subset_seed,
-        pad_stop_to_horizon=args.pad_stop_to_horizon,
+
+def main() -> None:
+    args = parse_args()
+    build_training_jsonl(
+        input_root=args.input_root.resolve(),
+        output_path=args.output_path.resolve(),
         seed=args.seed,
-        event_keep_prob=args.event_keep_prob,
-        background_keep_prob=args.background_keep_prob,
-        tail_dense_keep_prob=args.tail_dense_keep_prob,
-        body_keep_advance=args.body_keep_advance,
+        overwrite=args.overwrite,
     )
+
+
+if __name__ == "__main__":
+    main()
