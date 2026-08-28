@@ -6,7 +6,7 @@ model:
   cache_dir: null
   image_token: "<|image_pad|>"
   model_max_length: null
-  action_sequence_length: 12       # ablation: 1 / 2 / 4 / 8 / 12 / 16; saved to model config.json
+  action_sequence_length: 24       # ablation: 1 / 2 / 4 / 6 / 8 / 10 / 12 / 14 / 16 / 18 / 24; saved to model config.json
   view_mode: "panorama"           # "panorama" or runtime ERP-to-"perspective" projection
   perspective_xfov_degrees: 90.0
   perspective_yfov_degrees: 90.0
@@ -32,7 +32,7 @@ model:
   pbo_head_hidden_size: 512
 
 data:
-  train_jsonl: "/workspace/data2/dataset/ablation/12-action/train_r2r_rxr_maneuver_h12_seed42.jsonl"
+  train_jsonl: "/workspace/data2/dataset/ablation/action_sequence/train_r2r_rxr_action_sequence_length_24.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -50,7 +50,7 @@ data:
     mixing_strategy: "task"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/12-action/sampling/r2r_rxr_maneuver_h12_seed42"
+  output_dir: "/workspace/data2/model/ablation_new/action_sequence/erp_length24"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4

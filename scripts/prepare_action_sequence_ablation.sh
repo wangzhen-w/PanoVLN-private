@@ -13,7 +13,7 @@ OUTPUT_DIR="/workspace/data2/dataset/ablation/action_sequence"
     --input-root "$INPUT_ROOT" \
     --output-dir "$OUTPUT_DIR" \
     --datasets r2r rxr \
-    --lengths 1 2 4 6 8 10 12 14 16 \
+    --lengths 1 2 4 6 8 10 12 14 16 18 24 \
     --sample-count 512000 \
     --seed 42 \
     "$@"
