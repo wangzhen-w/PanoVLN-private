@@ -19,12 +19,13 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 INPUT_ROOT="/workspace/data2/dataset/PanoVLN"
-OUTPUT_DIR="/workspace/data2/dataset/ablation/12-action"
-OUTPUT_PATH="${OUTPUT_DIR}/train_r2r_rxr_maneuver_h12_seed42.jsonl"
+OUTPUT_PATH="/workspace/data2/dataset/ablation/12-action/train_r2r_rxr_stride6_h12_seed42.jsonl"
+DATASET_NAMES=(r2r rxr)
 
 PREPARE_CMD=(
     "${PYTHON_BIN}" src/data/prepare_training_data.py
     --input_root "${INPUT_ROOT}"
+    --dataset_name "${DATASET_NAMES[@]}"
     --output_path "${OUTPUT_PATH}"
     --seed 42
 )
@@ -32,9 +33,10 @@ PREPARE_CMD+=("$@")
 
 echo "INPUT_ROOT: ${INPUT_ROOT}"
 echo "OUTPUT_PATH: ${OUTPUT_PATH}"
-echo "DATASETS: r2r rxr"
+echo "DATASET_NAMES: ${DATASET_NAMES[*]}"
 echo "ACTION_HORIZON: 12"
-echo "RULE_VERSION: maneuver_h12"
+echo "BODY_STRIDE: 6"
+echo "RULE: stride6 + multi-turn-onset + long-forward + terminal-dense"
 printf 'Running:'
 printf ' %q' "${PREPARE_CMD[@]}"
 printf '\n'

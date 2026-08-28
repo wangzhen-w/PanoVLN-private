@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the R2R+RxR 12-action maneuver-phase training JSONL."""
+"""Generate stride-6, 12-action R2R/RxR training JSONL data."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 
 ACTION_HORIZON = 12
+BODY_STRIDE = 6
 DEFAULT_SEED = 42
 STOP, FORWARD, LEFT, RIGHT = 0, 1, 2, 3
 TURN_ACTIONS = frozenset({LEFT, RIGHT})
@@ -27,55 +28,24 @@ ACTION_NAMES = {
     LEFT: "left",
     RIGHT: "right",
 }
-ACTION_CHARS = {
-    STOP: "S",
-    FORWARD: "F",
-    LEFT: "L",
-    RIGHT: "R",
-}
 DATASET_ORDER = ("r2r", "rxr")
-STOP_BINS = (
-    (1, 2),
-    (3, 4),
-    (5, 6),
-    (7, 8),
-    (9, 10),
-    (11, 12),
-)
-REASON_ORDER = {
-    "episode_start": 0,
-    "turn_onset": 1,
-    "complete_centered": 2,
-    "long_turn_entry": 3,
-    "long_turn_exit": 4,
-    "forward_center": 5,
-}
 FRAME_PATTERN = re.compile(r"frame_(\d+)\.png")
 
 EXPECTED_SOURCES = {
     "r2r": {
-        "sha256": "7338528cb9ffe55283c7c9faf817c75e02be3e24a51da35ef6dfd40c0a38aaaa",
-        "bytes": 3_340_690,
         "episodes": 10_692,
         "starts": 660_055,
     },
     "rxr": {
-        "sha256": "b04f348f2e5d9ca3d5e037e762f7ecd87adc63891568d0202df088cc8dc78891",
-        "bytes": 14_259_993,
-        "episodes": 18_057,
-        "starts": 1_897_951,
+        "episodes": 18_063,
+        "starts": 1_898_944,
     },
 }
-DELETED_RXR_EPISODES = frozenset(
-    {"18639", "18640", "18641", "19236", "19243", "19244"}
-)
-EXPECTED_ROWS = 788_847
-EXPECTED_SELECTION_SHA256 = (
-    "a0d3a213f2ae586673e79a3a971ab1b2ce799a33dc5e1ed61048fb71c6ef5eeb"
-)
-EXPECTED_TRAINING_SHA256 = (
-    "859186155df5cf778076802c3ea82500f6c1dd7184bc4637b7a2a4841784a609"
-)
+EXPECTED_ROWS = {
+    ("r2r",): 243_096,
+    ("rxr",): 576_047,
+    ("r2r", "rxr"): 819_143,
+}
 
 
 @dataclass(frozen=True)
@@ -98,23 +68,6 @@ class ActionBlock:
     @property
     def length(self) -> int:
         return self.end - self.start
-
-
-def canonical_json(value: object) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def stable_choice(options: Sequence[int], *parts: object) -> int:
@@ -154,19 +107,6 @@ def validate_actions(actions: Sequence[int], context: str) -> None:
         raise ValueError(f"{context}: invalid action IDs {invalid}")
     if int(actions[-1]) != STOP or STOP in actions[:-1]:
         raise ValueError(f"{context}: actions must contain exactly one final stop")
-    for index, (left, right) in enumerate(zip(actions, actions[1:])):
-        if left in TURN_ACTIONS and right in TURN_ACTIONS and left != right:
-            raise ValueError(
-                f"{context}: immediate L/R reversal at action boundary {index}"
-            )
-    turn_lengths = [
-        block.length for block in maximal_blocks(actions, TURN_ACTIONS)
-    ]
-    if turn_lengths and max(turn_lengths) > ACTION_HORIZON:
-        raise ValueError(
-            f"{context}: turn block length {max(turn_lengths)} exceeds "
-            f"{ACTION_HORIZON}"
-        )
 
 
 def action_target(actions: Sequence[int], start: int) -> tuple[int, ...]:
@@ -192,34 +132,6 @@ def add_reason(
     selected.setdefault(start, set()).add(reason)
 
 
-def centered_turn_options(
-    actions: Sequence[int], block: ActionBlock
-) -> tuple[int, ...]:
-    if block.length > ACTION_HORIZON - 2:
-        return ()
-    stop_index = len(actions) - 1
-    if (
-        block.start == 0
-        or block.end >= stop_index
-        or actions[block.start - 1] != FORWARD
-        or actions[block.end] != FORWARD
-    ):
-        return ()
-
-    low = max(0, block.end - (ACTION_HORIZON - 1))
-    high = block.start - 1
-    candidates: list[tuple[int, int]] = []
-    for start in range(low, high + 1):
-        before = block.start - start
-        after = start + ACTION_HORIZON - block.end
-        if before >= 1 and after >= 1:
-            candidates.append((start, abs(before - after)))
-    if not candidates:
-        return ()
-    best = min(score for _, score in candidates)
-    return tuple(start for start, score in candidates if score == best)
-
-
 def centered_forward_options(block: ActionBlock) -> tuple[int, ...]:
     if block.action != FORWARD or block.length < ACTION_HORIZON:
         return ()
@@ -236,69 +148,27 @@ def centered_forward_options(block: ActionBlock) -> tuple[int, ...]:
     )
 
 
-def reason_sort_key(reason: str) -> tuple[int, str]:
-    if reason.startswith("stop_bin_"):
-        return (6, reason)
-    return (REASON_ORDER[reason], reason)
-
-
 def select_starts(
     dataset: str,
     episode_id: str,
     actions: Sequence[int],
     seed: int,
 ) -> tuple[dict[int, set[str]], Counter]:
-    """Apply only the final H=12 maneuver-phase sampling strategy."""
+    """Apply the final stride-6 H=12 sampling strategy."""
 
     validate_actions(actions, f"{dataset}:{episode_id}")
     selected: dict[int, set[str]] = {}
     audit = Counter()
 
-    add_reason(selected, actions, 0, "episode_start")
-    audit["episode_start"] += 1
+    for start in range(0, len(actions), BODY_STRIDE):
+        add_reason(selected, actions, start, "stride6")
+        audit["stride6"] += 1
 
     for block in maximal_blocks(actions, TURN_ACTIONS):
         audit["turn_blocks"] += 1
-        add_reason(selected, actions, block.start, "turn_onset")
-        audit["turn_onset"] += 1
-
-        if block.length <= 10:
-            options = centered_turn_options(actions, block)
-            if not options:
-                continue
-            center = stable_choice(
-                options,
-                seed,
-                dataset,
-                episode_id,
-                block.start,
-                block.end - 1,
-                "center_tie",
-            )
-            keep_center = block.length > 1
-            if block.length == 1:
-                approach = actions[center:block.start]
-                keep_center = bool(approach) and all(
-                    action == FORWARD for action in approach
-                )
-                audit[
-                    "length1_direct_center"
-                    if keep_center
-                    else "length1_center_skipped"
-                ] += 1
-            if keep_center:
-                add_reason(selected, actions, center, "complete_centered")
-                audit["complete_centered"] += 1
-        else:
-            entry = block.start - 1
-            if entry >= 0 and actions[entry] == FORWARD:
-                add_reason(selected, actions, entry, "long_turn_entry")
-                audit["long_turn_entry"] += 1
-            if block.length == 12:
-                exit_start = block.end - 11
-                if block.end < len(actions) - 1 and actions[block.end] == FORWARD:
-                    add_reason(selected, actions, exit_start, "long_turn_exit")
-                    audit["long_turn_exit"] += 1
+        if block.length >= 2:
+            add_reason(selected, actions, block.start, "multi_turn_onset")
+            audit["multi_turn_onset"] += 1
 
     for block in maximal_blocks(actions, frozenset({FORWARD})):
         options = centered_forward_options(block)
@@ -316,46 +186,42 @@ def select_starts(
         add_reason(selected, actions, center, "forward_center")
         audit["forward_center"] += 1
 
-    for bin_index, positions in enumerate(STOP_BINS):
-        starts = tuple(len(actions) - position for position in positions)
-        existing = tuple(start for start in starts if start in selected)
-        if existing:
-            audit["stop_bin_precovered"] += 1
-            audit["stop_bin_multiple"] += len(existing) > 1
-            continue
-        position = stable_choice(
-            positions,
-            seed,
-            dataset,
-            episode_id,
-            "stop_pair6",
-            bin_index,
-        )
+    for position in range(1, ACTION_HORIZON + 1):
         start = len(actions) - position
-        add_reason(
-            selected,
-            actions,
-            start,
-            f"stop_bin_{bin_index + 1}_pos_{position}",
-        )
-        audit["stop_supplement"] += 1
+        add_reason(selected, actions, start, "terminal_dense")
+        audit["terminal_dense"] += 1
 
     return dict(sorted(selected.items())), audit
 
 
-def load_episodes(input_root: Path) -> list[Episode]:
+def normalize_dataset_names(dataset_names: Sequence[str]) -> tuple[str, ...]:
+    requested = tuple(str(name).lower() for name in dataset_names)
+    if not requested:
+        raise ValueError("At least one dataset must be selected")
+    duplicates = sorted(
+        name for name, count in Counter(requested).items() if count > 1
+    )
+    if duplicates:
+        raise ValueError(f"Duplicate datasets: {duplicates}")
+    unsupported = sorted(set(requested) - set(DATASET_ORDER))
+    if unsupported:
+        raise ValueError(
+            f"Unsupported datasets {unsupported}; choose from {list(DATASET_ORDER)}"
+        )
+    return tuple(name for name in DATASET_ORDER if name in requested)
+
+
+def load_episodes(
+    input_root: Path,
+    dataset_names: Sequence[str] = DATASET_ORDER,
+) -> list[Episode]:
+    normalized_names = normalize_dataset_names(dataset_names)
     episodes: list[Episode] = []
     seen: set[tuple[str, str]] = set()
-    for dataset in DATASET_ORDER:
+    for dataset in normalized_names:
         path = input_root / "sub_dataset" / f"{dataset}.jsonl"
         raw = path.read_bytes()
         expected = EXPECTED_SOURCES[dataset]
-        digest = hashlib.sha256(raw).hexdigest()
-        if len(raw) != expected["bytes"] or digest != expected["sha256"]:
-            raise ValueError(
-                f"Source fingerprint mismatch for {path}: "
-                f"bytes={len(raw)} sha256={digest}"
-            )
 
         starts = 0
         count = 0
@@ -366,8 +232,6 @@ def load_episodes(input_root: Path) -> list[Episode]:
             if key in seen:
                 raise ValueError(f"Duplicate episode at {path}:{line_number}: {key}")
             seen.add(key)
-            if dataset == "rxr" and episode_id in DELETED_RXR_EPISODES:
-                raise ValueError(f"Deleted reversal episode remains: {key}")
 
             actions = tuple(int(value) for value in row["actions"])
             validate_actions(actions, f"{path}:{line_number}")
@@ -428,18 +292,19 @@ def build_training_jsonl(
     output_path: Path,
     seed: int,
     overwrite: bool,
+    dataset_names: Sequence[str] = DATASET_ORDER,
 ) -> dict[str, object]:
     if seed != DEFAULT_SEED:
         raise ValueError(f"This dataset is fixed to seed={DEFAULT_SEED}")
+    normalized_names = normalize_dataset_names(dataset_names)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not overwrite:
         raise FileExistsError(
             f"Refusing to overwrite {output_path}; pass --overwrite"
         )
 
-    episodes = load_episodes(input_root)
+    episodes = load_episodes(input_root, normalized_names)
     temporary = create_temp_path(output_path)
-    selection_hash = hashlib.sha256()
     dataset_counts = Counter()
     audit = Counter()
     row_count = 0
@@ -448,7 +313,7 @@ def build_training_jsonl(
         with temporary.open("wb") as output:
             for episode in tqdm(
                 episodes,
-                desc="maneuver_h12",
+                desc="stride6_h12",
                 dynamic_ncols=True,
             ):
                 selected, episode_audit = select_starts(
@@ -461,20 +326,8 @@ def build_training_jsonl(
                 images = load_image_paths(input_root, episode)
                 history = [ACTION_NAMES[action] for action in episode.actions]
 
-                for start, raw_reasons in selected.items():
-                    reasons = sorted(raw_reasons, key=reason_sort_key)
+                for start in selected:
                     target = action_target(episode.actions, start)
-                    target_chars = "".join(ACTION_CHARS[action] for action in target)
-                    selection_row = {
-                        "action_sequence": target_chars,
-                        "dataset": episode.dataset,
-                        "episode_id": episode.episode_id,
-                        "reasons": reasons,
-                        "step_index": start,
-                    }
-                    selection_hash.update(
-                        (canonical_json(selection_row) + "\n").encode("utf-8")
-                    )
 
                     real_action_count = (
                         target.index(STOP) + 1 if STOP in target else ACTION_HORIZON
@@ -506,28 +359,16 @@ def build_training_jsonl(
             os.fsync(output.fileno())
         os.chmod(temporary, 0o644)
 
-        selection_sha = selection_hash.hexdigest()
-        if row_count != EXPECTED_ROWS:
-            raise AssertionError(f"Row mismatch: {row_count} != {EXPECTED_ROWS}")
-        if selection_sha != EXPECTED_SELECTION_SHA256:
-            raise AssertionError(
-                f"Selection mismatch: {selection_sha} != "
-                f"{EXPECTED_SELECTION_SHA256}"
-            )
-        training_sha = sha256_file(temporary)
-        if training_sha != EXPECTED_TRAINING_SHA256:
-            raise AssertionError(
-                f"Training JSONL mismatch: {training_sha} != "
-                f"{EXPECTED_TRAINING_SHA256}"
-            )
+        expected_rows = EXPECTED_ROWS[normalized_names]
+        if row_count != expected_rows:
+            raise AssertionError(f"Row mismatch: {row_count} != {expected_rows}")
 
         os.replace(temporary, output_path)
         result = {
             "output_path": str(output_path),
+            "datasets": list(normalized_names),
             "rows": row_count,
             "dataset_counts": dict(dataset_counts),
-            "sha256": training_sha,
-            "selection_sha256": selection_sha,
             "anchor_events": dict(audit),
         }
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
@@ -538,7 +379,7 @@ def build_training_jsonl(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate the final R2R+RxR maneuver-phase H12 JSONL."
+        description="Generate stride-6 H12 R2R/RxR training JSONL data."
     )
     parser.add_argument(
         "--input_root",
@@ -546,11 +387,18 @@ def parse_args() -> argparse.Namespace:
         default=Path("/workspace/data2/dataset/PanoVLN"),
     )
     parser.add_argument(
+        "--dataset_name",
+        nargs="+",
+        choices=DATASET_ORDER,
+        default=list(DATASET_ORDER),
+        help="Dataset subsets to include (default: r2r rxr).",
+    )
+    parser.add_argument(
         "--output_path",
         type=Path,
         default=Path(
             "/workspace/data2/dataset/ablation/12-action/"
-            "train_r2r_rxr_maneuver_h12_seed42.jsonl"
+            "train_r2r_rxr_stride6_h12_seed42.jsonl"
         ),
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -565,6 +413,7 @@ def main() -> None:
         output_path=args.output_path.resolve(),
         seed=args.seed,
         overwrite=args.overwrite,
+        dataset_names=args.dataset_name,
     )
 
 
