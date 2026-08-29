@@ -25,7 +25,7 @@ from typing import Any, Iterable, Sequence
 DEFAULT_INPUT_ROOT = Path("/workspace/code/a_property/dataset/PanoVLN")
 DEFAULT_OUTPUT_DIR = Path("/workspace/data2/dataset/ablation/action_sequence")
 DEFAULT_DATASETS = ("r2r", "rxr")
-DEFAULT_ACTION_SEQUENCE_LENGTHS = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 24)
+DEFAULT_ACTION_SEQUENCE_LENGTHS = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 24, 36)
 DEFAULT_SAMPLE_COUNT = 512_000
 DEFAULT_SEED = 42
 STOP_ACTION_ID = 0
