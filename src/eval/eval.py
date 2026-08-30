@@ -143,6 +143,32 @@ def resolve_actions_per_replan(
     return validate_action_sequence_length(actions_per_replan)
 
 
+def select_actions_for_replan(
+    action_ids: Sequence[int],
+    actions_per_replan: int,
+    complete_action_event: bool = False,
+) -> List[int]:
+    actions_per_replan = validate_action_sequence_length(actions_per_replan)
+    action_ids = list(action_ids)
+    if not action_ids:
+        return []
+
+    if STOP_ACTION_ID in action_ids:
+        action_ids = action_ids[:action_ids.index(STOP_ACTION_ID) + 1]
+
+    end_index = min(actions_per_replan, len(action_ids))
+    if complete_action_event and 0 < end_index < len(action_ids):
+        boundary_action_id = action_ids[end_index - 1]
+        while (
+            end_index < len(action_ids)
+            and boundary_action_id != STOP_ACTION_ID
+            and action_ids[end_index] == boundary_action_id
+        ):
+            end_index += 1
+
+    return action_ids[:end_index]
+
+
 def build_eval_messages(
     instruction: str,
     images: List[Image.Image],
@@ -388,6 +414,7 @@ def evaluate_agent(
     attn_implementation,
     early_stop_max_steps,
     actions_per_replan,
+    complete_action_event,
 ) -> None:
     done_pairs = _load_done_pairs(result_path)
     pending_episodes = _filter_pending_episodes(list(dataset.episodes), done_pairs)
@@ -415,6 +442,7 @@ def evaluate_agent(
         save_topdown=save_topdown,
         attn_implementation=attn_implementation,
         actions_per_replan=actions_per_replan,
+        complete_action_event=complete_action_event,
     )
 
     early_stop_max_steps = max(0, int(early_stop_max_steps))
@@ -476,6 +504,7 @@ class PanoVLN_Agent(Agent):
         save_topdown=False,
         attn_implementation="sdpa",
         actions_per_replan=None,
+        complete_action_event=False,
     ):
         
         print("Initialize PanoVLN")
@@ -524,6 +553,7 @@ class PanoVLN_Agent(Agent):
             self.action_sequence_length,
             actions_per_replan,
         )
+        self.complete_action_event = bool(complete_action_event)
         self.view_mode = normalize_vln_view_mode(
             getattr(self.model.config, "view_mode", DEFAULT_VLN_VIEW_MODE)
         )
@@ -595,6 +625,7 @@ class PanoVLN_Agent(Agent):
             f"(attn_implementation={self.attn_implementation}, "
             f"action_sequence_length={self.action_sequence_length}, "
             f"actions_per_replan={self.actions_per_replan}, "
+            f"complete_action_event={self.complete_action_event}, "
             f"view_mode={self.view_mode}, pbo_enabled={self.pbo_enabled})"
         )
         
@@ -723,11 +754,13 @@ class PanoVLN_Agent(Agent):
         return navigation, action_ids
 
     def _build_pending_action_queue(self, action_ids):
-        action_ids = list(action_ids[:self.actions_per_replan])
+        action_ids = select_actions_for_replan(
+            action_ids,
+            actions_per_replan=self.actions_per_replan,
+            complete_action_event=self.complete_action_event,
+        )
         if not action_ids:
             return [STOP_ACTION_ID]
-        if STOP_ACTION_ID in action_ids:
-            return action_ids[:action_ids.index(STOP_ACTION_ID) + 1]
         return action_ids
 
     def finalize_episode(self):
@@ -829,6 +862,15 @@ def main():
             "when omitted, use model.config.action_sequence_length"
         ),
     )
+    parser.add_argument(
+        "--complete-action-event",
+        type=str2bool,
+        default=False,
+        help=(
+            "when an actions-per-replan boundary splits a consecutive run of "
+            "the same action, execute the rest of that run before replanning"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="random seed for python, numpy, and torch")
     args = parser.parse_args()
 
@@ -876,7 +918,8 @@ def main():
     evaluate_agent(config, args.split_id, dataset_split, args.model_path, args.lora_path, args.result_path,
                 args.forward_distance, args.turn_angle, args.max_memory_images,
                 args.memory_pool_window_frames, args.save_topdown, args.attn_implementation,
-                args.early_stop_max_steps, args.actions_per_replan)
+                args.early_stop_max_steps, args.actions_per_replan,
+                args.complete_action_event)
 
 if __name__ == "__main__":
     main()
