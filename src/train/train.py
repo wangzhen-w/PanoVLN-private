@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 
+import torch
 from transformers import Trainer, TrainingArguments
 from transformers.trainer_utils import get_last_checkpoint
 import yaml
@@ -33,6 +34,25 @@ from utils import (
 )
 
 RANK = int(os.environ.get("RANK", "0"))
+
+
+def bind_local_cuda_device() -> int:
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if local_rank < 0:
+        return local_rank
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is set, but CUDA is not available"
+        )
+
+    visible_device_count = torch.cuda.device_count()
+    if local_rank >= visible_device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is outside the visible CUDA device range "
+            f"[0, {visible_device_count})"
+        )
+    torch.cuda.set_device(local_rank)
+    return local_rank
 
 
 class PanoVLNTrainer(Trainer):
@@ -315,6 +335,11 @@ def safe_save_model_for_hf_trainer(
 
 
 def main():
+    # Bind each torchrun worker before seeding, model loading, and DeepSpeed/NCCL
+    # initialization. Otherwise every nonzero rank can first create a CUDA
+    # context on the default cuda:0 and leave that context resident there.
+    bind_local_cuda_device()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument(
