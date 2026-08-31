@@ -34,7 +34,7 @@ model:
 data:
   train_jsonl: "/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_h18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
-  train_image_root: "/workspace/data2/dataset/PanoVLN"
+  train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
   train_max_samples: null
   eval_max_samples: 3000
