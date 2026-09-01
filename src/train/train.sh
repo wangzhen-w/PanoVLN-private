@@ -14,7 +14,7 @@ MASTER_ADDR="127.0.0.1"
 MASTER_PORT="29520"
 
 if (( $# != 0 )); then
-    echo "The controlled PBO training launcher does not accept overrides: $*" >&2
+    echo "The controlled training launcher does not accept overrides: $*" >&2
     exit 1
 fi
 
