@@ -50,7 +50,7 @@ data:
     mixing_strategy: "task"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/18-action/stop_1-6_stride1_7-18_stride2"
+  output_dir: "/workspace/data2/model/18-action/base_18action_padding_loss_weight0.1"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -61,6 +61,7 @@ training:
   visual_merger_lr: 1.0e-5
   panovggt_mlp_lr: 2.0e-5
   pbo_head_lr: 2.0e-5
+  padding_stop_loss_weight: 0.1
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5

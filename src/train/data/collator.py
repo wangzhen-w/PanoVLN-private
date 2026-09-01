@@ -27,6 +27,27 @@ class MultiModalDataCollator:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         input_ids = [feature["input_ids"] for feature in features]
         labels = [feature["labels"] for feature in features]
+        loss_weights = []
+        for feature, feature_labels in zip(features, labels):
+            feature_weights = feature.get("loss_weights")
+            if feature_weights is None:
+                feature_weights = feature_labels.ne(-100).to(dtype=torch.float32)
+            else:
+                if feature_weights.shape != feature_labels.shape:
+                    raise ValueError(
+                        "loss_weights and labels must have the same shape, got "
+                        f"{tuple(feature_weights.shape)} and {tuple(feature_labels.shape)}"
+                    )
+                feature_weights = feature_weights.to(dtype=torch.float32)
+                if not bool(torch.isfinite(feature_weights).all().item()):
+                    raise ValueError("loss_weights must contain only finite values")
+                if bool((feature_weights < 0).any().item()):
+                    raise ValueError("loss_weights must be non-negative")
+                feature_weights = feature_weights.masked_fill(
+                    feature_labels.eq(-100),
+                    0.0,
+                )
+            loss_weights.append(feature_weights)
 
         batch = {
             "input_ids": torch.nn.utils.rnn.pad_sequence(
@@ -38,6 +59,11 @@ class MultiModalDataCollator:
                 labels,
                 batch_first=True,
                 padding_value=-100,
+            ),
+            "loss_weights": torch.nn.utils.rnn.pad_sequence(
+                loss_weights,
+                batch_first=True,
+                padding_value=0.0,
             ),
         }
 

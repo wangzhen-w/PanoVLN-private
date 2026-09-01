@@ -709,7 +709,31 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         return self.pbo_head is not None and bool(getattr(self.config, "pbo_enabled", False))
 
     @staticmethod
+    def _distributed_weighted_mean(
+        local_sum: torch.Tensor,
+        local_weight_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        weight_sum = local_weight_sum.detach().to(
+            device=local_sum.device,
+            dtype=torch.float32,
+        )
+        world_size = 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                weight_sum,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            world_size = torch.distributed.get_world_size()
+        if float(weight_sum.item()) <= 0.0:
+            return local_sum * 0.0
+        # DDP/DeepSpeed averages gradients across data-parallel ranks. Scaling
+        # each local sum by world_size/global_weight therefore produces the true
+        # global weighted mean after gradient reduction.
+        return local_sum * (float(world_size) / weight_sum)
+
+    @classmethod
     def _distributed_masked_mean(
+        cls,
         local_sum: torch.Tensor,
         local_count: int,
     ) -> torch.Tensor:
@@ -718,16 +742,51 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             device=local_sum.device,
             dtype=torch.float32,
         )
-        world_size = 1
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
-            world_size = torch.distributed.get_world_size()
-        if float(count.item()) <= 0.0:
-            return local_sum * 0.0
-        # DDP/DeepSpeed averages gradients across data-parallel ranks.  Scaling
-        # each local sum by world_size/global_count therefore produces the true
-        # global masked mean after gradient reduction.
-        return local_sum * (float(world_size) / count)
+        return cls._distributed_weighted_mean(local_sum, count)
+
+    @classmethod
+    def _compute_weighted_causal_lm_loss(
+        cls,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        loss_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if logits.ndim != 3 or labels.ndim != 2:
+            raise ValueError(
+                "Weighted causal LM loss expects [batch, sequence, vocab] logits "
+                "and [batch, sequence] labels"
+            )
+        if logits.shape[:2] != labels.shape or loss_weights.shape != labels.shape:
+            raise ValueError(
+                "logits, labels, and loss_weights must share batch/sequence shapes: "
+                f"logits={tuple(logits.shape)}, labels={tuple(labels.shape)}, "
+                f"loss_weights={tuple(loss_weights.shape)}"
+            )
+
+        shift_logits = logits[:, :-1, :].contiguous().float()
+        shift_labels = labels[:, 1:].contiguous().to(device=logits.device)
+        shift_weights = loss_weights[:, 1:].contiguous().to(
+            device=logits.device,
+            dtype=torch.float32,
+        )
+        if not bool(torch.isfinite(shift_weights).all().item()):
+            raise ValueError("loss_weights must contain only finite values")
+        if bool((shift_weights < 0).any().item()):
+            raise ValueError("loss_weights must be non-negative")
+
+        valid_mask = shift_labels.ne(-100)
+        effective_weights = shift_weights * valid_mask.to(dtype=torch.float32)
+        token_losses = F.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.shape[-1]),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape_as(shift_labels)
+        local_loss_sum = (token_losses * effective_weights).sum()
+        return cls._distributed_weighted_mean(
+            local_loss_sum,
+            effective_weights.sum(),
+        )
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
@@ -1507,6 +1566,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         past_key_values=None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
+        loss_weights: torch.FloatTensor | None = None,
         pixel_values: torch.Tensor | None = None,
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
@@ -1534,6 +1594,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             labels is not None
             and self._pbo_enabled()
         )
+        weighted_lm_enabled = labels is not None and loss_weights is not None
         self._capture_auxiliary_hidden = auxiliary_enabled
         self._auxiliary_last_hidden = None
         try:
@@ -1543,7 +1604,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 inputs_embeds=inputs_embeds,
-                labels=labels,
+                labels=None if weighted_lm_enabled else labels,
                 pixel_values=pixel_values,
                 pixel_values_videos=pixel_values_videos,
                 image_grid_thw=image_grid_thw,
@@ -1552,6 +1613,12 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 logits_to_keep=logits_to_keep,
                 **kwargs,
             )
+            if weighted_lm_enabled:
+                outputs.loss = self._compute_weighted_causal_lm_loss(
+                    outputs.logits,
+                    labels,
+                    loss_weights,
+                )
             if not auxiliary_enabled:
                 return outputs
             hidden_states = self._auxiliary_last_hidden

@@ -78,6 +78,7 @@ class TrainingConfig:
     visual_merger_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
     pbo_head_lr: Optional[float] = None
+    padding_stop_loss_weight: float = 1.0
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10
