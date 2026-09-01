@@ -32,7 +32,7 @@ model:
   pbo_head_hidden_size: 512
 
 data:
-  train_jsonl: "/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_h18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
+  train_jsonl: "/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_h18_stride4_stop_all_seed42.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -50,7 +50,7 @@ data:
     mixing_strategy: "task"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/18-action/base_18action_padding_loss_weight0.1"
+  output_dir: "/workspace/data2/model/18-action/base_18action_stride4_stop_all"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -61,7 +61,6 @@ training:
   visual_merger_lr: 1.0e-5
   panovggt_mlp_lr: 2.0e-5
   pbo_head_lr: 2.0e-5
-  padding_stop_loss_weight: 0.1
   weight_decay: 0.01
   num_train_epochs: 1
   logging_steps: 5
@@ -85,7 +84,7 @@ training:
   remove_unused_columns: false
   dataloader_num_workers: 6
   gradient_checkpointing: true
-  max_grad_norm: 10.0
+  max_grad_norm: 0.0
   deepspeed: "/workspace/code/VLN/scripts/zero2.json"
 
 run:

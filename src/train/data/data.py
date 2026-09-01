@@ -623,88 +623,6 @@ def _extract_real_action_count(
     return int(value)
 
 
-def validate_padding_stop_loss_weight(value: float) -> float:
-    value = float(value)
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise ValueError(
-            "padding_stop_loss_weight must be finite and in [0, 1], "
-            f"got {value}"
-        )
-    return value
-
-
-def build_vln_target_loss_weights(
-    *,
-    tokenizer,
-    target_text: str,
-    target_with_eos: str,
-    target_ids: torch.Tensor,
-    action_sequence: List[str],
-    real_action_count: int,
-    padding_stop_loss_weight: float,
-    truncation: bool = False,
-    max_length: Optional[int] = None,
-) -> torch.Tensor:
-    """Build target-token weights without assuming one token per action word."""
-    padding_stop_loss_weight = validate_padding_stop_loss_weight(
-        padding_stop_loss_weight
-    )
-    expected_target = " ".join(action_sequence)
-    if target_text != expected_target:
-        raise ValueError(
-            "VLN target text/action_sequence mismatch: "
-            f"target={target_text!r}, expected={expected_target!r}"
-        )
-    if real_action_count < 1 or real_action_count > len(action_sequence):
-        raise ValueError(
-            "real_action_count must identify at least one real action and cannot "
-            f"exceed the action sequence length, got {real_action_count}"
-        )
-    if any(action != "stop" for action in action_sequence[real_action_count:]):
-        raise ValueError("Every padded action after real_action_count must be stop")
-
-    encoded_with_offsets = tokenizer(
-        target_with_eos,
-        add_special_tokens=False,
-        return_offsets_mapping=True,
-        truncation=truncation,
-        max_length=max_length,
-    )
-    encoded_ids = encoded_with_offsets["input_ids"]
-    if encoded_ids and isinstance(encoded_ids[0], list):
-        encoded_ids = encoded_ids[0]
-    if list(encoded_ids) != target_ids.detach().cpu().tolist():
-        raise ValueError(
-            "Tokenizer returned different target ids while constructing loss weights"
-        )
-    offsets = encoded_with_offsets.get("offset_mapping")
-    if offsets is None:
-        raise ValueError(
-            "The tokenizer must support return_offsets_mapping to weight padding stop tokens"
-        )
-    if offsets and isinstance(offsets[0], list) and offsets[0] and isinstance(offsets[0][0], (list, tuple)):
-        offsets = offsets[0]
-    if len(offsets) != target_ids.numel():
-        raise ValueError(
-            "Tokenizer offset count does not match the target token count: "
-            f"{len(offsets)} vs {target_ids.numel()}"
-        )
-
-    weights = torch.ones(target_ids.shape, dtype=torch.float32)
-    if real_action_count == len(action_sequence):
-        return weights
-
-    # The next action begins at this character boundary. Tokens overlapping the
-    # remaining action text are padded STOP supervision; EOS begins at
-    # len(target_text) and deliberately keeps weight 1.
-    padding_char_start = len(" ".join(action_sequence[:real_action_count]))
-    target_char_end = len(target_text)
-    for token_index, (start, end) in enumerate(offsets):
-        if int(end) > padding_char_start and int(start) < target_char_end:
-            weights[token_index] = padding_stop_loss_weight
-    return weights
-
-
 def apply_vln_memory_policy(
     example: Dict[str, Any],
     *,
@@ -733,11 +651,7 @@ def apply_vln_memory_policy(
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example, action_sequence_length)
     history_actions = _extract_vln_history_actions(example, current_step)
-    real_action_count = _extract_real_action_count(
-        example,
-        action_sequence,
-        action_sequence_length,
-    )
+    _extract_real_action_count(example, action_sequence, action_sequence_length)
 
     has_pbo_target = bool(
         pbo_enabled
@@ -782,8 +696,6 @@ def apply_vln_memory_policy(
 
     normalized = dict(example)
     normalized["images"] = selected_images
-    normalized["action_sequence"] = action_sequence
-    normalized["real_action_count"] = real_action_count
     normalized["_pbo_valid"] = pbo_valid
     normalized["_pbo_start_image_index"] = pbo_start_image_index
     normalized["_pbo_action_labels"] = pbo_action_labels
@@ -876,7 +788,6 @@ class SupervisedDataset(Dataset):
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
         pbo_enabled: bool = False,
-        padding_stop_loss_weight: float = 1.0,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -903,9 +814,6 @@ class SupervisedDataset(Dataset):
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
         self.pbo_enabled = bool(pbo_enabled)
-        self.padding_stop_loss_weight = validate_padding_stop_loss_weight(
-            padding_stop_loss_weight
-        )
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -1031,17 +939,6 @@ class SupervisedDataset(Dataset):
             truncation=self.model_max_length is not None,
             max_length=self.model_max_length,
         )["input_ids"].squeeze(0)
-        target_loss_weights = build_vln_target_loss_weights(
-            tokenizer=self.tokenizer,
-            target_text=target_text,
-            target_with_eos=target_with_eos,
-            target_ids=target_ids,
-            action_sequence=example["action_sequence"],
-            real_action_count=example["real_action_count"],
-            padding_stop_loss_weight=self.padding_stop_loss_weight,
-            truncation=self.model_max_length is not None,
-            max_length=self.model_max_length,
-        )
 
         input_ids = encoded["input_ids"].squeeze(0)
         attention_mask = encoded.get("attention_mask")
@@ -1054,10 +951,6 @@ class SupervisedDataset(Dataset):
         target_len = min(target_ids.size(0), input_ids.size(0))
         if target_len > 0:
             labels[:-target_len] = -100
-        loss_weights = torch.zeros(input_ids.shape, dtype=torch.float32)
-        if target_len > 0:
-            loss_weights[-target_len:] = target_loss_weights[:target_len]
-        loss_weights.masked_fill_(labels.eq(-100), 0.0)
 
         image_count = len(vision_paths)
         image_erp_geometry = build_vln_image_geometry_batch(
@@ -1070,7 +963,6 @@ class SupervisedDataset(Dataset):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
-            "loss_weights": loss_weights,
         }
         if image_erp_geometry is not None:
             item["image_erp_geometry"] = image_erp_geometry

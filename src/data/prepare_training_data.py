@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate stride-6, 18-action R2R/RxR training JSONL data."""
+"""Generate stride-4, 18-action R2R/RxR training JSONL data."""
 
 from __future__ import annotations
 
@@ -18,11 +18,9 @@ from tqdm import tqdm
 
 
 ACTION_HORIZON = 18
-BODY_STRIDE = 6
-EXECUTION_HORIZON = 6
+BODY_STRIDE = 4
 DEFAULT_SEED = 42
 STOP, FORWARD, LEFT, RIGHT = 0, 1, 2, 3
-TURN_ACTIONS = frozenset({LEFT, RIGHT})
 ACTION_NAMES = {
     STOP: "stop",
     FORWARD: "forward",
@@ -43,9 +41,9 @@ EXPECTED_SOURCES = {
     },
 }
 EXPECTED_ROWS = {
-    ("r2r",): 240_806,
-    ("rxr",): 570_528,
-    ("r2r", "rxr"): 811_334,
+    ("r2r",): 313_897,
+    ("rxr",): 726_100,
+    ("r2r", "rxr"): 1_039_997,
 }
 
 
@@ -155,21 +153,16 @@ def select_starts(
     actions: Sequence[int],
     seed: int,
 ) -> tuple[dict[int, set[str]], Counter]:
-    """Apply the stride-6 H=18 sampling strategy."""
+    """Apply stride-4 body sampling, long-forward anchors, and dense STOP sampling."""
 
     validate_actions(actions, f"{dataset}:{episode_id}")
     selected: dict[int, set[str]] = {}
     audit = Counter()
 
-    for start in range(0, len(actions), BODY_STRIDE):
-        add_reason(selected, actions, start, "stride6")
-        audit["stride6"] += 1
-
-    for block in maximal_blocks(actions, TURN_ACTIONS):
-        audit["turn_blocks"] += 1
-        if block.length >= 2:
-            add_reason(selected, actions, block.start, "multi_turn_onset")
-            audit["multi_turn_onset"] += 1
+    terminal_start = len(actions) - ACTION_HORIZON
+    for start in range(0, terminal_start, BODY_STRIDE):
+        add_reason(selected, actions, start, "stride4_body")
+        audit["stride4_body"] += 1
 
     for block in maximal_blocks(actions, frozenset({FORWARD})):
         options = centered_forward_options(block)
@@ -187,27 +180,9 @@ def select_starts(
         add_reason(selected, actions, center, "forward_center")
         audit["forward_center"] += 1
 
-    for position in range(1, EXECUTION_HORIZON + 1):
-        start = len(actions) - position
-        add_reason(selected, actions, start, "terminal_executed_dense")
-        audit["terminal_executed_dense"] += 1
-
-    for first_position in range(
-        EXECUTION_HORIZON + 1,
-        ACTION_HORIZON + 1,
-        2,
-    ):
-        position = stable_choice(
-            (first_position, first_position + 1),
-            seed,
-            dataset,
-            episode_id,
-            "stop_future_pair",
-            first_position,
-        )
-        start = len(actions) - position
-        add_reason(selected, actions, start, "terminal_future_pair")
-        audit["terminal_future_pair"] += 1
+    for start in range(terminal_start, len(actions)):
+        add_reason(selected, actions, start, "terminal_all")
+        audit["terminal_all"] += 1
 
     return dict(sorted(selected.items())), audit
 
@@ -331,7 +306,7 @@ def build_training_jsonl(
         with temporary.open("wb") as output:
             for episode in tqdm(
                 episodes,
-                desc="stride6_h18",
+                desc="stride4_h18",
                 dynamic_ncols=True,
             ):
                 selected, episode_audit = select_starts(
@@ -397,7 +372,7 @@ def build_training_jsonl(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate stride-6 H18 R2R/RxR training JSONL data."
+        description="Generate stride-4 H18 R2R/RxR training JSONL data."
     )
     parser.add_argument(
         "--input_root",
@@ -416,7 +391,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(
             "/workspace/data2/dataset/ablation/18-action/"
-            "train_r2r_rxr_h18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
+            "train_r2r_rxr_h18_stride4_stop_all_seed42.jsonl"
         ),
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)

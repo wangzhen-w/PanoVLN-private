@@ -16,7 +16,6 @@ from data.data import (
     SupervisedDataset,
     normalize_vln_view_mode,
     validate_action_sequence_length,
-    validate_padding_stop_loss_weight,
 )
 from data.mixed import MixedSupervisedDataset, SourceGroupedSampler
 from data.panoworld import PanoWorldSupervisedDataset
@@ -214,7 +213,6 @@ def save_resolved_experiment_config(cfg, overrides) -> None:
 
 def validate_training_config(cfg) -> None:
     validate_action_sequence_length(cfg.model.action_sequence_length)
-    validate_padding_stop_loss_weight(cfg.training.padding_stop_loss_weight)
     view_mode = normalize_vln_view_mode(cfg.model.view_mode)
     if not 0.0 < float(cfg.model.perspective_xfov_degrees) < 180.0:
         raise ValueError("model.perspective_xfov_degrees must be in (0, 180)")
@@ -305,11 +303,6 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
     rank0_print(RANK, f"pbo_head_lr: {_config_value(cfg.training.pbo_head_lr)}")
-    rank0_print(
-        RANK,
-        "padding_stop_loss_weight: "
-        f"{_config_value(cfg.training.padding_stop_loss_weight)}",
-    )
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -457,7 +450,6 @@ def main():
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
         pbo_enabled=effective_pbo_enabled,
-        padding_stop_loss_weight=cfg.training.padding_stop_loss_weight,
         max_samples=cfg.data.train_max_samples,
         shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
         prompt_format=cfg.data.prompt_format,
@@ -520,7 +512,6 @@ def main():
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,
             pbo_enabled=effective_pbo_enabled,
-            padding_stop_loss_weight=cfg.training.padding_stop_loss_weight,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
