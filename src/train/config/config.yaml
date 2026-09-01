@@ -32,7 +32,7 @@ model:
   pbo_head_hidden_size: 512
 
 data:
-  train_jsonl: "/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_h18_stride4_stop_all_seed42.jsonl"
+  train_jsonl: "/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_h18_stride4_onset_fwd18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
   eval_jsonl: "/workspace/code/a_property/dataset/PanoVLN_eval/val_unseen_r2r_4action_pano_full_history_word_stop_pad.jsonl"
   train_image_root: "/workspace/code/a_property/dataset/PanoVLN"
   eval_image_root: "/workspace/code/a_property/dataset/PanoVLN_eval"
@@ -50,7 +50,7 @@ data:
     mixing_strategy: "task"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/18-action/base_18action_stride4_stop_all"
+  output_dir: "/workspace/data2/model/18-action/base_18action_stride4_onset_fwd18_stop_1-6_stride1_7-18_stride2"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
