@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate stride-4, 18-action R2R/RxR training JSONL data."""
+"""Generate H18 training JSONL from static R2R/RxR and DAgger data."""
 
 from __future__ import annotations
 
@@ -29,8 +29,9 @@ ACTION_NAMES = {
     LEFT: "left",
     RIGHT: "right",
 }
-DATASET_ORDER = ("r2r", "rxr")
-FRAME_PATTERN = re.compile(r"frame_(\d+)\.png")
+STATIC_DATASETS = ("r2r", "rxr")
+DATASET_ORDER = STATIC_DATASETS + ("dagger",)
+FRAME_PATTERN = re.compile(r"frame_(\d+)\.(?:png|jpe?g)", re.IGNORECASE)
 
 EXPECTED_SOURCES = {
     "r2r": {
@@ -50,12 +51,19 @@ EXPECTED_ROWS = {
 
 
 @dataclass(frozen=True)
+class OracleChunk:
+    step_index: int
+    actions: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Episode:
     dataset: str
     episode_id: str
     instruction: str
     actions: tuple[int, ...]
     image_id: str
+    oracle_chunks: tuple[OracleChunk, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,10 +105,14 @@ def maximal_blocks(
         index = end
 
 
-def validate_actions(actions: Sequence[int], context: str) -> None:
-    if len(actions) < ACTION_HORIZON + 1:
+def validate_trajectory_actions(
+    actions: Sequence[int],
+    context: str,
+    minimum_length: int = 1,
+) -> None:
+    if len(actions) < minimum_length:
         raise ValueError(
-            f"{context}: expected at least {ACTION_HORIZON + 1} actions, "
+            f"{context}: expected at least {minimum_length} actions, "
             f"got {len(actions)}"
         )
     invalid = sorted(set(int(value) for value in actions) - set(ACTION_NAMES))
@@ -108,6 +120,128 @@ def validate_actions(actions: Sequence[int], context: str) -> None:
         raise ValueError(f"{context}: invalid action IDs {invalid}")
     if int(actions[-1]) != STOP or STOP in actions[:-1]:
         raise ValueError(f"{context}: actions must contain exactly one final stop")
+
+
+def validate_actions(actions: Sequence[int], context: str) -> None:
+    validate_trajectory_actions(
+        actions,
+        context,
+        minimum_length=ACTION_HORIZON + 1,
+    )
+
+
+def parse_dagger_oracle_chunks(
+    row: dict,
+    actions: Sequence[int],
+    context: str,
+) -> tuple[OracleChunk, ...]:
+    if (
+        isinstance(row.get("action_horizon"), bool)
+        or not isinstance(row.get("action_horizon"), int)
+        or row.get("action_horizon") != ACTION_HORIZON
+    ):
+        raise ValueError(
+            f"{context}: DAgger action_horizon must be {ACTION_HORIZON}, "
+            f"got {row.get('action_horizon')!r}"
+        )
+    if (
+        isinstance(row.get("execute_horizon"), bool)
+        or not isinstance(row.get("execute_horizon"), int)
+        or row.get("execute_horizon") != EXECUTION_HORIZON
+    ):
+        raise ValueError(
+            f"{context}: DAgger execute_horizon must be {EXECUTION_HORIZON}, "
+            f"got {row.get('execute_horizon')!r}"
+        )
+
+    raw_chunks = row.get("oracle_chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise ValueError(f"{context}: DAgger episode has no oracle_chunks")
+
+    chunks: list[OracleChunk] = []
+    previous_step = -1
+    non_stop_action_count = len(actions) - 1
+    for chunk_index, raw_chunk in enumerate(raw_chunks):
+        if not isinstance(raw_chunk, dict):
+            raise ValueError(
+                f"{context}: oracle chunk {chunk_index} must be an object"
+            )
+        step_index = raw_chunk.get("step_index")
+        if (
+            isinstance(step_index, bool)
+            or not isinstance(step_index, int)
+            or step_index <= previous_step
+            or step_index > non_stop_action_count
+        ):
+            raise ValueError(
+                f"{context}: invalid oracle chunk step_index={step_index!r}"
+            )
+
+        try:
+            oracle_actions = tuple(
+                int(action) for action in raw_chunk.get("oracle_actions", [])
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{context}: invalid oracle actions at step {step_index}"
+            ) from exc
+        if len(oracle_actions) != ACTION_HORIZON:
+            raise ValueError(
+                f"{context}: oracle chunk at step {step_index} must contain "
+                f"{ACTION_HORIZON} actions, got {len(oracle_actions)}"
+            )
+        invalid = sorted(set(oracle_actions) - set(ACTION_NAMES))
+        if invalid:
+            raise ValueError(
+                f"{context}: oracle chunk at step {step_index} has invalid "
+                f"action IDs {invalid}"
+            )
+
+        if STOP in oracle_actions:
+            first_stop = oracle_actions.index(STOP)
+            if any(action != STOP for action in oracle_actions[first_stop:]):
+                raise ValueError(
+                    f"{context}: oracle chunk has an action after STOP at "
+                    f"step {step_index}"
+                )
+            if (
+                chunk_index < len(raw_chunks) - 1
+                and first_stop < EXECUTION_HORIZON
+            ):
+                raise ValueError(
+                    f"{context}: non-final oracle chunk requests STOP inside "
+                    f"its executable prefix at step {step_index}"
+                )
+
+        if previous_step >= 0:
+            step_gap = step_index - previous_step
+            if step_gap != EXECUTION_HORIZON:
+                is_early_terminal_decision = bool(
+                    0 < step_gap < EXECUTION_HORIZON
+                    and step_index == non_stop_action_count
+                    and oracle_actions[0] == STOP
+                )
+                if not is_early_terminal_decision:
+                    raise ValueError(
+                        f"{context}: expected DAgger decision gap "
+                        f"{EXECUTION_HORIZON}, got {step_gap} before step "
+                        f"{step_index}"
+                    )
+
+        chunks.append(OracleChunk(step_index, oracle_actions))
+        previous_step = step_index
+
+    if chunks[0].step_index != 0:
+        raise ValueError(f"{context}: first DAgger decision must be at step 0")
+    final_actions = chunks[-1].actions
+    if STOP not in final_actions:
+        raise ValueError(f"{context}: final DAgger oracle chunk has no STOP")
+    if chunks[-1].step_index + final_actions.index(STOP) != non_stop_action_count:
+        raise ValueError(
+            f"{context}: final oracle STOP does not align with the executed "
+            "trajectory"
+        )
+    return tuple(chunks)
 
 
 def action_target(actions: Sequence[int], start: int) -> tuple[int, ...]:
@@ -231,7 +365,7 @@ def normalize_dataset_names(dataset_names: Sequence[str]) -> tuple[str, ...]:
 
 def load_episodes(
     input_root: Path,
-    dataset_names: Sequence[str] = DATASET_ORDER,
+    dataset_names: Sequence[str] = STATIC_DATASETS,
 ) -> list[Episode]:
     normalized_names = normalize_dataset_names(dataset_names)
     episodes: list[Episode] = []
@@ -239,7 +373,7 @@ def load_episodes(
     for dataset in normalized_names:
         path = input_root / "sub_dataset" / f"{dataset}.jsonl"
         raw = path.read_bytes()
-        expected = EXPECTED_SOURCES[dataset]
+        expected = EXPECTED_SOURCES.get(dataset)
 
         starts = 0
         count = 0
@@ -252,18 +386,44 @@ def load_episodes(
             seen.add(key)
 
             actions = tuple(int(value) for value in row["actions"])
-            validate_actions(actions, f"{path}:{line_number}")
+            context = f"{path}:{line_number}"
+            if dataset == "dagger":
+                validate_trajectory_actions(actions, context)
+                oracle_chunks = parse_dagger_oracle_chunks(
+                    row,
+                    actions,
+                    context,
+                )
+            else:
+                validate_actions(actions, context)
+                oracle_chunks = ()
             instruction = row.get("instruction")
             if not isinstance(instruction, str) or not instruction:
                 raise ValueError(f"Missing instruction at {path}:{line_number}")
-            image_id = str(row.get("trajectory_id", row["episode_id"]))
+            raw_image_id = row.get("trajectory_id", row["episode_id"])
+            if (
+                isinstance(raw_image_id, bool)
+                or raw_image_id is None
+                or not str(raw_image_id).strip()
+            ):
+                raise ValueError(f"Missing trajectory image ID at {path}:{line_number}")
+            image_id = str(raw_image_id)
             episodes.append(
-                Episode(dataset, episode_id, instruction, actions, image_id)
+                Episode(
+                    dataset,
+                    episode_id,
+                    instruction,
+                    actions,
+                    image_id,
+                    oracle_chunks,
+                )
             )
             starts += len(actions)
             count += 1
 
-        if count != expected["episodes"] or starts != expected["starts"]:
+        if expected is not None and (
+            count != expected["episodes"] or starts != expected["starts"]
+        ):
             raise ValueError(
                 f"Source count mismatch for {dataset}: episodes={count}, "
                 f"starts={starts}, expected={expected}"
@@ -310,7 +470,7 @@ def build_training_jsonl(
     output_path: Path,
     seed: int,
     overwrite: bool,
-    dataset_names: Sequence[str] = DATASET_ORDER,
+    dataset_names: Sequence[str] = STATIC_DATASETS,
 ) -> dict[str, object]:
     if seed != DEFAULT_SEED:
         raise ValueError(f"This dataset is fixed to seed={DEFAULT_SEED}")
@@ -331,21 +491,32 @@ def build_training_jsonl(
         with temporary.open("wb") as output:
             for episode in tqdm(
                 episodes,
-                desc="stride4_h18",
+                desc="prepare_h18",
                 dynamic_ncols=True,
             ):
-                selected, episode_audit = select_starts(
-                    episode.dataset,
-                    episode.episode_id,
-                    episode.actions,
-                    seed,
-                )
-                audit.update(episode_audit)
                 images = load_image_paths(input_root, episode)
                 history = [ACTION_NAMES[action] for action in episode.actions]
 
-                for start in selected:
-                    target = action_target(episode.actions, start)
+                if episode.dataset == "dagger":
+                    targets = tuple(
+                        (chunk.step_index, chunk.actions)
+                        for chunk in episode.oracle_chunks
+                    )
+                    audit["dagger_oracle_decisions"] += len(targets)
+                else:
+                    selected, episode_audit = select_starts(
+                        episode.dataset,
+                        episode.episode_id,
+                        episode.actions,
+                        seed,
+                    )
+                    audit.update(episode_audit)
+                    targets = tuple(
+                        (start, action_target(episode.actions, start))
+                        for start in selected
+                    )
+
+                for start, target in targets:
 
                     real_action_count = (
                         target.index(STOP) + 1 if STOP in target else ACTION_HORIZON
@@ -377,9 +548,19 @@ def build_training_jsonl(
             os.fsync(output.fileno())
         os.chmod(temporary, 0o644)
 
-        expected_rows = EXPECTED_ROWS[normalized_names]
-        if row_count != expected_rows:
-            raise AssertionError(f"Row mismatch: {row_count} != {expected_rows}")
+        static_names = tuple(
+            dataset for dataset in normalized_names if dataset in STATIC_DATASETS
+        )
+        if static_names:
+            expected_static_rows = EXPECTED_ROWS[static_names]
+            actual_static_rows = sum(
+                dataset_counts[dataset] for dataset in static_names
+            )
+            if actual_static_rows != expected_static_rows:
+                raise AssertionError(
+                    f"Static row mismatch: {actual_static_rows} != "
+                    f"{expected_static_rows}"
+                )
 
         os.replace(temporary, output_path)
         result = {
@@ -397,7 +578,10 @@ def build_training_jsonl(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate stride-4 H18 R2R/RxR training JSONL data."
+        description=(
+            "Generate H18 training JSONL: stride-4 sampling for R2R/RxR "
+            "and complete oracle-decision preservation for DAgger."
+        )
     )
     parser.add_argument(
         "--input_root",
@@ -408,8 +592,8 @@ def parse_args() -> argparse.Namespace:
         "--dataset_name",
         nargs="+",
         choices=DATASET_ORDER,
-        default=list(DATASET_ORDER),
-        help="Dataset subsets to include (default: r2r rxr).",
+        default=list(STATIC_DATASETS),
+        help="Dataset subsets to include (default: r2r rxr; dagger is optional).",
     )
     parser.add_argument(
         "--output_path",

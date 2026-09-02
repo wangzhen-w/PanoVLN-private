@@ -7,7 +7,7 @@ cd "$SCRIPT_DIR"
 echo "Switched to directory: $SCRIPT_DIR"
 
 CONFIG_PATH="config/config.yaml"
-OUTPUT_DIR="/workspace/data2/model/18-action/base_18action_stride4_onset_fwd18_stop_1-6_stride1_7-18_stride2"
+OUTPUT_DIR="/workspace/data2/model/18-action/panovggt_18action_stride4_onset_fwd18_stop_1-6_stride1_7-18_stride2"
 GPU_DEVICES="0,1,2,3,4,5,6,7"
 GPU_NUM="$(awk -F',' '{print NF}' <<< "$GPU_DEVICES")"
 MASTER_ADDR="127.0.0.1"

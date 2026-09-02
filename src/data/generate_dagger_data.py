@@ -59,7 +59,6 @@ from src.data.habitat_shortest_path import (
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 
 from src.eval.eval import (
-    ACTION_SEQUENCE_LENGTH,
     DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
     PanoVLN_Agent,
@@ -69,9 +68,11 @@ from src.eval.eval import (
 DEFAULT_ALPHA = 0.5
 DEFAULT_DAGGER_MIDGOAL_RADIUS = 1.8
 DEFAULT_DAGGER_GOAL_RADIUS = 0.3
-DEFAULT_MODEL_PATH = "/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
+DEFAULT_MODEL_PATH = "/workspace/data2/model/18-action/base_18action"
 DEFAULT_OUTPUT_ROOT = "/workspace/data2/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
+DEFAULT_ACTION_HORIZON = 18
+DEFAULT_EXECUTE_HORIZON = 6
 DEFAULT_CPU_THREADS_PER_WORKER = 2
 DAGGER_CPU_THREADS_ENV = "VLN_DAGGER_CPU_THREADS_PER_WORKER"
 CPU_THREAD_ENV_VARS = (
@@ -374,7 +375,18 @@ def is_raw_episode_complete(
     dagger_dataset_name: str,
     annotation: Dict,
     image_format: str,
+    action_horizon: int,
+    execute_horizon: int,
 ) -> bool:
+    if (
+        isinstance(annotation.get("action_horizon"), bool)
+        or not isinstance(annotation.get("action_horizon"), int)
+        or annotation.get("action_horizon") != action_horizon
+        or isinstance(annotation.get("execute_horizon"), bool)
+        or not isinstance(annotation.get("execute_horizon"), int)
+        or annotation.get("execute_horizon") != execute_horizon
+    ):
+        return False
     actions = annotation.get("actions")
     oracle_chunks = annotation.get("oracle_chunks")
     if (
@@ -413,7 +425,7 @@ def is_raw_episode_complete(
             or step_index <= previous_step_index
             or step_index > non_stop_action_count
             or not isinstance(oracle_actions, list)
-            or len(oracle_actions) != ACTION_SEQUENCE_LENGTH
+            or len(oracle_actions) != action_horizon
         ):
             return False
         try:
@@ -423,14 +435,17 @@ def is_raw_episode_complete(
         if any(action_id not in SUPPORTED_ACTION_IDS for action_id in oracle_actions):
             return False
         if STOP_ACTION in oracle_actions:
-            if chunk_index != len(oracle_chunks) - 1:
-                return False
             first_stop = oracle_actions.index(STOP_ACTION)
             if any(action_id != STOP_ACTION for action_id in oracle_actions[first_stop:]):
                 return False
-        if step_gap is not None and step_gap != ACTION_SEQUENCE_LENGTH:
+            if (
+                chunk_index < len(oracle_chunks) - 1
+                and first_stop < execute_horizon
+            ):
+                return False
+        if step_gap is not None and step_gap != execute_horizon:
             is_early_terminal_replan = bool(
-                0 < step_gap < ACTION_SEQUENCE_LENGTH
+                0 < step_gap < execute_horizon
                 and step_index == non_stop_action_count
                 and oracle_actions[0] == STOP_ACTION
             )
@@ -931,7 +946,7 @@ def executable_prefix(action_ids: Sequence[int], execute_horizon: int) -> List[i
 def action_sequence_requests_stop(
     action_ids: Sequence[int],
 ) -> bool:
-    """Return whether a complete action chunk requests STOP."""
+    """Return whether the supplied actions request STOP."""
 
     return STOP_ACTION in [int(action_id) for action_id in action_ids]
 
@@ -1081,7 +1096,9 @@ def collect_raw_dagger_episode(
         if not oracle_queue:
             oracle_queue = [STOP_ACTION]
 
-        oracle_requests_stop = action_sequence_requests_stop(oracle_sequence)
+        # Positions after execute_horizon are supervision only.  A future STOP
+        # must not affect the policy selected or executed at this decision.
+        oracle_requests_stop = action_sequence_requests_stop(oracle_queue)
 
         # A terminal expert chunk has priority over both the dynamic DAgger
         # mixture and the model.  Execute the expert prefix through STOP so a
@@ -1101,7 +1118,7 @@ def collect_raw_dagger_episode(
             model_requests_stop = (
                 bool(selected_actions)
                 and action_sequence_requests_stop(
-                    model_action_ids,
+                    model_queue,
                 )
             )
             if not model_has_complete_chunk or model_requests_stop:
@@ -1242,6 +1259,8 @@ def collect_raw_dagger_episode(
         "episode_id": dagger_id,
         "trajectory_id": trajectory_id,
         "instruction": instruction,
+        "action_horizon": int(action_horizon),
+        "execute_horizon": int(execute_horizon),
         # Complete mixed-policy trajectory for image/history/PBO alignment.
         "actions": executed_actions,
         # Efficient-VLN expert labels at the real model decision states.
@@ -1369,7 +1388,15 @@ def dagger_worker(
             memory_pool_window_frames=memory_pool_window_frames,
             save_topdown=False,
             attn_implementation=attn_implementation,
+            actions_per_replan=execute_horizon,
         )
+        if agent.action_sequence_length != action_horizon:
+            raise DAggerCollectionError(
+                "DAgger action_horizon must match the loaded model's "
+                "action_sequence_length: "
+                f"requested={action_horizon}, "
+                f"model={agent.action_sequence_length}"
+            )
 
         with silence_external_output():
             env = habitat.Env(config=env_config.habitat, dataset=dataset)
@@ -1537,6 +1564,8 @@ def load_complete_existing_annotations(
     output_root,
     dagger_dataset_name,
     image_format,
+    action_horizon,
+    execute_horizon,
     progress_dir=None,
 ):
     existing: Dict[str, Dict] = {}
@@ -1546,6 +1575,8 @@ def load_complete_existing_annotations(
             dagger_dataset_name,
             annotation,
             image_format,
+            action_horizon,
+            execute_horizon,
         ):
             existing[annotation_episode_id(annotation)] = annotation
     if progress_dir is not None:
@@ -1560,6 +1591,8 @@ def load_complete_existing_annotations(
                     dagger_dataset_name,
                     annotation,
                     image_format,
+                    action_horizon,
+                    execute_horizon,
                 ):
                     continue
                 if current is not None:
@@ -1578,6 +1611,8 @@ def add_complete_annotation(
     annotation: Dict,
     source_path: str,
     image_format: str,
+    action_horizon: int,
+    execute_horizon: int,
 ) -> None:
     episode_id = annotation_episode_id(annotation)
     existing = merged_annotations.get(episode_id)
@@ -1588,6 +1623,8 @@ def add_complete_annotation(
         dagger_dataset_name,
         annotation,
         image_format,
+        action_horizon,
+        execute_horizon,
     ):
         tqdm.write(
             f"[dagger] skipping incomplete annotation episode_id="
@@ -1608,6 +1645,8 @@ def merge_partial_outputs(
     progress_dir: str,
     existing_annotations: Dict[str, Dict],
     image_format: str,
+    action_horizon: int,
+    execute_horizon: int,
 ):
     merged_annotations: Dict[str, Dict] = dict(existing_annotations)
     for path in list_rank_annotation_paths(progress_dir):
@@ -1619,6 +1658,8 @@ def merge_partial_outputs(
                 annotation=annotation,
                 source_path=path,
                 image_format=image_format,
+                action_horizon=action_horizon,
+                execute_horizon=execute_horizon,
             )
     write_jsonl_index(annotation_path(output_root, dagger_dataset_name), merged_annotations)
 
@@ -1931,16 +1972,15 @@ def validate_args(args) -> None:
             "cpu_threads_per_worker must be positive, "
             f"got {args.cpu_threads_per_worker}"
         )
-    if args.action_horizon != ACTION_SEQUENCE_LENGTH:
+    if args.action_horizon != DEFAULT_ACTION_HORIZON:
         raise ValueError(
-            f"action_horizon must be {ACTION_SEQUENCE_LENGTH} to match "
-            "the current training prompt."
+            f"action_horizon must be {DEFAULT_ACTION_HORIZON} for the current "
+            f"DAgger pipeline, got {args.action_horizon}"
         )
-    if args.execute_horizon != args.action_horizon:
+    if args.execute_horizon != DEFAULT_EXECUTE_HORIZON:
         raise ValueError(
-            "execute_horizon must equal action_horizon so every non-terminal "
-            "decision executes one complete action chunk, "
-            f"got {args.execute_horizon}"
+            f"execute_horizon must be {DEFAULT_EXECUTE_HORIZON} for the current "
+            f"DAgger pipeline, got {args.execute_horizon}"
         )
     if args.max_steps_per_episode <= 0:
         raise ValueError(
@@ -2000,8 +2040,18 @@ def parse_args():
         ),
     )
     parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA)
-    parser.add_argument("--action_horizon", type=int, default=ACTION_SEQUENCE_LENGTH)
-    parser.add_argument("--execute_horizon", type=int, default=ACTION_SEQUENCE_LENGTH)
+    parser.add_argument(
+        "--action_horizon",
+        type=int,
+        default=DEFAULT_ACTION_HORIZON,
+        help="Oracle-label and model-prediction length (fixed to 18).",
+    )
+    parser.add_argument(
+        "--execute_horizon",
+        type=int,
+        default=DEFAULT_EXECUTE_HORIZON,
+        help="Executed prefix before observing and replanning (fixed to 6).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--attn_implementation",
@@ -2098,6 +2148,8 @@ def main() -> None:
             output_root=args.output_root,
             dagger_dataset_name=args.dagger_dataset_name,
             image_format=args.image_format,
+            action_horizon=args.action_horizon,
+            execute_horizon=args.execute_horizon,
             progress_dir=progress_dir,
         )
     else:
@@ -2125,6 +2177,8 @@ def main() -> None:
         f"num_processes_per_gpu={args.num_processes_per_gpu}, "
         f"cpu_threads_per_worker={args.cpu_threads_per_worker}, "
         f"midgoal_radius={args.midgoal_radius}, goal_radius={args.goal_radius}, "
+        f"action_horizon={args.action_horizon}, "
+        f"execute_horizon={args.execute_horizon}, "
         f"progress_dir={progress_dir}, lock={lock_path}"
     )
 
@@ -2169,6 +2223,8 @@ def main() -> None:
             progress_dir=progress_dir,
             existing_annotations=existing_annotations,
             image_format=args.image_format,
+            action_horizon=args.action_horizon,
+            execute_horizon=args.execute_horizon,
         )
         success = True
     finally:
