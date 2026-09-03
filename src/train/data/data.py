@@ -29,7 +29,7 @@ DEFAULT_VLN_ACTION_SEQUENCE_LENGTH = 4
 # training/evaluation use the value stored in model.config instead.
 VLN_ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
 PBO_ACTION_SEQUENCE_LENGTH = 4
-VLN_VIEW_MODES = {"panorama", "perspective"}
+VLN_VIEW_MODES = {"panorama", "erp_180", "perspective"}
 DEFAULT_VLN_VIEW_MODE = "panorama"
 DEFAULT_PERSPECTIVE_XFOV_DEGREES = 90.0
 DEFAULT_PERSPECTIVE_YFOV_DEGREES = 90.0
@@ -218,6 +218,18 @@ def crop_erp_latitude(
     return image.crop((0, top_crop_pixels, width, crop_bottom))
 
 
+def crop_erp_center_180(image: Image.Image) -> Image.Image:
+    """Crop the forward-facing central 180 degrees from a full 360-degree ERP."""
+
+    width, height = image.size
+    if width <= 1 or height <= 0:
+        return image
+
+    crop_width = max(1, width // 2)
+    crop_left = (width - crop_width) // 2
+    return image.crop((crop_left, 0, crop_left + crop_width, height))
+
+
 def build_erp_image_geometry(
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
@@ -274,7 +286,8 @@ def preprocess_vln_current_image(
     perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
     perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
 ) -> Image.Image:
-    if normalize_vln_view_mode(view_mode) == "perspective":
+    view_mode = normalize_vln_view_mode(view_mode)
+    if view_mode == "perspective":
         return project_equirectangular_to_perspective(
             image,
             xfov_degrees=perspective_xfov_degrees,
@@ -283,6 +296,8 @@ def preprocess_vln_current_image(
             output_height=perspective_image_height,
         )
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_CURRENT_OBSERVATION_IMAGE_SIZE)
+    if view_mode == "erp_180":
+        return crop_erp_center_180(processed_image)
     return crop_erp_latitude(
         processed_image,
         top_crop_degrees=top_crop_degrees,
@@ -300,7 +315,8 @@ def preprocess_vln_memory_image(
     perspective_image_width: int = DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
     perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
 ) -> Image.Image:
-    if normalize_vln_view_mode(view_mode) == "perspective":
+    view_mode = normalize_vln_view_mode(view_mode)
+    if view_mode == "perspective":
         return project_equirectangular_to_perspective(
             image,
             xfov_degrees=perspective_xfov_degrees,
@@ -309,6 +325,8 @@ def preprocess_vln_memory_image(
             output_height=perspective_image_height,
         )
     processed_image = image.convert("RGB").resize(DEFAULT_VLN_MEMORY_IMAGE_SIZE)
+    if view_mode == "erp_180":
+        return crop_erp_center_180(processed_image)
     return crop_erp_latitude(
         processed_image,
         top_crop_degrees=top_crop_degrees,
@@ -325,7 +343,8 @@ def preprocess_panovggt_current_image(
     perspective_image_height: int = DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
 ) -> torch.Tensor:
     processed_image = image.convert("RGB")
-    if normalize_vln_view_mode(view_mode) == "perspective":
+    view_mode = normalize_vln_view_mode(view_mode)
+    if view_mode == "perspective":
         # Never expose the original 360-degree image to the auxiliary visual
         # encoder during a perspective-view ablation.  Keep the configured
         # 320x320 projection for every visual branch.
@@ -341,6 +360,8 @@ def preprocess_panovggt_current_image(
             DEFAULT_PANOVGGT_IMAGE_SIZE,
             Image.Resampling.LANCZOS,
         )
+        if view_mode == "erp_180":
+            processed_image = crop_erp_center_180(processed_image)
     return TF.to_tensor(processed_image)
 
 
@@ -351,10 +372,22 @@ def build_vln_image_geometry_batch(
     top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
     bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
 ) -> Optional[torch.Tensor]:
-    if normalize_vln_view_mode(view_mode) == "perspective":
+    view_mode = normalize_vln_view_mode(view_mode)
+    if view_mode == "perspective":
         # The PanoVGGT/Qwen alignment uses the full normalized image plane for
         # perspective inputs; ERP latitude/longitude metadata does not apply.
         return None
+    if view_mode == "erp_180":
+        vertical_geometry = build_erp_image_geometry_batch(
+            num_images,
+            top_crop_degrees=0.0,
+            bottom_crop_degrees=0.0,
+        )
+        horizontal_geometry = torch.tensor(
+            [[math.pi, 0.0]],
+            dtype=torch.float32,
+        ).repeat(max(0, int(num_images)), 1)
+        return torch.cat((vertical_geometry, horizontal_geometry), dim=1)
     return build_erp_image_geometry_batch(
         num_images,
         top_crop_degrees=top_crop_degrees,
@@ -426,21 +459,32 @@ def build_vln_user_content(
         raise ValueError("VLN samples require at least one image")
 
     view_mode = normalize_vln_view_mode(view_mode)
-    view_name = "panoramic" if view_mode == "panorama" else "perspective"
     num_memory_images = max(0, num_images - 1)
     content = [text_content(f"Instruction: {instruction.strip()}")]
 
     if num_memory_images > 0:
-        content.append(
-            text_content(
-                f"\nHistory memory observations are {view_name} views ordered from older to newer:"
+        if view_mode == "panorama":
+            memory_text = (
+                "\nHistory memory observations are panoramic views "
+                "ordered from older to newer:"
             )
+        else:
+            memory_text = (
+                "\nHistory memory observations are ordered from older to newer:"
+            )
+        content.append(
+            text_content(memory_text)
         )
         content.extend(image_content() for _ in range(num_memory_images))
 
+    current_text = (
+        "\nCurrent observation (panoramic view):"
+        if view_mode == "panorama"
+        else "\nCurrent observation:"
+    )
     content.extend(
         [
-            text_content(f"\nCurrent observation ({view_name} view):"),
+            text_content(current_text),
             image_content(),
             text_content("\nDevise the next action sequence."),
         ]

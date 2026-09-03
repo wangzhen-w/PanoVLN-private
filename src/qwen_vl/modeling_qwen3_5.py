@@ -1341,6 +1341,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         if image_erp_geometry is None:
             vertical_fov = math.pi
             center_latitude = 0.0
+            horizontal_fov = 2.0 * math.pi
+            center_longitude = 0.0
         else:
             geometry_values = image_erp_geometry.detach().to(
                 device="cpu",
@@ -1348,6 +1350,14 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             ).tolist()
             vertical_fov = float(geometry_values[0])
             center_latitude = float(geometry_values[1])
+            if len(geometry_values) >= 4:
+                horizontal_fov = float(geometry_values[2])
+                center_longitude = float(geometry_values[3])
+            else:
+                # Backward compatibility with checkpoints and batches whose
+                # ERP geometry predates horizontal-FOV metadata.
+                horizontal_fov = 2.0 * math.pi
+                center_longitude = 0.0
 
         latitude = (
             center_latitude
@@ -1356,9 +1366,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             * (vertical_fov / pooled_h)
         )
         longitude = (
-            -math.pi
+            center_longitude
+            - 0.5 * horizontal_fov
             + (torch.arange(pooled_w, device=device, dtype=torch.float32) + 0.5)
-            * (2.0 * math.pi / pooled_w)
+            * (horizontal_fov / pooled_w)
         )
         area_weight = latitude.cos().clamp_min(0.0).view(1, pooled_h, 1, 1)
         cosine_basis = longitude.cos().view(1, 1, pooled_w, 1)

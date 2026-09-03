@@ -6,8 +6,8 @@ model:
   cache_dir: null
   image_token: "<|image_pad|>"
   model_max_length: null
-  action_sequence_length: 18       # ablation: 1 / 2 / 4 / 6 / 8 / 10 / 12 / 14 / 16 / 18 / 24 / 36; saved to model config.json
-  view_mode: "panorama"           # "panorama" or runtime ERP-to-"perspective" projection
+  action_sequence_length: 18       # ablation: 1 / 2 / 4 / 6 / 8 / 10 / 12 / 14 / 16 / 18 / 24 / 36 / 50; saved to model config.json
+  view_mode: "panorama"           # "panorama", center-cropped "erp_180", or ERP-to-"perspective"
   perspective_xfov_degrees: 90.0
   perspective_yfov_degrees: 90.0
   perspective_image_width: 320

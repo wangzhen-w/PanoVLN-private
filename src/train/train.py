@@ -232,7 +232,7 @@ def validate_training_config(cfg) -> None:
         return
     if view_mode != "panorama":
         raise ValueError(
-            "data.panoworld.enabled must be false for the perspective-view VLN ablation"
+            "data.panoworld.enabled must be false for non-panorama VLN ablations"
         )
     if not panoworld_cfg.jsonl:
         raise ValueError("data.panoworld.jsonl is required when data.panoworld.enabled=true")
