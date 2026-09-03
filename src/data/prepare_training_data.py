@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate H18 training JSONL from static R2R/RxR and DAgger data."""
+"""Generate stride-6 H18 training JSONL from R2R/RxR and DAgger data."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 
 ACTION_HORIZON = 18
-BODY_STRIDE = 4
+BODY_STRIDE = 6
 EXECUTION_HORIZON = 6
 DEFAULT_SEED = 42
 STOP, FORWARD, LEFT, RIGHT = 0, 1, 2, 3
@@ -44,9 +44,9 @@ EXPECTED_SOURCES = {
     },
 }
 EXPECTED_ROWS = {
-    ("r2r",): 282_407,
-    ("rxr",): 703_446,
-    ("r2r", "rxr"): 985_853,
+    ("r2r",): 240_806,
+    ("rxr",): 570_528,
+    ("r2r", "rxr"): 811_334,
 }
 
 
@@ -289,15 +289,15 @@ def select_starts(
     actions: Sequence[int],
     seed: int,
 ) -> tuple[dict[int, set[str]], Counter]:
-    """Apply the original H=18 sampling strategy with body stride changed to 4."""
+    """Apply the H18 strategy with body stride 6."""
 
     validate_actions(actions, f"{dataset}:{episode_id}")
     selected: dict[int, set[str]] = {}
     audit = Counter()
 
     for start in range(0, len(actions), BODY_STRIDE):
-        add_reason(selected, actions, start, "stride4")
-        audit["stride4"] += 1
+        add_reason(selected, actions, start, "stride6")
+        audit["stride6"] += 1
 
     for block in maximal_blocks(actions, TURN_ACTIONS):
         audit["turn_blocks"] += 1
@@ -579,7 +579,7 @@ def build_training_jsonl(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate H18 training JSONL: stride-4 sampling for R2R/RxR "
+            "Generate H18 training JSONL: stride-6 sampling for R2R/RxR "
             "and complete oracle-decision preservation for DAgger."
         )
     )
@@ -600,8 +600,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(
             "/workspace/data2/dataset/ablation/18-action/"
-            "train_r2r_rxr_h18_stride4_onset_fwd18_"
-            "stop_1-6_stride1_7-18_stride2_seed42.jsonl"
+            "train_r2r_rxr_h18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
         ),
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)

@@ -68,7 +68,7 @@ from src.eval.eval import (
 DEFAULT_ALPHA = 0.5
 DEFAULT_DAGGER_MIDGOAL_RADIUS = 1.8
 DEFAULT_DAGGER_GOAL_RADIUS = 0.3
-DEFAULT_MODEL_PATH = "/workspace/data2/model/18-action/base_18action"
+DEFAULT_MODEL_PATH = "/workspace/data2/model/18-action/panovggt_base_18action"
 DEFAULT_OUTPUT_ROOT = "/workspace/data2/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
 DEFAULT_ACTION_HORIZON = 18

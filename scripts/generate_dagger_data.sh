@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data2/model/18-action/base_18action"
+MODEL_PATH="/workspace/data2/model/18-action/panovggt_base_18action"
 OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 REFERENCE_INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 SOURCE_DATASET_NAMES=(r2r rxr)

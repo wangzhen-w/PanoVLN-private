@@ -19,8 +19,8 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
-OUTPUT_PATH="/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_dagger_h18_stride4_onset_fwd18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
-DATASET_NAMES=(r2r rxr dagger)
+OUTPUT_PATH="/workspace/data2/dataset/ablation/18-action/train_r2r_rxr_h18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
+DATASET_NAMES=(r2r rxr)
 
 PREPARE_CMD=(
     "${PYTHON_BIN}" src/data/prepare_training_data.py
@@ -36,8 +36,8 @@ echo "OUTPUT_PATH: ${OUTPUT_PATH}"
 echo "DATASET_NAMES: ${DATASET_NAMES[*]}"
 echo "ACTION_HORIZON: 18"
 echo "EXECUTION_HORIZON: 6"
-echo "BODY_STRIDE: 4"
-echo "STATIC_RULE: original-strategy-with-stride4"
+echo "BODY_STRIDE: 6"
+echo "STATIC_RULE: stride6 + multi-turn-onset + long-forward + stop[1-6]dense + stop[7-18]pair"
 echo "DAGGER_RULE: keep-all-h18-oracle-decisions-executed-history-stride6"
 printf 'Running:'
 printf ' %q' "${PREPARE_CMD[@]}"
