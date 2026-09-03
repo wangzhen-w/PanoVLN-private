@@ -44,8 +44,6 @@ habitat:
         type: OracleSuccess
       oracle_navigation_error:
         type: OracleNavigationError
-      ndtw:
-        type: NDTW
         
         
   dataset:
