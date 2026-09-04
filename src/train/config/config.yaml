@@ -24,8 +24,8 @@ model:
   panovggt_checkpoint_path: "/workspace/code/a_property/model/PanoVGGT/model.pt"
   panovggt_alpha_value: 0.20
   panovggt_feature_source: "aggregator"  #"aggregator"共享主干2048维latent / "point_hidden"point decoder后的1024维hidden
-  panovggt_injection_stage: "pre_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
-  panovggt_sampling_mode: "singlepoint"    #"singlepoint"每个 Qwen token 采一个 PanoVGGT token / "grouping"每个 Qwen token 聚合局部2x2 PanoVGGT latent
+  panovggt_injection_stage: "post_merger"  #"post_merger"加到Qwen merger后2560维visual token / "pre_merger"加到Qwen merger前1024维patch token
+  panovggt_sampling_mode: "grouping"    #"singlepoint"每个 Qwen token 采一个 PanoVGGT token / "grouping"每个 Qwen token 聚合局部2x2 PanoVGGT latent
   panovggt_force_fp32: false
   pbo_enabled: false
   pbo_loss_weight: 0.1
@@ -50,7 +50,7 @@ data:
     mixing_strategy: "task"  #"sample"同一batch里有不同类型数据    "task"同一batch仅一个类型的训练数据
 
 training:
-  output_dir: "/workspace/data2/model/18-action/panovggt_base_18action"
+  output_dir: "/workspace/data2/model/18-action/panovggt_post_merger_grouping_alpha020_no_output_norm"
   seed: 42
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
@@ -58,7 +58,7 @@ training:
   learning_rate: 2.0e-5
   language_model_lr: 2.0e-5
   visual_lr: 2.0e-6
-  visual_merger_lr: 1.0e-5
+  visual_merger_lr: 2.0e-5
   panovggt_mlp_lr: 2.0e-5
   pbo_head_lr: 2.0e-5
   weight_decay: 0.01

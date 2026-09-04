@@ -218,7 +218,6 @@ class PanoVGGTGeometryMLP(nn.Module):
             nn.GELU(),
             nn.Linear(self.hidden_dim, self.output_dim),
         )
-        self.output_norm = nn.RMSNorm(self.output_dim, eps=1e-6)
         self.reset_parameters()
 
     @property
@@ -227,10 +226,9 @@ class PanoVGGTGeometryMLP(nn.Module):
 
     def reset_parameters(self) -> None:
         self.input_norm.reset_parameters()
-        self.output_norm.reset_parameters()
         for module in self.mlp:
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         self.alpha_value.fill_(self.alpha_init)
@@ -616,7 +614,7 @@ class PanoVGGTGeometryMLP(nn.Module):
                     "PanoVGGT sampled geometry length mismatch: "
                     f"sampled_len={geo.shape[0]}, qwen_len={int(target_len)}"
                 )
-            projected = self.output_norm(self.mlp(geo))
+            projected = self.mlp(geo)
             projected = self.alpha.to(dtype=projected.dtype) * projected
             if self.injection_stage == "pre_merger":
                 projected = self._to_qwen_pre_merger_order(projected, grid_h=grid_h, grid_w=grid_w)
@@ -639,7 +637,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.mlp.0.bias",
         "panovggt_mlp.mlp.2.weight",
         "panovggt_mlp.mlp.2.bias",
-        "panovggt_mlp.output_norm.weight",
     )
     def __init__(self, config):
         ensure_pbo_config(config)
