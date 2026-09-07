@@ -18,12 +18,16 @@ ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
 # Empty: use model.config.action_sequence_length; integer: fixed execution length.
-# "uncertainty": choose K in {4,5,6,7,8} from this prediction's logits.
-# Use a separate SAVE_PATH for each mode/budget; existing episodes are skipped.
+# "uncertainty": choose K from this prediction's logits, within REPLAN_ACTION_RANGE.
+# "random": uniformly sample K in REPLAN_ACTION_RANGE once per prediction, without logits.
+# Use a separate SAVE_PATH for each mode/range/budget/seed; existing episodes are skipped.
 ACTIONS_PER_REPLAN=""
+# Inclusive (minimum maximum) for uncertainty/random; fixed integer K is unaffected.
+# Bash array syntax uses a space, not a comma: (3 9) or (4 8).
+REPLAN_ACTION_RANGE=(3 9)
 # Budget for sum(-log p(action)) in uncertainty mode.
 # This is a fixed input parameter, not recomputed from online episode history.
-UNCERTAINTY_BUDGET=1.8
+UNCERTAINTY_BUDGET=1.5
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 
@@ -32,7 +36,7 @@ PROCS_PER_GPU=3
 CPU_THREADS_PER_WORKER=4
 MAX_EPISODES=0
 SAVE_TOPDOWN=false
-SEED=42
+SEED=42  # Also controls random-mode horizons; stable per episode across workers/resumes.
 
 mkdir -p "$SAVE_PATH"
 
@@ -52,14 +56,29 @@ fi
 
 actions_per_replan_args=()
 if [[ -n "$ACTIONS_PER_REPLAN" ]]; then
-    if [[ "$ACTIONS_PER_REPLAN" != "uncertainty" && ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ACTIONS_PER_REPLAN must be empty, a positive integer, or uncertainty: $ACTIONS_PER_REPLAN" >&2
+    if [[ "$ACTIONS_PER_REPLAN" != "uncertainty" &&
+          "$ACTIONS_PER_REPLAN" != "random" &&
+          ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ACTIONS_PER_REPLAN must be empty, a positive integer, uncertainty, or random: $ACTIONS_PER_REPLAN" >&2
         exit 1
     fi
     actions_per_replan_args=(--actions-per-replan "$ACTIONS_PER_REPLAN")
 fi
 if [[ "$ACTIONS_PER_REPLAN" == "uncertainty" ]]; then
     actions_per_replan_args+=(--uncertainty-budget "$UNCERTAINTY_BUDGET")
+fi
+if [[ "$ACTIONS_PER_REPLAN" == "uncertainty" || "$ACTIONS_PER_REPLAN" == "random" ]]; then
+    if [[ "${#REPLAN_ACTION_RANGE[@]}" -ne 2 ]] ||
+       [[ ! "${REPLAN_ACTION_RANGE[0]}" =~ ^[1-9][0-9]*$ ||
+          ! "${REPLAN_ACTION_RANGE[1]}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "REPLAN_ACTION_RANGE must contain two positive integers: (MIN MAX)" >&2
+        exit 1
+    fi
+    if (( REPLAN_ACTION_RANGE[0] > REPLAN_ACTION_RANGE[1] )); then
+        echo "REPLAN_ACTION_RANGE requires MIN <= MAX" >&2
+        exit 1
+    fi
+    actions_per_replan_args+=(--replan-action-range "${REPLAN_ACTION_RANGE[@]}")
 fi
 
 echo "MODEL_PATH=$MODEL_PATH"
@@ -76,6 +95,7 @@ echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
 echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
 echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
 echo "ACTIONS_PER_REPLAN=${ACTIONS_PER_REPLAN:-model_config}"
+echo "REPLAN_ACTION_RANGE=${REPLAN_ACTION_RANGE[*]}"
 echo "UNCERTAINTY_BUDGET=$UNCERTAINTY_BUDGET"
 echo "EARLY_STOP_MAX_STEPS=$EARLY_STOP_MAX_STEPS"
 echo "Total processes: $CHUNKS"

@@ -91,6 +91,7 @@ logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
 STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
+DEFAULT_REPLAN_ACTION_RANGE = (3, 9)
 ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
 ATOMIC_ACTION_VARIANTS = {
     "stop": ("stop",),
@@ -141,19 +142,19 @@ def resolve_actions_per_replan(
     )
     if actions_per_replan is None:
         return model_action_sequence_length
-    if actions_per_replan == "uncertainty":
-        return "uncertainty"
+    if actions_per_replan in ("uncertainty", "random"):
+        return actions_per_replan
     return validate_action_sequence_length(actions_per_replan)
 
 
 def parse_actions_per_replan(value):
-    if value == "uncertainty":
+    if value in ("uncertainty", "random"):
         return value
     try:
         return validate_action_sequence_length(value)
     except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError(
-            "actions-per-replan must be a positive integer or 'uncertainty'"
+            "actions-per-replan must be a positive integer, 'uncertainty', or 'random'"
         ) from exc
 
 
@@ -164,22 +165,34 @@ def validate_uncertainty_budget(value):
     return budget
 
 
-def select_uncertainty_horizon(action_uncertainties, budget):
-    """Longest prefix in 4..8 with sum(-log p(action)) <= budget.
+def validate_replan_action_range(action_range):
+    if not isinstance(action_range, (tuple, list)) or len(action_range) != 2:
+        raise ValueError("replan-action-range requires two positive integers: MIN MAX")
+    minimum, maximum = map(validate_action_sequence_length, action_range)
+    if minimum > maximum:
+        raise ValueError("replan-action-range requires MIN <= MAX")
+    return minimum, maximum
 
-    Four is the minimum nominal K, even if that prefix exceeds the budget.
+
+def select_uncertainty_horizon(
+    action_uncertainties, budget, action_range=DEFAULT_REPLAN_ACTION_RANGE,
+):
+    """Longest prefix within action_range with sum(-log p(action)) <= budget.
+
+    The lower bound is the minimum nominal K, even if it exceeds the budget.
     STOP and short predictions are subsequently handled by the action queue.
     This is model uncertainty, not a calibrated probability of execution error.
     """
     budget = validate_uncertainty_budget(budget)
-    horizon, cumulative = 4, 0.0
-    for position, uncertainty in enumerate(action_uncertainties[:8], start=1):
+    minimum, maximum = validate_replan_action_range(action_range)
+    horizon, cumulative = minimum, 0.0
+    for position, uncertainty in enumerate(action_uncertainties[:maximum], start=1):
         if not math.isfinite(uncertainty) or uncertainty < 0:
             raise ValueError("Action uncertainty must be finite and nonnegative")
         cumulative += uncertainty
         if cumulative > budget:
             break
-        horizon = max(4, position)
+        horizon = max(minimum, position)
     return horizon
 
 
@@ -199,8 +212,12 @@ def build_action_token_lookup(tokenizer):
     return lookup
 
 
-def extract_action_uncertainties(generated_ids, logits, token_lookup, special_ids):
+def extract_action_uncertainties(
+    generated_ids, logits, token_lookup, special_ids,
+    max_actions=DEFAULT_REPLAN_ACTION_RANGE[1],
+):
     """Read raw, temperature-1 four-action log probabilities from this generation."""
+    max_actions = validate_action_sequence_length(max_actions)
     if logits is None or len(generated_ids) != len(logits):
         raise ValueError("Generated tokens and raw logits are not aligned")
     actions, uncertainties = [], []
@@ -216,7 +233,7 @@ def extract_action_uncertainties(generated_ids, logits, token_lookup, special_id
             raise ValueError("Non-finite action logits in uncertainty mode")
         actions.append(action_id)
         uncertainties.append(uncertainty)
-        if action_id == STOP_ACTION_ID or len(actions) == 8:
+        if action_id == STOP_ACTION_ID or len(actions) == max_actions:
             break
     return actions, uncertainties
 
@@ -482,6 +499,8 @@ def evaluate_agent(
     early_stop_max_steps,
     actions_per_replan,
     uncertainty_budget=1.5,
+    seed=42,
+    replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
 ) -> None:
     done_pairs = _load_done_pairs(result_path)
     pending_episodes = _filter_pending_episodes(list(dataset.episodes), done_pairs)
@@ -510,6 +529,8 @@ def evaluate_agent(
         attn_implementation=attn_implementation,
         actions_per_replan=actions_per_replan,
         uncertainty_budget=uncertainty_budget,
+        seed=seed,
+        replan_action_range=replan_action_range,
     )
 
     early_stop_max_steps = max(0, int(early_stop_max_steps))
@@ -523,6 +544,12 @@ def evaluate_agent(
         executed_action_log = []
         for episode in progress:
             agent.reset()
+            if agent.actions_per_replan == "random":
+                # Keep horizon draws independent of worker layout, resume order,
+                # and random numbers consumed by the simulator or model.
+                agent.replan_rng.seed(
+                    f"{seed}:{_scene_id_from_path(episode.scene_id)}:{episode.episode_id}"
+                )
             executed_action_log = []
             env.current_episode = episode
             obs = env.reset()
@@ -545,10 +572,14 @@ def evaluate_agent(
             result_row["executed_action_history"] = executed_action_log
             result_row["model_generated_actions"] = list(agent.model_generated_actions)
             result_row["model_parsed_action_sequences"] = list(agent.model_parsed_action_sequences)
-            if agent.actions_per_replan == "uncertainty":
-                result_row["actions_per_replan"] = "uncertainty"
-                result_row["uncertainty_budget"] = agent.uncertainty_budget
+            if agent.actions_per_replan in ("uncertainty", "random"):
+                result_row["actions_per_replan"] = agent.actions_per_replan
+                result_row["replan_action_range"] = list(agent.replan_action_range)
                 result_row["model_actions_per_replan"] = list(agent.model_actions_per_replan)
+                if agent.actions_per_replan == "uncertainty":
+                    result_row["uncertainty_budget"] = agent.uncertainty_budget
+                else:
+                    result_row["random_seed"] = seed
             _append_result_row(result_path, split_id, result_row)
             agent.reset()
 
@@ -576,11 +607,15 @@ class PanoVLN_Agent(Agent):
         attn_implementation="sdpa",
         actions_per_replan=None,
         uncertainty_budget=1.5,
+        seed=42,
+        replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
     ):
         
         print("Initialize PanoVLN")
 
         self.uncertainty_budget = validate_uncertainty_budget(uncertainty_budget)
+        self.replan_action_range = validate_replan_action_range(replan_action_range)
+        self.replan_rng = random.Random(seed)
         
         self.result_path = result_path
         self.save_topdown = save_topdown
@@ -701,6 +736,7 @@ class PanoVLN_Agent(Agent):
             f"(attn_implementation={self.attn_implementation}, "
             f"action_sequence_length={self.action_sequence_length}, "
             f"actions_per_replan={self.actions_per_replan}, "
+            f"replan_action_range={self.replan_action_range}, "
             f"uncertainty_budget={self.uncertainty_budget}, "
             f"view_mode={self.view_mode}, pbo_enabled={self.pbo_enabled})"
         )
@@ -784,6 +820,7 @@ class PanoVLN_Agent(Agent):
             token_ids = cont.sequences[0, prompt_inputs.input_ids.shape[1]:].tolist()
             self.prediction_action_ids, self.prediction_action_uncertainties = extract_action_uncertainties(
                 token_ids, cont.logits, self.action_token_lookup, self.tokenizer.all_special_ids,
+                max_actions=self.replan_action_range[1],
             )
             cont = cont.sequences
         generated_ids_trimmed = [
@@ -842,14 +879,18 @@ class PanoVLN_Agent(Agent):
     def _build_pending_action_queue(self, action_ids):
         horizon = self.actions_per_replan
         if horizon == "uncertainty":
-            prefix = list(action_ids[:8])
+            prefix = list(action_ids[:self.replan_action_range[1]])
             if STOP_ACTION_ID in prefix:
                 prefix = prefix[:prefix.index(STOP_ACTION_ID) + 1]
             if prefix != self.prediction_action_ids:
                 raise ValueError("Parsed actions do not match uncertainty logits")
             horizon = select_uncertainty_horizon(
-                self.prediction_action_uncertainties, self.uncertainty_budget,
+                self.prediction_action_uncertainties, self.uncertainty_budget, self.replan_action_range,
             )
+            self.model_actions_per_replan.append(horizon)
+        elif horizon == "random":
+            # One independent, uniform draw per prediction, inclusive bounds.
+            horizon = self.replan_rng.randint(*self.replan_action_range)
             self.model_actions_per_replan.append(horizon)
         action_ids = select_actions_for_replan(
             action_ids,
@@ -958,9 +999,15 @@ def main():
         default=None,
         help=(
             "positive integer for a fixed execution length, or 'uncertainty' for "
-            "a current-logits uncertainty budget selecting K in 4..8; "
+            "a current-logits uncertainty budget; 'random' uniformly samples K per prediction; "
+            "both use --replan-action-range; "
             "when omitted, use model.config.action_sequence_length"
         ),
+    )
+    parser.add_argument(
+        "--replan-action-range", type=int, nargs=2, metavar=("MIN", "MAX"),
+        default=DEFAULT_REPLAN_ACTION_RANGE,
+        help="inclusive K range for uncertainty and random (default: 3 9); fixed K is unaffected",
     )
     parser.add_argument(
         "--uncertainty-budget", type=float, default=1.5,
@@ -972,6 +1019,7 @@ def main():
 
     try:
         args.uncertainty_budget = validate_uncertainty_budget(args.uncertainty_budget)
+        args.replan_action_range = validate_replan_action_range(args.replan_action_range)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1020,7 +1068,7 @@ def main():
                 args.forward_distance, args.turn_angle, args.max_memory_images,
                 args.memory_pool_window_frames, args.save_topdown, args.attn_implementation,
                 args.early_stop_max_steps, args.actions_per_replan,
-                args.uncertainty_budget)
+                args.uncertainty_budget, args.seed, args.replan_action_range)
 
 if __name__ == "__main__":
     main()
