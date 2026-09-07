@@ -1,8 +1,9 @@
 import json
 import logging
+import math
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 DEFAULT_EVAL_CPU_THREADS_PER_WORKER = 4
 EVAL_CPU_THREADS_ENV = "VLN_EVAL_CPU_THREADS_PER_WORKER"
@@ -133,20 +134,96 @@ def validate_eval_model_path(model_path: str) -> str:
 
 def resolve_actions_per_replan(
     model_action_sequence_length: int,
-    actions_per_replan: Optional[int],
-) -> int:
+    actions_per_replan: Optional[Union[int, str]],
+) -> Union[int, str]:
     model_action_sequence_length = validate_action_sequence_length(
         model_action_sequence_length
     )
     if actions_per_replan is None:
         return model_action_sequence_length
+    if actions_per_replan == "uncertainty":
+        return "uncertainty"
     return validate_action_sequence_length(actions_per_replan)
+
+
+def parse_actions_per_replan(value):
+    if value == "uncertainty":
+        return value
+    try:
+        return validate_action_sequence_length(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "actions-per-replan must be a positive integer or 'uncertainty'"
+        ) from exc
+
+
+def validate_uncertainty_budget(value):
+    budget = float(value)
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("uncertainty-budget must be finite and positive")
+    return budget
+
+
+def select_uncertainty_horizon(action_uncertainties, budget):
+    """Longest prefix in 4..8 with sum(-log p(action)) <= budget.
+
+    Four is the minimum nominal K, even if that prefix exceeds the budget.
+    STOP and short predictions are subsequently handled by the action queue.
+    This is model uncertainty, not a calibrated probability of execution error.
+    """
+    budget = validate_uncertainty_budget(budget)
+    horizon, cumulative = 4, 0.0
+    for position, uncertainty in enumerate(action_uncertainties[:8], start=1):
+        if not math.isfinite(uncertainty) or uncertainty < 0:
+            raise ValueError("Action uncertainty must be finite and nonnegative")
+        cumulative += uncertainty
+        if cumulative > budget:
+            break
+        horizon = max(4, position)
+    return horizon
+
+
+def build_action_token_lookup(tokenizer):
+    """Map both first-word and space-prefixed action tokens to four-way logits."""
+    lookup = {}
+    for prefix in ("", " "):
+        encoded = [tokenizer.encode(prefix + name, add_special_tokens=False)
+                   for name in ATOMIC_ACTION_NAMES]
+        if any(len(ids) != 1 for ids in encoded):
+            raise ValueError("Uncertainty mode requires one-token canonical actions")
+        token_ids = tuple(ids[0] for ids in encoded)
+        if len(set(token_ids)) != len(ATOMIC_ACTION_NAMES):
+            raise ValueError("Action token IDs must be distinct")
+        for action_id, token_id in enumerate(token_ids):
+            lookup[token_id] = (action_id, token_ids)
+    return lookup
+
+
+def extract_action_uncertainties(generated_ids, logits, token_lookup, special_ids):
+    """Read raw, temperature-1 four-action log probabilities from this generation."""
+    if logits is None or len(generated_ids) != len(logits):
+        raise ValueError("Generated tokens and raw logits are not aligned")
+    actions, uncertainties = [], []
+    for token_id, raw_logits in zip(generated_ids, logits):
+        if token_id in special_ids:
+            continue
+        if token_id not in token_lookup:
+            raise ValueError(f"Uncertainty mode received a noncanonical action token: {token_id}")
+        action_id, token_ids = token_lookup[token_id]
+        action_logits = raw_logits[0, list(token_ids)].float()
+        uncertainty = -action_logits.log_softmax(dim=-1)[action_id].item()
+        if not math.isfinite(uncertainty):
+            raise ValueError("Non-finite action logits in uncertainty mode")
+        actions.append(action_id)
+        uncertainties.append(uncertainty)
+        if action_id == STOP_ACTION_ID or len(actions) == 8:
+            break
+    return actions, uncertainties
 
 
 def select_actions_for_replan(
     action_ids: Sequence[int],
     actions_per_replan: int,
-    complete_action_event: bool = False,
 ) -> List[int]:
     actions_per_replan = validate_action_sequence_length(actions_per_replan)
     action_ids = list(action_ids)
@@ -156,17 +233,7 @@ def select_actions_for_replan(
     if STOP_ACTION_ID in action_ids:
         action_ids = action_ids[:action_ids.index(STOP_ACTION_ID) + 1]
 
-    end_index = min(actions_per_replan, len(action_ids))
-    if complete_action_event and 0 < end_index < len(action_ids):
-        boundary_action_id = action_ids[end_index - 1]
-        while (
-            end_index < len(action_ids)
-            and boundary_action_id != STOP_ACTION_ID
-            and action_ids[end_index] == boundary_action_id
-        ):
-            end_index += 1
-
-    return action_ids[:end_index]
+    return action_ids[:actions_per_replan]
 
 
 def build_eval_messages(
@@ -414,7 +481,7 @@ def evaluate_agent(
     attn_implementation,
     early_stop_max_steps,
     actions_per_replan,
-    complete_action_event,
+    uncertainty_budget=1.5,
 ) -> None:
     done_pairs = _load_done_pairs(result_path)
     pending_episodes = _filter_pending_episodes(list(dataset.episodes), done_pairs)
@@ -442,7 +509,7 @@ def evaluate_agent(
         save_topdown=save_topdown,
         attn_implementation=attn_implementation,
         actions_per_replan=actions_per_replan,
-        complete_action_event=complete_action_event,
+        uncertainty_budget=uncertainty_budget,
     )
 
     early_stop_max_steps = max(0, int(early_stop_max_steps))
@@ -478,6 +545,10 @@ def evaluate_agent(
             result_row["executed_action_history"] = executed_action_log
             result_row["model_generated_actions"] = list(agent.model_generated_actions)
             result_row["model_parsed_action_sequences"] = list(agent.model_parsed_action_sequences)
+            if agent.actions_per_replan == "uncertainty":
+                result_row["actions_per_replan"] = "uncertainty"
+                result_row["uncertainty_budget"] = agent.uncertainty_budget
+                result_row["model_actions_per_replan"] = list(agent.model_actions_per_replan)
             _append_result_row(result_path, split_id, result_row)
             agent.reset()
 
@@ -504,10 +575,12 @@ class PanoVLN_Agent(Agent):
         save_topdown=False,
         attn_implementation="sdpa",
         actions_per_replan=None,
-        complete_action_event=False,
+        uncertainty_budget=1.5,
     ):
         
         print("Initialize PanoVLN")
+
+        self.uncertainty_budget = validate_uncertainty_budget(uncertainty_budget)
         
         self.result_path = result_path
         self.save_topdown = save_topdown
@@ -553,7 +626,6 @@ class PanoVLN_Agent(Agent):
             self.action_sequence_length,
             actions_per_replan,
         )
-        self.complete_action_event = bool(complete_action_event)
         self.view_mode = normalize_vln_view_mode(
             getattr(self.model.config, "view_mode", DEFAULT_VLN_VIEW_MODE)
         )
@@ -595,6 +667,10 @@ class PanoVLN_Agent(Agent):
         self.tokenizer = getattr(self.processor, "tokenizer", None)
         if self.tokenizer is None:
             raise ValueError("Eval requires a tokenizer for generation token ids")
+        self.action_token_lookup = (
+            build_action_token_lookup(self.tokenizer)
+            if self.actions_per_replan == "uncertainty" else None
+        )
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
         self.bos_token_id = getattr(self.tokenizer, "bos_token_id", None)
@@ -625,7 +701,7 @@ class PanoVLN_Agent(Agent):
             f"(attn_implementation={self.attn_implementation}, "
             f"action_sequence_length={self.action_sequence_length}, "
             f"actions_per_replan={self.actions_per_replan}, "
-            f"complete_action_event={self.complete_action_event}, "
+            f"uncertainty_budget={self.uncertainty_budget}, "
             f"view_mode={self.view_mode}, pbo_enabled={self.pbo_enabled})"
         )
         
@@ -693,6 +769,10 @@ class PanoVLN_Agent(Agent):
                 temperature=generation_kwargs["temperature"],
                 top_p=generation_kwargs["top_p"],
             )
+        if self.actions_per_replan == "uncertainty":
+            if model_generation_kwargs["num_beams"] != 1:
+                raise ValueError("Uncertainty mode requires num_beams=1 for token/logit alignment")
+            model_generation_kwargs.update(output_logits=True, return_dict_in_generate=True)
         with torch.inference_mode():
             cont = self.model.generate(
                 **prompt_inputs,
@@ -700,6 +780,12 @@ class PanoVLN_Agent(Agent):
                 pad_token_id=self.pad_token_id,
                 **model_generation_kwargs,
             )
+        if self.actions_per_replan == "uncertainty":
+            token_ids = cont.sequences[0, prompt_inputs.input_ids.shape[1]:].tolist()
+            self.prediction_action_ids, self.prediction_action_uncertainties = extract_action_uncertainties(
+                token_ids, cont.logits, self.action_token_lookup, self.tokenizer.all_special_ids,
+            )
+            cont = cont.sequences
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(prompt_inputs.input_ids, cont)
         ]
@@ -754,10 +840,20 @@ class PanoVLN_Agent(Agent):
         return navigation, action_ids
 
     def _build_pending_action_queue(self, action_ids):
+        horizon = self.actions_per_replan
+        if horizon == "uncertainty":
+            prefix = list(action_ids[:8])
+            if STOP_ACTION_ID in prefix:
+                prefix = prefix[:prefix.index(STOP_ACTION_ID) + 1]
+            if prefix != self.prediction_action_ids:
+                raise ValueError("Parsed actions do not match uncertainty logits")
+            horizon = select_uncertainty_horizon(
+                self.prediction_action_uncertainties, self.uncertainty_budget,
+            )
+            self.model_actions_per_replan.append(horizon)
         action_ids = select_actions_for_replan(
             action_ids,
-            actions_per_replan=self.actions_per_replan,
-            complete_action_event=self.complete_action_event,
+            actions_per_replan=horizon,
         )
         if not action_ids:
             return [STOP_ACTION_ID]
@@ -784,6 +880,9 @@ class PanoVLN_Agent(Agent):
         self.model_parsed_action_sequences = []
         self.pending_action_queue = []
         self.conversations = []
+        self.prediction_action_ids = []
+        self.prediction_action_uncertainties = []
+        self.model_actions_per_replan = []
         
     def act(self, observations, info, episode_id):
 
@@ -855,24 +954,26 @@ def main():
                         help="optional hard cap on env steps per episode; 0 relies on habitat.environment.max_episode_steps")
     parser.add_argument(
         "--actions-per-replan",
-        type=int,
+        type=parse_actions_per_replan,
         default=None,
         help=(
-            "maximum number of generated actions to execute before replanning; "
+            "positive integer for a fixed execution length, or 'uncertainty' for "
+            "a current-logits uncertainty budget selecting K in 4..8; "
             "when omitted, use model.config.action_sequence_length"
         ),
     )
     parser.add_argument(
-        "--complete-action-event",
-        type=str2bool,
-        default=False,
-        help=(
-            "when an actions-per-replan boundary splits a consecutive run of "
-            "the same action, execute the rest of that run before replanning"
-        ),
+        "--uncertainty-budget", type=float, default=1.5,
+        help="maximum cumulative -log four-action probability in uncertainty mode; "
+             "set to an offline median six-action prefix score (default: 1.5)",
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for python, numpy, and torch")
     args = parser.parse_args()
+
+    try:
+        args.uncertainty_budget = validate_uncertainty_budget(args.uncertainty_budget)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     seed_all(args.seed)
     args.model_path = validate_eval_model_path(args.model_path)
@@ -919,7 +1020,7 @@ def main():
                 args.forward_distance, args.turn_angle, args.max_memory_images,
                 args.memory_pool_window_frames, args.save_topdown, args.attn_implementation,
                 args.early_stop_max_steps, args.actions_per_replan,
-                args.complete_action_event)
+                args.uncertainty_budget)
 
 if __name__ == "__main__":
     main()

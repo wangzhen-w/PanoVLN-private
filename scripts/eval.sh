@@ -17,12 +17,13 @@ SAVE_PATH="/workspace/code/vln_result/ablation_new/panovggt_pre_merger/panovggt_
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
-# Maximum generated actions to execute before replanning. Leave empty to use
-# action_sequence_length from the model's config.json.
+# Empty: use model.config.action_sequence_length; integer: fixed execution length.
+# "uncertainty": choose K in {4,5,6,7,8} from this prediction's logits.
+# Use a separate SAVE_PATH for each mode/budget; existing episodes are skipped.
 ACTIONS_PER_REPLAN=""
-# If true, do not replan in the middle of a consecutive run of the same action.
-# The run may therefore extend beyond ACTIONS_PER_REPLAN.
-COMPLETE_ACTION_EVENT=false
+# Budget for sum(-log p(action)) in uncertainty mode.
+# This is a fixed input parameter, not recomputed from online episode history.
+UNCERTAINTY_BUDGET=1.8
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 
@@ -51,11 +52,14 @@ fi
 
 actions_per_replan_args=()
 if [[ -n "$ACTIONS_PER_REPLAN" ]]; then
-    if [[ ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ACTIONS_PER_REPLAN must be empty or a positive integer: $ACTIONS_PER_REPLAN" >&2
+    if [[ "$ACTIONS_PER_REPLAN" != "uncertainty" && ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ACTIONS_PER_REPLAN must be empty, a positive integer, or uncertainty: $ACTIONS_PER_REPLAN" >&2
         exit 1
     fi
     actions_per_replan_args=(--actions-per-replan "$ACTIONS_PER_REPLAN")
+fi
+if [[ "$ACTIONS_PER_REPLAN" == "uncertainty" ]]; then
+    actions_per_replan_args+=(--uncertainty-budget "$UNCERTAINTY_BUDGET")
 fi
 
 echo "MODEL_PATH=$MODEL_PATH"
@@ -72,7 +76,7 @@ echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
 echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
 echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
 echo "ACTIONS_PER_REPLAN=${ACTIONS_PER_REPLAN:-model_config}"
-echo "COMPLETE_ACTION_EVENT=$COMPLETE_ACTION_EVENT"
+echo "UNCERTAINTY_BUDGET=$UNCERTAINTY_BUDGET"
 echo "EARLY_STOP_MAX_STEPS=$EARLY_STOP_MAX_STEPS"
 echo "Total processes: $CHUNKS"
 
@@ -113,7 +117,6 @@ for gpu_id in "${gpu_ids[@]}"; do
             --max-memory-images "$MAX_MEMORY_IMAGES" \
             --memory-pool-window-frames "$MEMORY_POOL_WINDOW_FRAMES" \
             "${actions_per_replan_args[@]}" \
-            --complete-action-event "$COMPLETE_ACTION_EVENT" \
             --model-path "$MODEL_PATH" \
             --max-episodes "$MAX_EPISODES" \
             --total-max-episodes "$TOTAL_MAX_EPISODES" \
