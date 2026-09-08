@@ -23,11 +23,11 @@ MEMORY_POOL_WINDOW_FRAMES=100
 # Use a separate SAVE_PATH for each mode/range/budget/seed; existing episodes are skipped.
 ACTIONS_PER_REPLAN=""
 # Inclusive (minimum maximum) for uncertainty/random; fixed integer K is unaffected.
-# Bash array syntax uses a space, not a comma: (3 9) or (4 8).
-REPLAN_ACTION_RANGE=(3 9)
+# Bash array syntax uses a space, not a comma: (1 9) or (4 8).
+REPLAN_ACTION_RANGE=(1 9)
 # Budget for sum(-log p(action)) in uncertainty mode.
 # This is a fixed input parameter, not recomputed from online episode history.
-UNCERTAINTY_BUDGET=1.5
+UNCERTAINTY_BUDGET=1.2
 TOTAL_MAX_EPISODES=0
 EARLY_STOP_MAX_STEPS=0
 

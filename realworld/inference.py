@@ -386,7 +386,6 @@ class PanoVLNPredictor:
                     DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
                 )
             )
-            self.pbo_enabled = bool(getattr(self.model.config, "pbo_enabled", False))
             _log_stage(
                 "model moved and initialized "
                 f"device={self._input_device()} "
@@ -395,7 +394,6 @@ class PanoVLNPredictor:
                 f"crop_bottom={self.erp_bottom_crop_degrees} "
                 f"action_sequence_length={self.action_sequence_length} "
                 f"view_mode={self.view_mode} "
-                f"pbo_enabled={self.pbo_enabled} "
                 f"in {_format_elapsed(step_start)}"
             )
             _log_stage(f"model load finished in {_format_elapsed(load_start)}")

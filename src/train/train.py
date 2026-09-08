@@ -17,8 +17,6 @@ from data.data import (
     normalize_vln_view_mode,
     validate_action_sequence_length,
 )
-from data.mixed import MixedSupervisedDataset, SourceGroupedSampler
-from data.panoworld import PanoWorldSupervisedDataset
 from utils import (
     build_action_accuracy,
     init_wandb,
@@ -61,7 +59,6 @@ class PanoVLNTrainer(Trainer):
         "visual",
         "visual_merger",
         "panovggt_mlp",
-        "pbo_head",
     )
 
     def get_decay_parameter_names(self, model):
@@ -89,8 +86,6 @@ class PanoVLNTrainer(Trainer):
             return "visual_merger"
         if self._name_has_module(name, "panovggt_mlp"):
             return "panovggt_mlp"
-        if self._name_has_module(name, "pbo_head"):
-            return "pbo_head"
         if self._name_has_module(name, "visual"):
             return "visual"
         if (
@@ -132,21 +127,6 @@ class PanoVLNTrainer(Trainer):
 
         return self.optimizer
 
-    def _get_train_sampler(self, train_dataset=None):
-        if train_dataset is None:
-            train_dataset = self.train_dataset
-        if getattr(train_dataset, "mixing_strategy", None) == "task":
-            return SourceGroupedSampler(
-                train_dataset,
-                batch_size=self._train_batch_size,
-                seed=self.args.seed,
-                shuffle=getattr(train_dataset, "shuffle", True),
-                world_size=self.args.world_size,
-                gradient_accumulation_steps=self.args.gradient_accumulation_steps,
-                drop_last=self.args.dataloader_drop_last,
-            )
-        return super()._get_train_sampler(train_dataset)
-
 def copy_chat_template_files(source_dir: str, output_dir: str):
     for template_name in ("chat_template.json", "chat_template.jinja"):
         source_path = os.path.join(source_dir, template_name)
@@ -181,15 +161,6 @@ def apply_config_overrides(cfg, overrides):
         setattr(target, field_name, yaml.safe_load(raw_value))
 
 
-def load_optional_text(path):
-    if not path:
-        return None
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing text file: {path}")
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read().strip()
-
-
 def save_resolved_experiment_config(cfg, overrides) -> None:
     output_dir = Path(cfg.training.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -213,7 +184,7 @@ def save_resolved_experiment_config(cfg, overrides) -> None:
 
 def validate_training_config(cfg) -> None:
     validate_action_sequence_length(cfg.model.action_sequence_length)
-    view_mode = normalize_vln_view_mode(cfg.model.view_mode)
+    normalize_vln_view_mode(cfg.model.view_mode)
     if not 0.0 < float(cfg.model.perspective_xfov_degrees) < 180.0:
         raise ValueError("model.perspective_xfov_degrees must be in (0, 180)")
     if not 0.0 < float(cfg.model.perspective_yfov_degrees) < 180.0:
@@ -222,43 +193,6 @@ def validate_training_config(cfg) -> None:
         raise ValueError("model.perspective_image_width must be positive")
     if int(cfg.model.perspective_image_height) <= 0:
         raise ValueError("model.perspective_image_height must be positive")
-    if float(cfg.model.pbo_loss_weight) < 0.0:
-        raise ValueError("model.pbo_loss_weight must be non-negative")
-    if int(cfg.model.pbo_head_hidden_size) <= 0:
-        raise ValueError("model.pbo_head_hidden_size must be positive")
-
-    panoworld_cfg = cfg.data.panoworld
-    if not panoworld_cfg.enabled:
-        return
-    if view_mode != "panorama":
-        raise ValueError(
-            "data.panoworld.enabled must be false for non-panorama VLN ablations"
-        )
-    if not panoworld_cfg.jsonl:
-        raise ValueError("data.panoworld.jsonl is required when data.panoworld.enabled=true")
-    if not panoworld_cfg.image_root:
-        raise ValueError("data.panoworld.image_root is required when data.panoworld.enabled=true")
-    if cfg.data.train_max_samples is not None:
-        raise ValueError(
-            "data.train_max_samples must be null when data.panoworld.enabled=true "
-            "because mixed training requires full PanoVLN exposure"
-        )
-    if not 0.0 <= float(panoworld_cfg.keep_ratio) <= 1.0:
-        raise ValueError(
-            "data.panoworld.keep_ratio must be in [0, 1], "
-            f"got {panoworld_cfg.keep_ratio}"
-        )
-    if panoworld_cfg.mixing_strategy not in {"sample", "task"}:
-        raise ValueError(
-            "data.panoworld.mixing_strategy must be 'sample' or 'task', "
-            f"got {panoworld_cfg.mixing_strategy}"
-        )
-    for name, path in (
-        ("data.panoworld.jsonl", panoworld_cfg.jsonl),
-        ("data.panoworld.image_root", panoworld_cfg.image_root),
-    ):
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Missing required path for {name}: {path}")
 
 
 def print_training_config(cfg) -> None:
@@ -285,16 +219,7 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"panovggt_injection_stage: {_config_value(cfg.model.panovggt_injection_stage)}")
     rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(cfg.model.panovggt_sampling_mode)}")
     rank0_print(RANK, f"panovggt_force_fp32: {_config_value(cfg.model.panovggt_force_fp32)}")
-    rank0_print(RANK, f"pbo_enabled: {_config_value(cfg.model.pbo_enabled)}")
-    rank0_print(RANK, f"pbo_loss_weight: {_config_value(cfg.model.pbo_loss_weight)}")
-    rank0_print(RANK, f"pbo_head_hidden_size: {_config_value(cfg.model.pbo_head_hidden_size)}")
     rank0_print(RANK, f"data_shuffle: {_config_value(cfg.data.shuffle)}")
-    rank0_print(RANK, f"panoworld_enabled: {_config_value(cfg.data.panoworld.enabled)}")
-    if cfg.data.panoworld.enabled:
-        rank0_print(RANK, f"panoworld_jsonl: {_config_value(cfg.data.panoworld.jsonl)}")
-        rank0_print(RANK, f"panoworld_image_root: {_config_value(cfg.data.panoworld.image_root)}")
-        rank0_print(RANK, f"panoworld_keep_ratio: {_config_value(cfg.data.panoworld.keep_ratio)}")
-        rank0_print(RANK, f"panoworld_mixing_strategy: {_config_value(cfg.data.panoworld.mixing_strategy)}")
     rank0_print(RANK, f"per_device_train_batch_size: {cfg.training.per_device_train_batch_size}")
     rank0_print(RANK, f"gradient_accumulation_steps: {cfg.training.gradient_accumulation_steps}")
     rank0_print(RANK, f"learning_rate: {cfg.training.learning_rate}")
@@ -302,7 +227,6 @@ def print_training_config(cfg) -> None:
     rank0_print(RANK, f"visual_lr: {_config_value(cfg.training.visual_lr)}")
     rank0_print(RANK, f"visual_merger_lr: {_config_value(cfg.training.visual_merger_lr)}")
     rank0_print(RANK, f"panovggt_mlp_lr: {_config_value(cfg.training.panovggt_mlp_lr)}")
-    rank0_print(RANK, f"pbo_head_lr: {_config_value(cfg.training.pbo_head_lr)}")
     rank0_print(RANK, f"bf16: {_config_value(cfg.training.bf16)}")
     rank0_print(RANK, f"fp16: {_config_value(cfg.training.fp16)}")
     rank0_print(RANK, "===========================")
@@ -362,7 +286,6 @@ def main():
     model = load_model(cfg)
     model_config = model.config
     effective_panovggt_enabled = bool(getattr(model_config, "panovggt_enabled", cfg.model.panovggt_enabled))
-    effective_pbo_enabled = bool(getattr(model_config, "pbo_enabled", cfg.model.pbo_enabled))
     effective_action_sequence_length = validate_action_sequence_length(
         getattr(
             model_config,
@@ -426,12 +349,9 @@ def main():
         rank0_print(RANK, f"panovggt_sampling_mode: {_config_value(getattr(model_config, 'panovggt_sampling_mode', None))}")
         rank0_print(RANK, f"erp_top_crop_degrees: {_config_value(effective_erp_top_crop_degrees)}")
         rank0_print(RANK, f"erp_bottom_crop_degrees: {_config_value(effective_erp_bottom_crop_degrees)}")
-        rank0_print(RANK, f"pbo_enabled: {_config_value(effective_pbo_enabled)}")
-        rank0_print(RANK, f"pbo_loss_weight: {_config_value(getattr(model_config, 'pbo_loss_weight', None))}")
         rank0_print(RANK, "==================================")
     train_image_root = cfg.data.train_image_root
     eval_image_root = cfg.data.eval_image_root or train_image_root
-    panoworld_cfg = cfg.data.panoworld
 
     train_dataset = SupervisedDataset(
         jsonl_path=cfg.data.train_jsonl,
@@ -449,49 +369,10 @@ def main():
         erp_top_crop_degrees=effective_erp_top_crop_degrees,
         erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
         panovggt_enabled=effective_panovggt_enabled,
-        pbo_enabled=effective_pbo_enabled,
         max_samples=cfg.data.train_max_samples,
-        shuffle=cfg.data.shuffle and not panoworld_cfg.enabled,
+        shuffle=cfg.data.shuffle,
         prompt_format=cfg.data.prompt_format,
     )
-    if panoworld_cfg.enabled:
-        panoworld_dataset = PanoWorldSupervisedDataset(
-            jsonl_path=panoworld_cfg.jsonl,
-            processor=processor,
-            tokenizer=tokenizer,
-            image_root=panoworld_cfg.image_root,
-            image_token=cfg.model.image_token,
-            model_max_length=cfg.model.model_max_length,
-            erp_top_crop_degrees=panoworld_cfg.top_crop_degrees,
-            erp_bottom_crop_degrees=panoworld_cfg.bottom_crop_degrees,
-            panovggt_enabled=effective_panovggt_enabled,
-            max_samples=panoworld_cfg.max_samples,
-            prompt_format=cfg.data.prompt_format,
-            system_prompt=(
-                panoworld_cfg.system_prompt
-                if panoworld_cfg.system_prompt is not None
-                else load_optional_text(panoworld_cfg.system_prompt_path)
-            ),
-            auto_insert_media_placeholders=panoworld_cfg.auto_insert_media_placeholders,
-        )
-        train_dataset = MixedSupervisedDataset(
-            vln_dataset=train_dataset,
-            panoworld_dataset=panoworld_dataset,
-            panoworld_keep_ratio=panoworld_cfg.keep_ratio,
-            seed=cfg.training.seed,
-            shuffle=cfg.data.shuffle,
-            mixing_strategy=panoworld_cfg.mixing_strategy,
-        )
-        if RANK == 0:
-            source_counts = getattr(train_dataset, "source_counts", {})
-            rank0_print(
-                RANK,
-                "mixed_train_dataset: "
-                f"total={len(train_dataset)}, "
-                f"vln={source_counts.get('vln', 0)}, "
-                f"panoworld={source_counts.get('panoworld', 0)}, "
-                f"mixing_strategy={panoworld_cfg.mixing_strategy}",
-            )
 
     eval_dataset = None
     if cfg.data.eval_jsonl and cfg.run.do_eval:
@@ -511,7 +392,6 @@ def main():
             erp_top_crop_degrees=effective_erp_top_crop_degrees,
             erp_bottom_crop_degrees=effective_erp_bottom_crop_degrees,
             panovggt_enabled=effective_panovggt_enabled,
-            pbo_enabled=effective_pbo_enabled,
             max_samples=cfg.data.eval_max_samples,
             shuffle=True,
             prompt_format=cfg.data.prompt_format,
@@ -574,7 +454,6 @@ def main():
             "visual": cfg.training.visual_lr,
             "visual_merger": cfg.training.visual_merger_lr,
             "panovggt_mlp": cfg.training.panovggt_mlp_lr,
-            "pbo_head": cfg.training.pbo_head_lr,
         },
         compute_metrics=(
             build_action_accuracy(

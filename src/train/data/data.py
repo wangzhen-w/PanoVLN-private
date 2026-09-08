@@ -28,7 +28,6 @@ DEFAULT_VLN_ACTION_SEQUENCE_LENGTH = 4
 # Backward-compatible name used by the existing DAgger collector.  Policy
 # training/evaluation use the value stored in model.config instead.
 VLN_ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
-PBO_ACTION_SEQUENCE_LENGTH = 4
 VLN_VIEW_MODES = {"panorama", "erp_180", "perspective"}
 DEFAULT_VLN_VIEW_MODE = "panorama"
 DEFAULT_PERSPECTIVE_XFOV_DEGREES = 90.0
@@ -47,12 +46,6 @@ VLN_ACTION_ALIASES = {
     "turn right": "right",
     "turn-right": "right",
     "stop": "stop",
-}
-VLN_ACTION_TO_ID = {
-    "stop": 0,
-    "forward": 1,
-    "left": 2,
-    "right": 3,
 }
 ACTION_COUNT_WORDS = {
     1: "one",
@@ -670,7 +663,6 @@ def _extract_real_action_count(
 def apply_vln_memory_policy(
     example: Dict[str, Any],
     *,
-    pbo_enabled: bool = False,
     action_sequence_length: int = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
     view_mode: str = DEFAULT_VLN_VIEW_MODE,
 ) -> Dict[str, Any]:
@@ -694,43 +686,14 @@ def apply_vln_memory_policy(
 
     instruction = _extract_vln_instruction(example)
     action_sequence = _extract_vln_action_sequence(example, action_sequence_length)
-    history_actions = _extract_vln_history_actions(example, current_step)
+    _extract_vln_history_actions(example, current_step)
     _extract_real_action_count(example, action_sequence, action_sequence_length)
 
-    has_pbo_target = bool(
-        pbo_enabled
-        and history_actions is not None
-        and len(history_actions) >= PBO_ACTION_SEQUENCE_LENGTH
-    )
-    four_step_memory_anchor = (
-        current_step - PBO_ACTION_SEQUENCE_LENGTH
-        if current_step >= PBO_ACTION_SEQUENCE_LENGTH
-        else -1
-    )
     selected_indices = build_vln_image_selection(
         current_step=current_step,
         last_frame_index=len(raw_images) - 1,
     )
     selected_images = [raw_images[index] for index in selected_indices]
-    # Keep the policy's standard uniform memory sampling unchanged.  PBO is
-    # supervised only when that sampling naturally includes the exact t-4
-    # endpoint required by the past-four action labels.
-    pbo_valid = bool(
-        has_pbo_target and four_step_memory_anchor in selected_indices
-    )
-    pbo_start_image_index = (
-        selected_indices.index(four_step_memory_anchor)
-        if pbo_valid
-        else -1
-    )
-
-    if pbo_valid:
-        pbo_action_labels = [
-            VLN_ACTION_TO_ID[action]
-            for action in history_actions[-PBO_ACTION_SEQUENCE_LENGTH:]
-        ]
-    else:
-        pbo_action_labels = [-100] * PBO_ACTION_SEQUENCE_LENGTH
 
     user_content = build_vln_user_content(
         instruction=instruction,
@@ -740,9 +703,6 @@ def apply_vln_memory_policy(
 
     normalized = dict(example)
     normalized["images"] = selected_images
-    normalized["_pbo_valid"] = pbo_valid
-    normalized["_pbo_start_image_index"] = pbo_start_image_index
-    normalized["_pbo_action_labels"] = pbo_action_labels
     normalized["messages"] = [
         {
             "role": "system",
@@ -831,7 +791,6 @@ class SupervisedDataset(Dataset):
         erp_top_crop_degrees: float = DEFAULT_ERP_TOP_CROP_DEGREES,
         erp_bottom_crop_degrees: float = DEFAULT_ERP_BOTTOM_CROP_DEGREES,
         panovggt_enabled: bool = False,
-        pbo_enabled: bool = False,
         max_samples: Optional[int] = None,
         shuffle: bool = True,
         prompt_format: str = "chat_template",
@@ -857,7 +816,6 @@ class SupervisedDataset(Dataset):
         self.erp_top_crop_degrees = float(erp_top_crop_degrees)
         self.erp_bottom_crop_degrees = float(erp_bottom_crop_degrees)
         self.panovggt_enabled = bool(panovggt_enabled)
-        self.pbo_enabled = bool(pbo_enabled)
         self.prompt_format = prompt_format
         self._fp = None
 
@@ -937,7 +895,6 @@ class SupervisedDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, Any]:
         example = apply_vln_memory_policy(
             self._load_example(index),
-            pbo_enabled=self.pbo_enabled,
             action_sequence_length=self.action_sequence_length,
             view_mode=self.view_mode,
         )
@@ -1015,18 +972,6 @@ class SupervisedDataset(Dataset):
             [resolve_current_image_index(image_count)],
             dtype=torch.long,
         )
-        item["pbo_action_labels"] = torch.tensor(
-            [example["_pbo_action_labels"]],
-            dtype=torch.long,
-        )
-        item["pbo_valid_mask"] = torch.tensor(
-            [example["_pbo_valid"]],
-            dtype=torch.bool,
-        )
-        item["pbo_start_image_index"] = torch.tensor(
-            [example["_pbo_start_image_index"]],
-            dtype=torch.long,
-        )
 
         if "mm_token_type_ids" in encoded:
             item["mm_token_type_ids"] = encoded["mm_token_type_ids"].squeeze(0)
@@ -1055,7 +1000,4 @@ STACKABLE_KEYS = (
     "image_num_images",
     "image_current_index",
     "panovggt_pixel_values",
-    "pbo_action_labels",
-    "pbo_valid_mask",
-    "pbo_start_image_index",
 )

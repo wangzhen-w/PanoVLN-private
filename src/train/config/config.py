@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import yaml
@@ -29,26 +29,6 @@ class ModelConfig:
     panovggt_injection_stage: str = "post_merger"
     panovggt_sampling_mode: str = "grouping"
     panovggt_force_fp32: bool = False
-    pbo_enabled: bool = False
-    pbo_loss_weight: float = 0.1
-    pbo_head_hidden_size: int = 512
-
-
-@dataclass
-class PanoWorldDataConfig:
-    enabled: bool = False
-    jsonl: Optional[str] = None
-    image_root: Optional[str] = None
-    keep_ratio: float = 0.0
-    mixing_strategy: str = "sample"
-    max_samples: Optional[int] = None
-    system_prompt: Optional[str] = None
-    system_prompt_path: Optional[str] = (
-        "/workspace/code/VLN/src/panoworld/config/system_prompts/erp_multimodal_prompts.txt"
-    )
-    top_crop_degrees: float = 0.0
-    bottom_crop_degrees: float = 0.0
-    auto_insert_media_placeholders: bool = True
 
 
 @dataclass
@@ -63,7 +43,6 @@ class DataConfig:
     action_vocab: Optional[List[str]] = None
     f1_action_weight: Optional[List[float]] = None
     prompt_format: str = "chat_template"
-    panoworld: PanoWorldDataConfig = field(default_factory=PanoWorldDataConfig)
 
 
 @dataclass
@@ -77,7 +56,6 @@ class TrainingConfig:
     visual_lr: Optional[float] = None
     visual_merger_lr: Optional[float] = None
     panovggt_mlp_lr: Optional[float] = None
-    pbo_head_lr: Optional[float] = None
     weight_decay: float = 0.0
     num_train_epochs: float = 1.0
     logging_steps: int = 10
@@ -144,10 +122,6 @@ def load_config(path: str) -> TrainConfig:
     training = raw.get("training", {})
     run = raw.get("run", {})
     wandb = raw.get("wandb", None)
-    if "panoworld" in data:
-        data = dict(data)
-        panoworld = data.get("panoworld") or {}
-        data["panoworld"] = PanoWorldDataConfig(**panoworld)
 
     return TrainConfig(
         model=ModelConfig(**model),

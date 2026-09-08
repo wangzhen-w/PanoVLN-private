@@ -15,12 +15,6 @@ PANOVGGT_POINT_HIDDEN_DIM = 1024
 PANOVGGT_FEATURE_SOURCES = {"aggregator", "point_hidden"}
 PANOVGGT_INJECTION_STAGES = {"post_merger", "pre_merger"}
 PANOVGGT_MLP_HIDDEN_SIZE = 4096
-PBO_ACTION_HORIZON = 4
-PBO_NUM_ACTIONS = 4
-# Six is the current endpoint-only PBO input. Legacy checkpoints may store
-# pbo_input_vector_count=7 and prepend one LLM instruction-context vector.
-PBO_INPUT_VECTOR_COUNT = 6
-PBO_SUPPORTED_INPUT_VECTOR_COUNTS = {6, 7}
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
 VENDORED_PANOVGGT_DIR = SRC_ROOT / "panovggt"
@@ -39,18 +33,6 @@ def ensure_panovggt_config(config) -> None:
         "panovggt_sampling_mode": "grouping",
         "panovggt_force_fp32": False,
         "panovggt_output_dim": int(getattr(vision_config, "out_hidden_size", text_hidden_size)),
-    }
-    for field_name, default_value in defaults.items():
-        if not hasattr(config, field_name):
-            setattr(config, field_name, default_value)
-
-
-def ensure_pbo_config(config) -> None:
-    defaults = {
-        "pbo_enabled": False,
-        "pbo_loss_weight": 0.1,
-        "pbo_head_hidden_size": 512,
-        "pbo_input_vector_count": PBO_INPUT_VECTOR_COUNT,
     }
     for field_name, default_value in defaults.items():
         if not hasattr(config, field_name):
@@ -639,7 +621,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         "panovggt_mlp.mlp.2.bias",
     )
     def __init__(self, config):
-        ensure_pbo_config(config)
         panovggt_enabled = bool(getattr(config, "panovggt_enabled", False))
         if panovggt_enabled:
             ensure_panovggt_config(config)
@@ -649,31 +630,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             ensure_panovggt_config(config)
 
         self.panovggt_mlp = PanoVGGTGeometryMLP(config) if panovggt_enabled else None
-        text_hidden_size = int(config.text_config.hidden_size)
-        pbo_hidden_size = int(getattr(config, "pbo_head_hidden_size", 512))
-        pbo_input_vector_count = int(
-            getattr(config, "pbo_input_vector_count", PBO_INPUT_VECTOR_COUNT)
-        )
-        if pbo_input_vector_count not in PBO_SUPPORTED_INPUT_VECTOR_COUNTS:
-            raise ValueError(
-                "pbo_input_vector_count must be 6 or 7, "
-                f"got {pbo_input_vector_count}"
-            )
-        self.pbo_head = None
-        if bool(getattr(config, "pbo_enabled", False)):
-            self.pbo_head = nn.Sequential(
-                nn.LayerNorm(text_hidden_size * pbo_input_vector_count),
-                nn.Linear(
-                    text_hidden_size * pbo_input_vector_count,
-                    pbo_hidden_size,
-                ),
-                nn.GELU(),
-                nn.Linear(
-                    pbo_hidden_size,
-                    PBO_ACTION_HORIZON * PBO_NUM_ACTIONS,
-                ),
-            )
-            self.pbo_head.apply(self._init_weights)
 
         self.panovggt = None
         self._panovggt_weights_ready = False
@@ -687,44 +643,10 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         self._pano_runtime_panovggt_pixel_values = None
         self._pano_runtime_in_image_features = False
         self._pano_runtime_visual_grid_thw = None
-        self._capture_auxiliary_hidden = False
-        self._auxiliary_last_hidden = None
-        self.model.language_model.norm.register_forward_hook(
-            self._capture_auxiliary_hidden_hook
-        )
         self._install_pano_merger_hook()
         self._install_image_feature_hook()
         self.register_load_state_dict_pre_hook(self._drop_incompatible_panovggt_mlp_pre_hook)
         self.register_load_state_dict_post_hook(self._load_missing_pano_parameters_post_hook)
-
-    def _capture_auxiliary_hidden_hook(self, module, inputs, output) -> None:
-        del module, inputs
-        if self._capture_auxiliary_hidden:
-            self._auxiliary_last_hidden = output
-
-    def _pbo_enabled(self) -> bool:
-        return self.pbo_head is not None and bool(getattr(self.config, "pbo_enabled", False))
-
-    @staticmethod
-    def _distributed_masked_mean(
-        local_sum: torch.Tensor,
-        local_count: int,
-    ) -> torch.Tensor:
-        count = torch.tensor(
-            float(local_count),
-            device=local_sum.device,
-            dtype=torch.float32,
-        )
-        world_size = 1
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
-            world_size = torch.distributed.get_world_size()
-        if float(count.item()) <= 0.0:
-            return local_sum * 0.0
-        # DDP/DeepSpeed averages gradients across data-parallel ranks.  Scaling
-        # each local sum by world_size/global_count therefore produces the true
-        # global masked mean after gradient reduction.
-        return local_sum * (float(world_size) / count)
 
     def _panovggt_enabled(self) -> bool:
         return self.panovggt_mlp is not None and bool(getattr(self.panovggt_mlp, "enabled", False))
@@ -1204,309 +1126,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
             if bool(valid[batch_index].item())
         ]
 
-    def _split_llm_image_hidden_states(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        mm_token_type_ids: torch.Tensor | None,
-        image_grid_thw: torch.Tensor,
-        image_num_images: torch.Tensor,
-        image_erp_geometry: torch.Tensor | None,
-    ) -> list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]]:
-        batch_size = int(hidden_states.shape[0])
-        image_num_images = image_num_images.to(device="cpu", dtype=torch.long)
-        if int(image_num_images.numel()) != batch_size:
-            raise AssertionError(
-                "image_num_images batch mismatch: "
-                f"counts={int(image_num_images.numel())}, batch={batch_size}"
-            )
-        image_grid_cpu = image_grid_thw.detach().to(device="cpu", dtype=torch.long)
-        if int(image_num_images.sum().item()) != int(image_grid_cpu.shape[0]):
-            raise AssertionError(
-                "image_num_images does not sum to image_grid_thw rows: "
-                f"counts={image_num_images.tolist()}, grids={int(image_grid_cpu.shape[0])}"
-            )
-
-        geometry_cpu = None
-        if image_erp_geometry is not None:
-            geometry_cpu = image_erp_geometry.detach().to(device="cpu", dtype=torch.float32)
-            if int(geometry_cpu.shape[0]) != int(image_grid_cpu.shape[0]):
-                raise AssertionError(
-                    "image_erp_geometry/image_grid_thw row mismatch: "
-                    f"geometry={int(geometry_cpu.shape[0])}, grids={int(image_grid_cpu.shape[0])}"
-                )
-
-        merge_size = int(self.config.vision_config.spatial_merge_size)
-        grid_offset = 0
-        grouped_hidden_states = []
-        for batch_index, num_images_tensor in enumerate(image_num_images):
-            num_images = int(num_images_tensor.item())
-            sample_grids = image_grid_cpu[grid_offset:grid_offset + num_images]
-            sample_geometry = (
-                None
-                if geometry_cpu is None
-                else geometry_cpu[grid_offset:grid_offset + num_images]
-            )
-            grid_offset += num_images
-
-            if mm_token_type_ids is not None:
-                visual_positions = torch.nonzero(
-                    mm_token_type_ids[batch_index] == 1,
-                    as_tuple=False,
-                ).flatten()
-            else:
-                visual_positions = torch.nonzero(
-                    input_ids[batch_index] == int(self.config.image_token_id),
-                    as_tuple=False,
-                ).flatten()
-
-            image_lengths = []
-            for grid in sample_grids.tolist():
-                grid_t, grid_h, grid_w = [int(value) for value in grid]
-                if grid_h % merge_size != 0 or grid_w % merge_size != 0:
-                    raise AssertionError(
-                        "Image grid is not divisible by Qwen spatial merge size: "
-                        f"grid={grid}, merge_size={merge_size}"
-                    )
-                image_lengths.append(
-                    grid_t * (grid_h // merge_size) * (grid_w // merge_size)
-                )
-            if int(visual_positions.numel()) != sum(image_lengths):
-                raise AssertionError(
-                    "LLM visual-token count does not match image grids: "
-                    f"sample={batch_index}, tokens={int(visual_positions.numel())}, "
-                    f"expected={sum(image_lengths)}, lengths={image_lengths}"
-                )
-
-            sample_visual_hidden = hidden_states[batch_index].index_select(
-                0,
-                visual_positions.to(device=hidden_states.device),
-            )
-            sample_groups = []
-            token_offset = 0
-            for image_index, (grid, image_length) in enumerate(
-                zip(sample_grids, image_lengths)
-            ):
-                geometry = (
-                    None if sample_geometry is None else sample_geometry[image_index]
-                )
-                sample_groups.append(
-                    (
-                        sample_visual_hidden[token_offset:token_offset + image_length],
-                        grid,
-                        geometry,
-                    )
-                )
-                token_offset += image_length
-            grouped_hidden_states.append(sample_groups)
-
-        return grouped_hidden_states
-
-    @staticmethod
-    def spherical_yaw_fourier_pool(
-        image_hidden_states: torch.Tensor,
-        image_grid_thw: torch.Tensor,
-        image_erp_geometry: torch.Tensor | None,
-        spatial_merge_size: int,
-    ) -> torch.Tensor:
-        grid_t, grid_h, grid_w = [
-            int(value)
-            for value in image_grid_thw.detach().to(device="cpu", dtype=torch.long).tolist()
-        ]
-        if grid_h % spatial_merge_size != 0 or grid_w % spatial_merge_size != 0:
-            raise AssertionError(
-                "Image grid is not divisible by the spatial merge size: "
-                f"grid={(grid_t, grid_h, grid_w)}, merge={spatial_merge_size}"
-            )
-        pooled_h = grid_h // spatial_merge_size
-        pooled_w = grid_w // spatial_merge_size
-        expected_tokens = grid_t * pooled_h * pooled_w
-        if int(image_hidden_states.shape[0]) != expected_tokens:
-            raise AssertionError(
-                "Fourier pooling token/grid mismatch: "
-                f"tokens={int(image_hidden_states.shape[0])}, expected={expected_tokens}"
-            )
-
-        hidden = image_hidden_states.float().reshape(
-            grid_t,
-            pooled_h,
-            pooled_w,
-            int(image_hidden_states.shape[-1]),
-        )
-        device = hidden.device
-        if image_erp_geometry is None:
-            vertical_fov = math.pi
-            center_latitude = 0.0
-            horizontal_fov = 2.0 * math.pi
-            center_longitude = 0.0
-        else:
-            geometry_values = image_erp_geometry.detach().to(
-                device="cpu",
-                dtype=torch.float32,
-            ).tolist()
-            vertical_fov = float(geometry_values[0])
-            center_latitude = float(geometry_values[1])
-            if len(geometry_values) >= 4:
-                horizontal_fov = float(geometry_values[2])
-                center_longitude = float(geometry_values[3])
-            else:
-                # Backward compatibility with checkpoints and batches whose
-                # ERP geometry predates horizontal-FOV metadata.
-                horizontal_fov = 2.0 * math.pi
-                center_longitude = 0.0
-
-        latitude = (
-            center_latitude
-            - 0.5 * vertical_fov
-            + (torch.arange(pooled_h, device=device, dtype=torch.float32) + 0.5)
-            * (vertical_fov / pooled_h)
-        )
-        longitude = (
-            center_longitude
-            - 0.5 * horizontal_fov
-            + (torch.arange(pooled_w, device=device, dtype=torch.float32) + 0.5)
-            * (horizontal_fov / pooled_w)
-        )
-        area_weight = latitude.cos().clamp_min(0.0).view(1, pooled_h, 1, 1)
-        cosine_basis = longitude.cos().view(1, 1, pooled_w, 1)
-        sine_basis = longitude.sin().view(1, 1, pooled_w, 1)
-        denominator = area_weight.sum() * float(grid_t * pooled_w)
-        denominator = denominator.clamp_min(torch.finfo(torch.float32).eps)
-
-        zero_order = (hidden * area_weight).sum(dim=(0, 1, 2)) / denominator
-        cosine_order = (
-            2.0 * (hidden * area_weight * cosine_basis).sum(dim=(0, 1, 2))
-            / denominator
-        )
-        sine_order = (
-            2.0 * (hidden * area_weight * sine_basis).sum(dim=(0, 1, 2))
-            / denominator
-        )
-        return torch.cat((zero_order, cosine_order, sine_order), dim=-1)
-
-    @staticmethod
-    def _first_supervised_token_index(sample_labels: torch.Tensor) -> int:
-        supervised_positions = torch.nonzero(
-            sample_labels != -100,
-            as_tuple=False,
-        ).flatten()
-        if supervised_positions.numel() == 0:
-            return -1
-        return int(supervised_positions[0].item())
-
-    def _compute_pbo_loss(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        image_groups: list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]],
-        labels: torch.Tensor,
-        image_current_index: torch.Tensor,
-        pbo_action_labels: torch.Tensor | None,
-        pbo_valid_mask: torch.Tensor | None,
-        pbo_start_image_index: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if self.pbo_head is None:
-            return hidden_states.sum() * 0.0
-
-        batch_size, _, hidden_size = hidden_states.shape
-        pbo_input_vector_count = int(
-            getattr(self.config, "pbo_input_vector_count", PBO_INPUT_VECTOR_COUNT)
-        )
-        if pbo_input_vector_count not in PBO_SUPPORTED_INPUT_VECTOR_COUNTS:
-            raise AssertionError(
-                "Unsupported PBO input vector count: "
-                f"{pbo_input_vector_count}"
-            )
-        head_dtype = next(self.pbo_head.parameters()).dtype
-        features = torch.zeros(
-            (batch_size, hidden_size * pbo_input_vector_count),
-            device=hidden_states.device,
-            dtype=head_dtype,
-        )
-        if pbo_valid_mask is None:
-            valid_mask = torch.zeros(batch_size, device=hidden_states.device, dtype=torch.bool)
-        else:
-            valid_mask = pbo_valid_mask.to(device=hidden_states.device, dtype=torch.bool)
-
-        current_indices = image_current_index.to(device="cpu", dtype=torch.long)
-        start_indices = (
-            torch.full((batch_size,), -1, dtype=torch.long)
-            if pbo_start_image_index is None
-            else pbo_start_image_index.to(device="cpu", dtype=torch.long)
-        )
-        merge_size = int(self.config.vision_config.spatial_merge_size)
-        for batch_index in torch.nonzero(valid_mask, as_tuple=False).flatten().tolist():
-            start_index = int(start_indices[batch_index].item())
-            current_index = int(current_indices[batch_index].item())
-            sample_groups = image_groups[batch_index]
-            if not (0 <= start_index < len(sample_groups)):
-                raise AssertionError(
-                    f"PBO start image index is invalid: sample={batch_index}, index={start_index}, "
-                    f"num_images={len(sample_groups)}"
-                )
-            if not (0 <= current_index < len(sample_groups)):
-                raise AssertionError(
-                    f"PBO current image index is invalid: sample={batch_index}, index={current_index}, "
-                    f"num_images={len(sample_groups)}"
-                )
-
-            previous_hidden, previous_grid, previous_geometry = sample_groups[start_index]
-            current_hidden, current_grid, current_geometry = sample_groups[current_index]
-            previous_fourier = self.spherical_yaw_fourier_pool(
-                previous_hidden,
-                previous_grid,
-                previous_geometry,
-                merge_size,
-            )
-            current_fourier = self.spherical_yaw_fourier_pool(
-                current_hidden,
-                current_grid,
-                current_geometry,
-                merge_size,
-            )
-            feature_vectors = [previous_fourier, current_fourier]
-            if pbo_input_vector_count == 7:
-                context_index = (
-                    self._first_supervised_token_index(labels[batch_index]) - 1
-                )
-                if context_index < 0:
-                    raise AssertionError(
-                        f"PBO sample {batch_index} has no prompt token before "
-                        "the assistant response"
-                    )
-                feature_vectors.insert(
-                    0,
-                    hidden_states[batch_index, context_index].float(),
-                )
-            pbo_feature = torch.cat(feature_vectors, dim=-1)
-            features[batch_index] = pbo_feature.to(dtype=head_dtype)
-
-        logits = self.pbo_head(features).reshape(
-            batch_size,
-            PBO_ACTION_HORIZON,
-            PBO_NUM_ACTIONS,
-        )
-        local_loss_sum = logits.sum() * 0.0
-        local_target_count = 0
-        if bool(valid_mask.any().item()):
-            if pbo_action_labels is None:
-                raise AssertionError(
-                    "PBO has valid samples but pbo_action_labels is missing"
-                )
-            targets = pbo_action_labels.to(device=logits.device, dtype=torch.long)
-            valid_targets = targets[valid_mask].reshape(-1)
-            local_target_count = int((valid_targets != -100).sum().item())
-            local_loss_sum = F.cross_entropy(
-                logits[valid_mask].reshape(-1, PBO_NUM_ACTIONS).float(),
-                valid_targets,
-                reduction="sum",
-            )
-        return self._distributed_masked_mean(
-            local_loss_sum,
-            local_target_count,
-        )
-
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1525,9 +1144,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
         image_num_images: torch.LongTensor | None = None,
         image_current_index: torch.LongTensor | None = None,
         panovggt_pixel_values: torch.Tensor | None = None,
-        pbo_action_labels: torch.LongTensor | None = None,
-        pbo_valid_mask: torch.BoolTensor | None = None,
-        pbo_start_image_index: torch.LongTensor | None = None,
         **kwargs,
     ):
         if self._panovggt_enabled():
@@ -1538,14 +1154,8 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 image_erp_geometry=image_erp_geometry,
                 panovggt_pixel_values=panovggt_pixel_values,
             )
-        auxiliary_enabled = bool(
-            labels is not None
-            and self._pbo_enabled()
-        )
-        self._capture_auxiliary_hidden = auxiliary_enabled
-        self._auxiliary_last_hidden = None
         try:
-            outputs = super().forward(
+            return super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1560,55 +1170,7 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
                 logits_to_keep=logits_to_keep,
                 **kwargs,
             )
-            if not auxiliary_enabled:
-                return outputs
-            hidden_states = self._auxiliary_last_hidden
-            if hidden_states is None:
-                raise AssertionError("Failed to capture the final LLM hidden states")
-            if input_ids is None or labels is None:
-                raise AssertionError("PBO loss requires input_ids and labels")
-
-            batch_size = int(hidden_states.shape[0])
-            if image_num_images is None:
-                image_num_images = torch.zeros(
-                    batch_size,
-                    device=hidden_states.device,
-                    dtype=torch.long,
-                )
-            if image_current_index is None:
-                image_current_index = image_num_images - 1
-            if image_grid_thw is not None:
-                image_groups = self._split_llm_image_hidden_states(
-                    hidden_states=hidden_states,
-                    input_ids=input_ids,
-                    mm_token_type_ids=mm_token_type_ids,
-                    image_grid_thw=image_grid_thw,
-                    image_num_images=image_num_images,
-                    image_erp_geometry=image_erp_geometry,
-                )
-            else:
-                image_groups = [[] for _ in range(batch_size)]
-
-            auxiliary_loss = hidden_states.sum() * 0.0
-            if self._pbo_enabled():
-                pbo_loss = self._compute_pbo_loss(
-                    hidden_states=hidden_states,
-                    image_groups=image_groups,
-                    labels=labels,
-                    image_current_index=image_current_index,
-                    pbo_action_labels=pbo_action_labels,
-                    pbo_valid_mask=pbo_valid_mask,
-                    pbo_start_image_index=pbo_start_image_index,
-                )
-                auxiliary_loss = auxiliary_loss + float(
-                    getattr(self.config, "pbo_loss_weight", 0.1)
-                ) * pbo_loss
-
-            outputs.loss = auxiliary_loss if outputs.loss is None else outputs.loss + auxiliary_loss
-            return outputs
         finally:
-            self._capture_auxiliary_hidden = False
-            self._auxiliary_last_hidden = None
             self._clear_runtime_pano_context()
 
     def _load_missing_pano_parameters_post_hook(self, module, incompatible_keys) -> None:
@@ -1639,70 +1201,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
     @classmethod
     def _checkpoint_has_panovggt_weights(cls, pretrained_model_name_or_path) -> bool | None:
         return cls._checkpoint_has_any_weights(pretrained_model_name_or_path, cls.PANOVGGT_STATE_KEYS)
-
-    @classmethod
-    def _local_pbo_head_input_width(cls, pretrained_model_name_or_path) -> int | None:
-        checkpoint_dir = Path(str(pretrained_model_name_or_path))
-        if not checkpoint_dir.is_dir():
-            return None
-
-        tensor_key = "pbo_head.0.weight"
-        safetensors_path = checkpoint_dir / "model.safetensors"
-        if not safetensors_path.exists():
-            index_path = checkpoint_dir / "model.safetensors.index.json"
-            if not index_path.exists():
-                return None
-            try:
-                weight_map = json.loads(index_path.read_text())["weight_map"]
-                shard_name = weight_map.get(tensor_key)
-            except (KeyError, OSError, TypeError, ValueError):
-                return None
-            if not shard_name:
-                return None
-            safetensors_path = checkpoint_dir / shard_name
-
-        try:
-            from safetensors import safe_open
-
-            with safe_open(
-                str(safetensors_path),
-                framework="pt",
-                device="cpu",
-            ) as handle:
-                if tensor_key not in handle.keys():
-                    return None
-                shape = tuple(handle.get_slice(tensor_key).get_shape())
-        except Exception:
-            return None
-        if len(shape) != 1:
-            return None
-        return int(shape[0])
-
-    @classmethod
-    def _configure_pbo_input_width_from_checkpoint(
-        cls,
-        pretrained_model_name_or_path,
-        config,
-    ) -> int | None:
-        input_width = cls._local_pbo_head_input_width(
-            pretrained_model_name_or_path
-        )
-        if input_width is None:
-            return None
-        hidden_size = int(config.text_config.hidden_size)
-        if input_width % hidden_size != 0:
-            raise ValueError(
-                "PBO checkpoint input width is not divisible by the text hidden "
-                f"size: width={input_width}, hidden_size={hidden_size}"
-            )
-        vector_count = input_width // hidden_size
-        if vector_count not in PBO_SUPPORTED_INPUT_VECTOR_COUNTS:
-            raise ValueError(
-                "Unsupported PBO checkpoint input width: "
-                f"{vector_count} vectors ({input_width} features)"
-            )
-        config.pbo_input_vector_count = vector_count
-        return vector_count
 
     @classmethod
     def _checkpoint_has_any_weights(cls, pretrained_model_name_or_path, state_keys) -> bool | None:
@@ -1750,33 +1248,6 @@ class Qwen3_5ForConditionalGenerationForPanoVLN(Qwen3_5ForConditionalGeneration)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        checkpoint_pbo_width = cls._local_pbo_head_input_width(
-            pretrained_model_name_or_path
-        )
-        if checkpoint_pbo_width is not None:
-            config = kwargs.get("config")
-            if config is None:
-                config_kwargs = {
-                    key: kwargs[key]
-                    for key in (
-                        "cache_dir",
-                        "force_download",
-                        "local_files_only",
-                        "revision",
-                        "token",
-                        "subfolder",
-                    )
-                    if key in kwargs
-                }
-                config = cls.config_class.from_pretrained(
-                    pretrained_model_name_or_path,
-                    **config_kwargs,
-                )
-                kwargs["config"] = config
-            cls._configure_pbo_input_width_from_checkpoint(
-                pretrained_model_name_or_path,
-                config,
-            )
         model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
         has_panovggt_weights = cls._checkpoint_has_panovggt_weights(pretrained_model_name_or_path)
         if has_panovggt_weights is False:

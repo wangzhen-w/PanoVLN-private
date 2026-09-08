@@ -12,13 +12,6 @@ STACKABLE_KEYS = (
     "panovggt_pixel_values",
 )
 
-AUXILIARY_DEFAULTS = {
-    "pbo_action_labels": lambda: torch.full((1, 4), -100, dtype=torch.long),
-    "pbo_valid_mask": lambda: torch.zeros((1,), dtype=torch.bool),
-    "pbo_start_image_index": lambda: torch.full((1,), -1, dtype=torch.long),
-}
-
-
 class MultiModalDataCollator:
     def __init__(self, tokenizer, pad_to_multiple_of: Optional[int] = None):
         self.tokenizer = tokenizer
@@ -70,11 +63,5 @@ class MultiModalDataCollator:
                     f"{present_count}/{len(features)} samples include it"
                 )
             batch[key] = torch.cat([feature[key] for feature in features], dim=0)
-
-        for key, default_factory in AUXILIARY_DEFAULTS.items():
-            batch[key] = torch.cat(
-                [feature.get(key, default_factory()) for feature in features],
-                dim=0,
-            )
 
         return batch

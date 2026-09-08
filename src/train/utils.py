@@ -27,7 +27,6 @@ DEFAULT_TRAINABLE_MODULES = {
     "visual_merger": True,
     "language_model": True,
     "panovggt_mlp": True,
-    "pbo_head": True,
 }
 def set_seed(seed: int):
     random.seed(seed)
@@ -74,7 +73,6 @@ def set_model(cfg, model):
             if visual_model is not None else None
         ),
         "panovggt_mlp": getattr(model, "panovggt_mlp", None),
-        "pbo_head": getattr(model, "pbo_head", None),
         "language_model": language_model,
     }
 
@@ -110,12 +108,6 @@ def _load_model_config(cfg):
         cfg.model.name_or_path,
         cache_dir=cfg.model.cache_dir,
     )
-    checkpoint_pbo_enabled = bool(getattr(config, "pbo_enabled", False))
-    checkpoint_pbo_input_vector_count = getattr(
-        config,
-        "pbo_input_vector_count",
-        None,
-    )
     behavior_fields = (
         "action_sequence_length",
         "view_mode",
@@ -136,11 +128,6 @@ def _load_model_config(cfg):
         "panovggt_injection_stage",
         "panovggt_sampling_mode",
         "panovggt_force_fp32",
-    )
-    pbo_fields = (
-        "pbo_enabled",
-        "pbo_loss_weight",
-        "pbo_head_hidden_size",
     )
 
     def apply_module_fields(enabled: bool, field_names: tuple[str, ...]) -> None:
@@ -167,12 +154,6 @@ def _load_model_config(cfg):
     for field_name in behavior_fields + erp_crop_fields:
         setattr(config, field_name, getattr(cfg.model, field_name))
     apply_module_fields_preserve_checkpoint(bool(cfg.model.panovggt_enabled), panovggt_fields)
-    apply_module_fields_preserve_checkpoint(bool(cfg.model.pbo_enabled), pbo_fields)
-    # The input width is part of the saved PBO head architecture. Preserve
-    # explicit legacy metadata here; model loading also infers it from local
-    # PBO weights for older checkpoints that predate this config field.
-    if checkpoint_pbo_enabled and checkpoint_pbo_input_vector_count is not None:
-        config.pbo_input_vector_count = int(checkpoint_pbo_input_vector_count)
     return config
 
 

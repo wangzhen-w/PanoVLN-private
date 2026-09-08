@@ -692,7 +692,6 @@ class PanoVLN_Agent(Agent):
                 DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
             )
         )
-        self.pbo_enabled = bool(getattr(self.model.config, "pbo_enabled", False))
         self.device = 'cuda'
         self.model.to(self.device)
         self.model = self.model.eval()
@@ -738,7 +737,7 @@ class PanoVLN_Agent(Agent):
             f"actions_per_replan={self.actions_per_replan}, "
             f"replan_action_range={self.replan_action_range}, "
             f"uncertainty_budget={self.uncertainty_budget}, "
-            f"view_mode={self.view_mode}, pbo_enabled={self.pbo_enabled})"
+            f"view_mode={self.view_mode})"
         )
         
         self.rgb_history = []

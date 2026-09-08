@@ -1261,7 +1261,7 @@ def collect_raw_dagger_episode(
         "instruction": instruction,
         "action_horizon": int(action_horizon),
         "execute_horizon": int(execute_horizon),
-        # Complete mixed-policy trajectory for image/history/PBO alignment.
+        # Complete mixed-policy trajectory for image/history alignment.
         "actions": executed_actions,
         # Efficient-VLN expert labels at the real model decision states.
         "oracle_chunks": oracle_chunks,
