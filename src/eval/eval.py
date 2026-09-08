@@ -45,6 +45,11 @@ from habitat.config.default_structured_configs import (
 )
 from PIL import Image
 from peft import PeftModel
+from src.eval.collision_recovery import (
+    DEFAULT_COLLISION_RECOVERY_STEPS,
+    CollisionRecovery,
+    validate_collision_recovery_steps,
+)
 from src.train.data.data import (
     DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
     DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
@@ -251,6 +256,18 @@ def extract_action_uncertainties(
         if action_id == STOP_ACTION_ID or len(actions) == max_actions:
             break
     return actions, uncertainties
+
+
+def extract_first_turn_logits(generated_ids, logits, token_lookup, special_ids):
+    """Read LEFT/RIGHT alternatives at the first generated action, not later turns."""
+    for token_id, raw_logits in zip(generated_ids, logits):
+        if token_id in special_ids:
+            continue
+        # Fixed-K parsing also accepts noncanonical action text. In that case,
+        # compare the unprefixed canonical actions at the first content token.
+        _, token_ids = token_lookup.get(token_id, next(iter(token_lookup.values())))
+        return raw_logits[0, [token_ids[2], token_ids[3]]].float().tolist()
+    return None
 
 
 def select_actions_for_replan(
@@ -517,6 +534,7 @@ def evaluate_agent(
     seed=42,
     replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
     stop_commit_max_actions=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+    collision_recovery_steps=DEFAULT_COLLISION_RECOVERY_STEPS,
 ) -> None:
     done_pairs = _load_done_pairs(result_path)
     pending_episodes = _filter_pending_episodes(list(dataset.episodes), done_pairs)
@@ -548,6 +566,7 @@ def evaluate_agent(
         seed=seed,
         replan_action_range=replan_action_range,
         stop_commit_max_actions=stop_commit_max_actions,
+        collision_recovery_steps=collision_recovery_steps,
     )
 
     early_stop_max_steps = max(0, int(early_stop_max_steps))
@@ -620,6 +639,7 @@ class PanoVLN_Agent(Agent):
         seed=42,
         replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
         stop_commit_max_actions=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+        collision_recovery_steps=DEFAULT_COLLISION_RECOVERY_STEPS,
     ):
         
         print("Initialize PanoVLN")
@@ -627,6 +647,7 @@ class PanoVLN_Agent(Agent):
         self.uncertainty_budget = validate_uncertainty_budget(uncertainty_budget)
         self.replan_action_range = validate_replan_action_range(replan_action_range)
         self.stop_commit_max_actions = validate_stop_commit_max_actions(stop_commit_max_actions)
+        self.collision_recovery = CollisionRecovery(collision_recovery_steps)
         
         self.result_path = result_path
         self.save_topdown = save_topdown
@@ -714,7 +735,7 @@ class PanoVLN_Agent(Agent):
             raise ValueError("Eval requires a tokenizer for generation token ids")
         self.action_token_lookup = (
             build_action_token_lookup(self.tokenizer)
-            if self.actions_per_replan == "uncertainty" else None
+            if self.actions_per_replan == "uncertainty" or self.collision_recovery.enabled else None
         )
         self.eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
         self.pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
@@ -749,6 +770,7 @@ class PanoVLN_Agent(Agent):
             f"replan_action_range={self.replan_action_range}, "
             f"uncertainty_budget={self.uncertainty_budget}, "
             f"stop_commit_max_actions={self.stop_commit_max_actions}, "
+            f"collision_recovery_steps={self.collision_recovery.steps}, "
             f"view_mode={self.view_mode})"
         )
         
@@ -816,9 +838,10 @@ class PanoVLN_Agent(Agent):
                 temperature=generation_kwargs["temperature"],
                 top_p=generation_kwargs["top_p"],
             )
-        if self.actions_per_replan == "uncertainty":
+        need_action_logits = self.actions_per_replan == "uncertainty" or self.collision_recovery.enabled
+        if need_action_logits:
             if model_generation_kwargs["num_beams"] != 1:
-                raise ValueError("Uncertainty mode requires num_beams=1 for token/logit alignment")
+                raise ValueError("Uncertainty and collision recovery require num_beams=1 for token/logit alignment")
             model_generation_kwargs.update(output_logits=True, return_dict_in_generate=True)
         with torch.inference_mode():
             cont = self.model.generate(
@@ -827,12 +850,18 @@ class PanoVLN_Agent(Agent):
                 pad_token_id=self.pad_token_id,
                 **model_generation_kwargs,
             )
-        if self.actions_per_replan == "uncertainty":
+        self.prediction_turn_logits = None
+        if need_action_logits:
             token_ids = cont.sequences[0, prompt_inputs.input_ids.shape[1]:].tolist()
-            self.prediction_action_ids, self.prediction_action_uncertainties = extract_action_uncertainties(
-                token_ids, cont.logits, self.action_token_lookup, self.tokenizer.all_special_ids,
-                max_actions=self.replan_action_range[1],
-            )
+            if self.actions_per_replan == "uncertainty":
+                self.prediction_action_ids, self.prediction_action_uncertainties = extract_action_uncertainties(
+                    token_ids, cont.logits, self.action_token_lookup, self.tokenizer.all_special_ids,
+                    max_actions=self.replan_action_range[1],
+                )
+            if self.collision_recovery.enabled:
+                self.prediction_turn_logits = extract_first_turn_logits(
+                    token_ids, cont.logits, self.action_token_lookup, self.tokenizer.all_special_ids,
+                )
             cont = cont.sequences
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(prompt_inputs.input_ids, cont)
@@ -938,6 +967,9 @@ class PanoVLN_Agent(Agent):
         self.prediction_action_uncertainties = []
         self.model_actions_per_replan = []
         self.model_stop_committed = []
+        self.prediction_turn_logits = None
+        self.last_action = None
+        self.collision_recovery.reset()
         
     def act(self, observations, info, episode_id):
 
@@ -952,7 +984,19 @@ class PanoVLN_Agent(Agent):
         rgb = observations["rgb"]
         self.rgb_history.append(Image.fromarray(rgb.astype('uint8')).convert('RGB'))
 
-        if not self.pending_action_queue:
+        if self.collision_recovery.enabled:
+            collided = bool(info.get("collisions", {}).get("is_collision", False))
+            rgb_mae = None
+            if self.last_action == ATOMIC_ACTION_TO_ID["forward"] and collided:
+                previous = np.asarray(self.rgb_history[-2].resize((64, 32)), dtype=np.float32)
+                current = np.asarray(self.rgb_history[-1].resize((64, 32)), dtype=np.float32)
+                rgb_mae = float(np.abs(current - previous).mean())
+            recovery_queue = self.collision_recovery.observe(self.last_action, collided, rgb_mae)
+            if recovery_queue is not None:
+                self.pending_action_queue = recovery_queue
+
+        if not self.pending_action_queue or self.collision_recovery.requested:
+            pending_before_prediction = list(self.pending_action_queue)
             selected_indices = self._select_image_indices()
             selected_images = self._prepare_selected_images(selected_indices)
             navigation, action_ids = self._predict_action_sequence_from_images(
@@ -965,9 +1009,13 @@ class PanoVLN_Agent(Agent):
                     f"[Warning] Failed to parse a valid action sequence from model output "
                     f"on episode {episode_id}: {navigation!r}. Defaulting to stop."
                 )
-            self.pending_action_queue = self._build_pending_action_queue(action_ids)
+            default_queue = self._build_pending_action_queue(action_ids)
+            self.pending_action_queue = self.collision_recovery.choose_queue(
+                action_ids, default_queue, pending_before_prediction, self.prediction_turn_logits,
+            )
 
         action_id = self.pending_action_queue.pop(0)
+        self.last_action = action_id
         if action_id == STOP_ACTION_ID:
             self.pending_action_queue = []
 
@@ -1033,12 +1081,18 @@ def main():
         help="execute through the first STOP within this many predicted actions, including STOP itself "
              "(default: 12; 0 disables); overrides fixed K and the uncertainty budget/range",
     )
+    parser.add_argument(
+        "--collision-recovery-steps", type=int, default=DEFAULT_COLLISION_RECOVERY_STEPS,
+        help="consecutive forward collisions with static RGB before recovery (default: 2; 0 disables); "
+             "preserves STOP priority and the next queued turn direction",
+    )
     args = parser.parse_args()
 
     try:
         args.uncertainty_budget = validate_uncertainty_budget(args.uncertainty_budget)
         args.replan_action_range = validate_replan_action_range(args.replan_action_range)
         args.stop_commit_max_actions = validate_stop_commit_max_actions(args.stop_commit_max_actions)
+        args.collision_recovery_steps = validate_collision_recovery_steps(args.collision_recovery_steps)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1087,7 +1141,8 @@ def main():
                 args.forward_distance, args.turn_angle, args.max_memory_images,
                 args.memory_pool_window_frames, args.save_topdown, args.attn_implementation,
                 args.early_stop_max_steps, args.actions_per_replan,
-                args.uncertainty_budget, args.seed, args.replan_action_range, args.stop_commit_max_actions)
+                args.uncertainty_budget, args.seed, args.replan_action_range, args.stop_commit_max_actions,
+                args.collision_recovery_steps)
 
 if __name__ == "__main__":
     main()
