@@ -91,7 +91,8 @@ logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
 STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
-DEFAULT_REPLAN_ACTION_RANGE = (3, 9)
+DEFAULT_REPLAN_ACTION_RANGE = (4, 8)
+DEFAULT_STOP_COMMIT_MAX_ACTIONS = 12
 ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
 ATOMIC_ACTION_VARIANTS = {
     "stop": ("stop",),
@@ -135,26 +136,22 @@ def validate_eval_model_path(model_path: str) -> str:
 
 def resolve_actions_per_replan(
     model_action_sequence_length: int,
-    actions_per_replan: Optional[Union[int, str]],
+    actions_per_replan: Union[int, str],
 ) -> Union[int, str]:
-    model_action_sequence_length = validate_action_sequence_length(
-        model_action_sequence_length
-    )
-    if actions_per_replan is None:
-        return model_action_sequence_length
-    if actions_per_replan in ("uncertainty", "random"):
+    validate_action_sequence_length(model_action_sequence_length)
+    if actions_per_replan == "uncertainty":
         return actions_per_replan
     return validate_action_sequence_length(actions_per_replan)
 
 
 def parse_actions_per_replan(value):
-    if value in ("uncertainty", "random"):
+    if value == "uncertainty":
         return value
     try:
         return validate_action_sequence_length(value)
     except (TypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError(
-            "actions-per-replan must be a positive integer, 'uncertainty', or 'random'"
+            "actions-per-replan must be a positive integer or 'uncertainty'"
         ) from exc
 
 
@@ -172,6 +169,24 @@ def validate_replan_action_range(action_range):
     if minimum > maximum:
         raise ValueError("replan-action-range requires MIN <= MAX")
     return minimum, maximum
+
+
+def validate_stop_commit_max_actions(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("stop-commit-max-actions must be a nonnegative integer (0 disables)")
+    return value
+
+
+def select_stop_commit_horizon(
+    action_ids: Sequence[int],
+    stop_commit_max_actions: int = DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+) -> Optional[int]:
+    """Commit through the first STOP in the inclusive window, counting STOP itself."""
+    limit = validate_stop_commit_max_actions(stop_commit_max_actions)
+    for position, action_id in enumerate(action_ids[:limit], start=1):
+        if action_id == STOP_ACTION_ID:
+            return position
+    return None
 
 
 def select_uncertainty_horizon(
@@ -501,6 +516,7 @@ def evaluate_agent(
     uncertainty_budget=1.5,
     seed=42,
     replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
+    stop_commit_max_actions=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
 ) -> None:
     done_pairs = _load_done_pairs(result_path)
     pending_episodes = _filter_pending_episodes(list(dataset.episodes), done_pairs)
@@ -531,6 +547,7 @@ def evaluate_agent(
         uncertainty_budget=uncertainty_budget,
         seed=seed,
         replan_action_range=replan_action_range,
+        stop_commit_max_actions=stop_commit_max_actions,
     )
 
     early_stop_max_steps = max(0, int(early_stop_max_steps))
@@ -544,12 +561,6 @@ def evaluate_agent(
         executed_action_log = []
         for episode in progress:
             agent.reset()
-            if agent.actions_per_replan == "random":
-                # Keep horizon draws independent of worker layout, resume order,
-                # and random numbers consumed by the simulator or model.
-                agent.replan_rng.seed(
-                    f"{seed}:{_scene_id_from_path(episode.scene_id)}:{episode.episode_id}"
-                )
             executed_action_log = []
             env.current_episode = episode
             obs = env.reset()
@@ -572,14 +583,13 @@ def evaluate_agent(
             result_row["executed_action_history"] = executed_action_log
             result_row["model_generated_actions"] = list(agent.model_generated_actions)
             result_row["model_parsed_action_sequences"] = list(agent.model_parsed_action_sequences)
-            if agent.actions_per_replan in ("uncertainty", "random"):
-                result_row["actions_per_replan"] = agent.actions_per_replan
+            result_row["actions_per_replan"] = agent.actions_per_replan
+            result_row["stop_commit_max_actions"] = agent.stop_commit_max_actions
+            result_row["model_actions_per_replan"] = list(agent.model_actions_per_replan)
+            result_row["model_stop_committed"] = list(agent.model_stop_committed)
+            if agent.actions_per_replan == "uncertainty":
                 result_row["replan_action_range"] = list(agent.replan_action_range)
-                result_row["model_actions_per_replan"] = list(agent.model_actions_per_replan)
-                if agent.actions_per_replan == "uncertainty":
-                    result_row["uncertainty_budget"] = agent.uncertainty_budget
-                else:
-                    result_row["random_seed"] = seed
+                result_row["uncertainty_budget"] = agent.uncertainty_budget
             _append_result_row(result_path, split_id, result_row)
             agent.reset()
 
@@ -605,17 +615,18 @@ class PanoVLN_Agent(Agent):
         memory_pool_window_frames,
         save_topdown=False,
         attn_implementation="sdpa",
-        actions_per_replan=None,
+        actions_per_replan="uncertainty",
         uncertainty_budget=1.5,
         seed=42,
         replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
+        stop_commit_max_actions=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
     ):
         
         print("Initialize PanoVLN")
 
         self.uncertainty_budget = validate_uncertainty_budget(uncertainty_budget)
         self.replan_action_range = validate_replan_action_range(replan_action_range)
-        self.replan_rng = random.Random(seed)
+        self.stop_commit_max_actions = validate_stop_commit_max_actions(stop_commit_max_actions)
         
         self.result_path = result_path
         self.save_topdown = save_topdown
@@ -737,6 +748,7 @@ class PanoVLN_Agent(Agent):
             f"actions_per_replan={self.actions_per_replan}, "
             f"replan_action_range={self.replan_action_range}, "
             f"uncertainty_budget={self.uncertainty_budget}, "
+            f"stop_commit_max_actions={self.stop_commit_max_actions}, "
             f"view_mode={self.view_mode})"
         )
         
@@ -876,21 +888,23 @@ class PanoVLN_Agent(Agent):
         return navigation, action_ids
 
     def _build_pending_action_queue(self, action_ids):
-        horizon = self.actions_per_replan
-        if horizon == "uncertainty":
-            prefix = list(action_ids[:self.replan_action_range[1]])
-            if STOP_ACTION_ID in prefix:
-                prefix = prefix[:prefix.index(STOP_ACTION_ID) + 1]
-            if prefix != self.prediction_action_ids:
-                raise ValueError("Parsed actions do not match uncertainty logits")
-            horizon = select_uncertainty_horizon(
-                self.prediction_action_uncertainties, self.uncertainty_budget, self.replan_action_range,
-            )
-            self.model_actions_per_replan.append(horizon)
-        elif horizon == "random":
-            # One independent, uniform draw per prediction, inclusive bounds.
-            horizon = self.replan_rng.randint(*self.replan_action_range)
-            self.model_actions_per_replan.append(horizon)
+        # Inspect the complete current prediction BEFORE applying either policy.
+        # A nearby STOP may extend execution beyond fixed K or the uncertainty cap.
+        horizon = select_stop_commit_horizon(action_ids, self.stop_commit_max_actions)
+        stop_committed = horizon is not None
+        if not stop_committed:
+            horizon = self.actions_per_replan
+            if horizon == "uncertainty":
+                prefix = list(action_ids[:self.replan_action_range[1]])
+                if STOP_ACTION_ID in prefix:
+                    prefix = prefix[:prefix.index(STOP_ACTION_ID) + 1]
+                if prefix != self.prediction_action_ids:
+                    raise ValueError("Parsed actions do not match uncertainty logits")
+                horizon = select_uncertainty_horizon(
+                    self.prediction_action_uncertainties, self.uncertainty_budget, self.replan_action_range,
+                )
+        self.model_actions_per_replan.append(horizon)
+        self.model_stop_committed.append(stop_committed)
         action_ids = select_actions_for_replan(
             action_ids,
             actions_per_replan=horizon,
@@ -923,6 +937,7 @@ class PanoVLN_Agent(Agent):
         self.prediction_action_ids = []
         self.prediction_action_uncertainties = []
         self.model_actions_per_replan = []
+        self.model_stop_committed = []
         
     def act(self, observations, info, episode_id):
 
@@ -995,18 +1010,17 @@ def main():
     parser.add_argument(
         "--actions-per-replan",
         type=parse_actions_per_replan,
-        default=None,
+        default="uncertainty",
         help=(
-            "positive integer for a fixed execution length, or 'uncertainty' for "
-            "a current-logits uncertainty budget; 'random' uniformly samples K per prediction; "
-            "both use --replan-action-range; "
-            "when omitted, use model.config.action_sequence_length"
+            "positive integer for a fixed execution length, or 'uncertainty' (default) "
+            "for a current-logits budget within --replan-action-range; "
+            "nearby STOP commitment takes priority in both modes"
         ),
     )
     parser.add_argument(
         "--replan-action-range", type=int, nargs=2, metavar=("MIN", "MAX"),
         default=DEFAULT_REPLAN_ACTION_RANGE,
-        help="inclusive K range for uncertainty and random (default: 3 9); fixed K is unaffected",
+        help="inclusive K range for uncertainty (default: 4 8); STOP commitment may exceed this cap",
     )
     parser.add_argument(
         "--uncertainty-budget", type=float, default=1.5,
@@ -1014,11 +1028,17 @@ def main():
              "set to an offline median six-action prefix score (default: 1.5)",
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for python, numpy, and torch")
+    parser.add_argument(
+        "--stop-commit-max-actions", type=int, default=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+        help="execute through the first STOP within this many predicted actions, including STOP itself "
+             "(default: 12; 0 disables); overrides fixed K and the uncertainty budget/range",
+    )
     args = parser.parse_args()
 
     try:
         args.uncertainty_budget = validate_uncertainty_budget(args.uncertainty_budget)
         args.replan_action_range = validate_replan_action_range(args.replan_action_range)
+        args.stop_commit_max_actions = validate_stop_commit_max_actions(args.stop_commit_max_actions)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -1067,7 +1087,7 @@ def main():
                 args.forward_distance, args.turn_angle, args.max_memory_images,
                 args.memory_pool_window_frames, args.save_topdown, args.attn_implementation,
                 args.early_stop_max_steps, args.actions_per_replan,
-                args.uncertainty_budget, args.seed, args.replan_action_range)
+                args.uncertainty_budget, args.seed, args.replan_action_range, args.stop_commit_max_actions)
 
 if __name__ == "__main__":
     main()

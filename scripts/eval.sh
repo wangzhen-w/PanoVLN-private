@@ -13,18 +13,19 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 MODEL_PATH="/workspace/data2/model/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
 CONFIG_PATH="config/vln_r2r.yaml"
-SAVE_PATH="/workspace/code/vln_result/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card"
+SAVE_PATH="/workspace/code/vln_result/ablation_new/panovggt_pre_merger/panovggt_0.30_lr2e-5_singlepoint_8card_uncertainty1.2_k4-8_stop12"
 ATTN_IMPLEMENTATION="flash_attention_2"
 MAX_MEMORY_IMAGES=10
 MEMORY_POOL_WINDOW_FRAMES=100
-# Empty: use model.config.action_sequence_length; integer: fixed execution length.
+# Positive integer: fixed execution length.
 # "uncertainty": choose K from this prediction's logits, within REPLAN_ACTION_RANGE.
-# "random": uniformly sample K in REPLAN_ACTION_RANGE once per prediction, without logits.
-# Use a separate SAVE_PATH for each mode/range/budget/seed; existing episodes are skipped.
-ACTIONS_PER_REPLAN=""
-# Inclusive (minimum maximum) for uncertainty/random; fixed integer K is unaffected.
-# Bash array syntax uses a space, not a comma: (1 9) or (4 8).
-REPLAN_ACTION_RANGE=(1 9)
+# Use a separate SAVE_PATH for each mode/range/budget/stop-window/seed; existing episodes are skipped.
+ACTIONS_PER_REPLAN="uncertainty"
+# Inclusive (minimum maximum) for uncertainty; fixed integer K is unaffected.
+# Bash array syntax uses a space, not a comma
+REPLAN_ACTION_RANGE=(4 8)
+# Execute through STOP if it appears within the first N actions; 0 disables.
+STOP_COMMIT_MAX_ACTIONS=12
 # Budget for sum(-log p(action)) in uncertainty mode.
 # This is a fixed input parameter, not recomputed from online episode history.
 UNCERTAINTY_BUDGET=1.2
@@ -36,7 +37,7 @@ PROCS_PER_GPU=3
 CPU_THREADS_PER_WORKER=4
 MAX_EPISODES=0
 SAVE_TOPDOWN=false
-SEED=42  # Also controls random-mode horizons; stable per episode across workers/resumes.
+SEED=42
 
 mkdir -p "$SAVE_PATH"
 
@@ -55,19 +56,19 @@ if [ ! -d "$MODEL_PATH" ]; then
 fi
 
 actions_per_replan_args=()
-if [[ -n "$ACTIONS_PER_REPLAN" ]]; then
-    if [[ "$ACTIONS_PER_REPLAN" != "uncertainty" &&
-          "$ACTIONS_PER_REPLAN" != "random" &&
-          ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
-        echo "ACTIONS_PER_REPLAN must be empty, a positive integer, uncertainty, or random: $ACTIONS_PER_REPLAN" >&2
-        exit 1
-    fi
-    actions_per_replan_args=(--actions-per-replan "$ACTIONS_PER_REPLAN")
+if [[ "$ACTIONS_PER_REPLAN" != "uncertainty" &&
+      ! "$ACTIONS_PER_REPLAN" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ACTIONS_PER_REPLAN must be a positive integer or uncertainty: $ACTIONS_PER_REPLAN" >&2
+    exit 1
 fi
+if [[ ! "$STOP_COMMIT_MAX_ACTIONS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "STOP_COMMIT_MAX_ACTIONS must be a nonnegative integer (0 disables): $STOP_COMMIT_MAX_ACTIONS" >&2
+    exit 1
+fi
+actions_per_replan_args=(--actions-per-replan "$ACTIONS_PER_REPLAN"
+                         --stop-commit-max-actions "$STOP_COMMIT_MAX_ACTIONS")
 if [[ "$ACTIONS_PER_REPLAN" == "uncertainty" ]]; then
     actions_per_replan_args+=(--uncertainty-budget "$UNCERTAINTY_BUDGET")
-fi
-if [[ "$ACTIONS_PER_REPLAN" == "uncertainty" || "$ACTIONS_PER_REPLAN" == "random" ]]; then
     if [[ "${#REPLAN_ACTION_RANGE[@]}" -ne 2 ]] ||
        [[ ! "${REPLAN_ACTION_RANGE[0]}" =~ ^[1-9][0-9]*$ ||
           ! "${REPLAN_ACTION_RANGE[1]}" =~ ^[1-9][0-9]*$ ]]; then
@@ -94,9 +95,10 @@ echo "SEED=$SEED"
 echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
 echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
 echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
-echo "ACTIONS_PER_REPLAN=${ACTIONS_PER_REPLAN:-model_config}"
+echo "ACTIONS_PER_REPLAN=$ACTIONS_PER_REPLAN"
 echo "REPLAN_ACTION_RANGE=${REPLAN_ACTION_RANGE[*]}"
 echo "UNCERTAINTY_BUDGET=$UNCERTAINTY_BUDGET"
+echo "STOP_COMMIT_MAX_ACTIONS=$STOP_COMMIT_MAX_ACTIONS"
 echo "EARLY_STOP_MAX_STEPS=$EARLY_STOP_MAX_STEPS"
 echo "Total processes: $CHUNKS"
 
