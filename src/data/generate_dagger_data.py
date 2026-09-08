@@ -28,6 +28,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.data.habitat_shortest_path import (
+    ERP_IMAGE_SIZE,
     MOVE_FORWARD_ACTION,
     STOP_ACTION,
     TURN_LEFT_ACTION,
@@ -61,7 +62,20 @@ from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from src.eval.eval import (
     DEFAULT_MAX_MEMORY_IMAGES,
     DEFAULT_MEMORY_POOL_WINDOW_FRAMES,
+    DEFAULT_REPLAN_ACTION_RANGE,
     PanoVLN_Agent,
+    select_stop_commit_horizon,
+    select_uncertainty_horizon,
+)
+from src.data.prepare_training_data import (
+    parse_dagger_oracle_chunks,
+    validate_dagger_execution_policy,
+)
+from src.data.dagger_replay import (
+    capture_frame_state,
+    capture_replay_config,
+    portable_scene_id,
+    validate_replay_metadata,
 )
 
 
@@ -72,7 +86,8 @@ DEFAULT_MODEL_PATH = "/workspace/data2/model/18-action/panovggt_base_18action"
 DEFAULT_OUTPUT_ROOT = "/workspace/data2/dataset/PanoVLN"
 DEFAULT_DAGGER_DATASET_NAME = "dagger"
 DEFAULT_ACTION_HORIZON = 18
-DEFAULT_EXECUTE_HORIZON = 6
+DEFAULT_UNCERTAINTY_BUDGET = 1.2
+DEFAULT_STOP_ORACLE_MAX_ACTIONS = 12
 DEFAULT_CPU_THREADS_PER_WORKER = 2
 DAGGER_CPU_THREADS_ENV = "VLN_DAGGER_CPU_THREADS_PER_WORKER"
 CPU_THREAD_ENV_VARS = (
@@ -376,15 +391,13 @@ def is_raw_episode_complete(
     annotation: Dict,
     image_format: str,
     action_horizon: int,
-    execute_horizon: int,
+    execution_policy: Dict,
 ) -> bool:
     if (
         isinstance(annotation.get("action_horizon"), bool)
         or not isinstance(annotation.get("action_horizon"), int)
         or annotation.get("action_horizon") != action_horizon
-        or isinstance(annotation.get("execute_horizon"), bool)
-        or not isinstance(annotation.get("execute_horizon"), int)
-        or annotation.get("execute_horizon") != execute_horizon
+        or annotation.get("execution_policy") != execution_policy
     ):
         return False
     actions = annotation.get("actions")
@@ -407,62 +420,10 @@ def is_raw_episode_complete(
     ):
         return False
 
-    non_stop_action_count = len(actions) - 1
-    previous_step_index = -1
-    for chunk_index, chunk in enumerate(oracle_chunks):
-        if not isinstance(chunk, dict):
-            return False
-        step_index = chunk.get("step_index")
-        oracle_actions = chunk.get("oracle_actions")
-        step_gap = (
-            step_index - previous_step_index
-            if isinstance(step_index, int) and previous_step_index >= 0
-            else None
-        )
-        if (
-            isinstance(step_index, bool)
-            or not isinstance(step_index, int)
-            or step_index <= previous_step_index
-            or step_index > non_stop_action_count
-            or not isinstance(oracle_actions, list)
-            or len(oracle_actions) != action_horizon
-        ):
-            return False
-        try:
-            oracle_actions = [int(action_id) for action_id in oracle_actions]
-        except (TypeError, ValueError):
-            return False
-        if any(action_id not in SUPPORTED_ACTION_IDS for action_id in oracle_actions):
-            return False
-        if STOP_ACTION in oracle_actions:
-            first_stop = oracle_actions.index(STOP_ACTION)
-            if any(action_id != STOP_ACTION for action_id in oracle_actions[first_stop:]):
-                return False
-            if (
-                chunk_index < len(oracle_chunks) - 1
-                and first_stop < execute_horizon
-            ):
-                return False
-        if step_gap is not None and step_gap != execute_horizon:
-            is_early_terminal_replan = bool(
-                0 < step_gap < execute_horizon
-                and step_index == non_stop_action_count
-                and oracle_actions[0] == STOP_ACTION
-            )
-            if not is_early_terminal_replan:
-                return False
-        previous_step_index = step_index
-    if int(oracle_chunks[0]["step_index"]) != 0:
-        return False
-    last_oracle_actions = [
-        int(action_id) for action_id in oracle_chunks[-1]["oracle_actions"]
-    ]
-    if STOP_ACTION not in last_oracle_actions:
-        return False
-    if (
-        previous_step_index + last_oracle_actions.index(STOP_ACTION)
-        != non_stop_action_count
-    ):
+    try:
+        parse_dagger_oracle_chunks(annotation, actions, "raw DAgger episode")
+        validate_replay_metadata(annotation)
+    except (TypeError, ValueError):
         return False
 
     try:
@@ -943,12 +904,26 @@ def executable_prefix(action_ids: Sequence[int], execute_horizon: int) -> List[i
     return prefix
 
 
-def action_sequence_requests_stop(
-    action_ids: Sequence[int],
-) -> bool:
-    """Return whether the supplied actions request STOP."""
-
-    return STOP_ACTION in [int(action_id) for action_id in action_ids]
+def select_dagger_action_queue(
+    model_actions: Sequence[int],
+    oracle_actions: Sequence[int],
+    horizon: int,
+    stop_oracle_max_actions: int,
+    beta: float,
+    rng: random.Random,
+) -> Tuple[str, List[int]]:
+    """A nearby model STOP changes the actor, never the ordinary execution K."""
+    if select_stop_commit_horizon(model_actions, stop_oracle_max_actions) is not None:
+        source = "model_stop_oracle"
+    elif len(model_actions) != len(oracle_actions):
+        source = "model_fallback_oracle"
+    else:
+        source = "oracle" if rng.random() < beta else "model"
+    actions = model_actions if source == "model" else oracle_actions
+    selected = executable_prefix(actions, horizon)
+    if not selected or (source == "model" and STOP_ACTION in selected):
+        raise DAggerCollectionError("DAgger requires a nonempty queue with oracle-only STOP")
+    return source, selected
 
 
 def is_successful_dagger_termination(
@@ -986,10 +961,12 @@ def execute_and_record_one_action(
     jpeg_quality: int,
     jpeg_subsampling: int,
     png_compress_level: int,
+    frame_states: List[Dict],
 ):
     observation = env.step(int(action_id))
     if int(action_id) == STOP_ACTION:
         return observation, frame_index
+    frame_states.append(capture_frame_state(env.sim))
     save_episode_frame(
         episode_image_dir,
         frame_index,
@@ -1017,7 +994,7 @@ def collect_raw_dagger_episode(
     goal_radius: float,
     alpha: float,
     action_horizon: int,
-    execute_horizon: int,
+    execution_policy: Dict,
     max_steps_per_episode: int,
     image_format: str,
     jpeg_quality: int,
@@ -1049,6 +1026,11 @@ def collect_raw_dagger_episode(
     )
     append_history_image(agent, observation)
 
+    frame_states = [capture_frame_state(env.sim)]
+    replay_config = capture_replay_config(
+        env, ERP_IMAGE_SIZE, image_format, jpeg_quality, jpeg_subsampling, png_compress_level,
+    )
+    scene_id = portable_scene_id(episode.scene_id, env._config.dataset.scenes_dir)
     start_position = to_position_list(env.sim.get_agent_state().position)
     current_position = list(start_position)
     target_positions, next_target_index = initial_target_state(episode, current_position)
@@ -1062,7 +1044,10 @@ def collect_raw_dagger_episode(
 
     executed_actions: List[int] = []
     oracle_chunks: List[Dict] = []
-    policy_counts = {"oracle": 0, "model": 0, "model_fallback_oracle": 0, "terminal_oracle": 0}
+    policy_counts = {
+        "oracle": 0, "model": 0, "model_stop_oracle": 0,
+        "model_fallback_oracle": 0, "terminal_oracle": 0,
+    }
     frame_index = 1
     env_steps = 0
     replan_index = 0
@@ -1092,45 +1077,34 @@ def collect_raw_dagger_episode(
             goal_radius=goal_radius,
             action_horizon=action_horizon,
         )
-        oracle_queue = executable_prefix(oracle_sequence, execute_horizon)
-        if not oracle_queue:
-            oracle_queue = [STOP_ACTION]
-
-        # Positions after execute_horizon are supervision only.  A future STOP
-        # must not affect the policy selected or executed at this decision.
-        oracle_requests_stop = action_sequence_requests_stop(oracle_queue)
-
-        # A terminal expert chunk has priority over both the dynamic DAgger
-        # mixture and the model.  Execute the expert prefix through STOP so a
-        # trajectory that the expert considers complete always ends correctly.
-        if oracle_requests_stop:
+        if oracle_sequence[0] == STOP_ACTION:
             executed_policy = "terminal_oracle"
-            selected_actions = oracle_queue
-        elif rng.random() < beta:
-            executed_policy = "oracle"
-            selected_actions = oracle_queue
+            horizon = 1
+            selected_actions = [STOP_ACTION]
         else:
-            executed_policy = "model"
+            # Predict even on expert rounds: both actors share the ordinary K.
             _, model_action_ids = model_predict_action_sequence(agent, instruction)
-            model_queue = executable_prefix(model_action_ids, execute_horizon)
-            selected_actions = model_queue
-            model_has_complete_chunk = len(model_action_ids) == action_horizon
-            model_requests_stop = (
-                bool(selected_actions)
-                and action_sequence_requests_stop(
-                    model_queue,
-                )
+            horizon = select_uncertainty_horizon(
+                agent.prediction_action_uncertainties,
+                execution_policy["uncertainty_budget"],
+                execution_policy["replan_action_range"],
             )
-            if not model_has_complete_chunk or model_requests_stop:
-                executed_policy = "model_fallback_oracle"
-                selected_actions = oracle_queue
-        policy_counts[executed_policy] = policy_counts.get(executed_policy, 0) + 1
-        oracle_chunks.append(
-            {
-                "step_index": int(decision_step),
-                "oracle_actions": [int(action_id) for action_id in oracle_sequence],
-            }
+            executed_policy, selected_actions = select_dagger_action_queue(
+                model_action_ids, oracle_sequence, horizon,
+                execution_policy["stop_oracle_max_actions"], beta, rng,
+            )
+        oracle_requests_stop = (
+            executed_policy != "model" and STOP_ACTION in selected_actions
         )
+        policy_counts[executed_policy] = policy_counts.get(executed_policy, 0) + 1
+        active_chunk = {
+            "step_index": int(decision_step),
+            "oracle_actions": [int(action_id) for action_id in oracle_sequence],
+            "execute_horizon": int(horizon),
+            "executed_policy": executed_policy,
+            "executed_count": 0,
+        }
+        oracle_chunks.append(active_chunk)
 
         for selected_action in selected_actions:
             if env_steps >= max_steps_per_episode:
@@ -1157,12 +1131,15 @@ def collect_raw_dagger_episode(
                         f"decision_step={decision_step}, "
                         f"terminal_step={terminal_decision_step}"
                     )
-                oracle_chunks.append(
-                    {
-                        "step_index": int(terminal_decision_step),
-                        "oracle_actions": [STOP_ACTION] * action_horizon,
-                    }
-                )
+                active_chunk = {
+                    "step_index": int(terminal_decision_step),
+                    "oracle_actions": [STOP_ACTION] * action_horizon,
+                    "execute_horizon": 1,
+                    "executed_policy": "terminal_oracle",
+                    "executed_count": 0,
+                }
+                oracle_chunks.append(active_chunk)
+                policy_counts["terminal_oracle"] += 1
             if action_to_execute == STOP_ACTION and not oracle_requests_stop_now:
                 raise DAggerCollectionError(
                     "Oracle preview requested STOP before the real trajectory "
@@ -1185,10 +1162,12 @@ def collect_raw_dagger_episode(
                 jpeg_quality=jpeg_quality,
                 jpeg_subsampling=jpeg_subsampling,
                 png_compress_level=png_compress_level,
+                frame_states=frame_states,
             )
             current_position = to_position_list(env.sim.get_agent_state().position)
             executed_path_length += euclidean_distance(previous_position, current_position)
             env_steps += 1
+            active_chunk["executed_count"] += 1
 
             if action_to_execute == STOP_ACTION:
                 status = "terminal"
@@ -1251,6 +1230,7 @@ def collect_raw_dagger_episode(
             "replans": replan_index,
             "dagger_alpha": float(alpha),
             "policy_counts": policy_counts,
+            "execution_policy": dict(execution_policy),
             "seconds": time.time() - start_time,
         }
         return None, summary
@@ -1259,13 +1239,19 @@ def collect_raw_dagger_episode(
         "episode_id": dagger_id,
         "trajectory_id": trajectory_id,
         "instruction": instruction,
+        "source_dataset": source_dataset,
+        "source_episode_id": str(episode.episode_id),
+        "scene_id": scene_id,
+        "replay_config": replay_config,
+        "frame_states": frame_states,
         "action_horizon": int(action_horizon),
-        "execute_horizon": int(execute_horizon),
+        "execution_policy": dict(execution_policy),
         # Complete mixed-policy trajectory for image/history alignment.
         "actions": executed_actions,
         # Efficient-VLN expert labels at the real model decision states.
         "oracle_chunks": oracle_chunks,
     }
+    validate_replay_metadata(annotation)
     summary = {
         "episode_id": dagger_id,
         "source_dataset": source_dataset,
@@ -1288,6 +1274,7 @@ def collect_raw_dagger_episode(
         "replans": replan_index,
         "dagger_alpha": float(alpha),
         "policy_counts": policy_counts,
+        "execution_policy": dict(execution_policy),
         "seconds": time.time() - start_time,
     }
     return annotation, summary
@@ -1330,7 +1317,7 @@ def dagger_worker(
     goal_radius,
     alpha,
     action_horizon,
-    execute_horizon,
+    execution_policy,
     max_steps_per_episode,
     seed,
     attn_implementation,
@@ -1388,7 +1375,11 @@ def dagger_worker(
             memory_pool_window_frames=memory_pool_window_frames,
             save_topdown=False,
             attn_implementation=attn_implementation,
-            actions_per_replan=execute_horizon,
+            actions_per_replan="uncertainty",
+            uncertainty_budget=execution_policy["uncertainty_budget"],
+            replan_action_range=execution_policy["replan_action_range"],
+            stop_commit_max_actions=0,
+            collision_recovery_steps=0,
         )
         if agent.action_sequence_length != action_horizon:
             raise DAggerCollectionError(
@@ -1436,7 +1427,7 @@ def dagger_worker(
                         goal_radius=goal_radius,
                         alpha=alpha,
                         action_horizon=action_horizon,
-                        execute_horizon=execute_horizon,
+                        execution_policy=execution_policy,
                         max_steps_per_episode=max_steps_per_episode,
                         image_format=image_format,
                         jpeg_quality=jpeg_quality,
@@ -1560,28 +1551,39 @@ def build_worker_jobs(
     return worker_jobs
 
 
+def assert_matching_execution_policy(annotation: Dict, execution_policy: Dict) -> None:
+    if annotation.get("execution_policy") != execution_policy:
+        raise ValueError(
+            "Existing DAgger data uses a different execution policy "
+            f"(episode_id={annotation.get('episode_id')}). "
+            "Use a separate output_root; fixed-6 data remains supported for training."
+        )
+
+
 def load_complete_existing_annotations(
     output_root,
     dagger_dataset_name,
     image_format,
     action_horizon,
-    execute_horizon,
+    execution_policy,
     progress_dir=None,
 ):
     existing: Dict[str, Dict] = {}
     for annotation in load_jsonl_index(annotation_path(output_root, dagger_dataset_name)).values():
+        assert_matching_execution_policy(annotation, execution_policy)
         if is_raw_episode_complete(
             output_root,
             dagger_dataset_name,
             annotation,
             image_format,
             action_horizon,
-            execute_horizon,
+            execution_policy,
         ):
             existing[annotation_episode_id(annotation)] = annotation
     if progress_dir is not None:
         for path in list_rank_annotation_paths(progress_dir):
             for annotation in load_jsonl_index(path).values():
+                assert_matching_execution_policy(annotation, execution_policy)
                 episode_id = annotation_episode_id(annotation)
                 current = existing.get(episode_id)
                 if current == annotation:
@@ -1592,7 +1594,7 @@ def load_complete_existing_annotations(
                     annotation,
                     image_format,
                     action_horizon,
-                    execute_horizon,
+                    execution_policy,
                 ):
                     continue
                 if current is not None:
@@ -1612,8 +1614,9 @@ def add_complete_annotation(
     source_path: str,
     image_format: str,
     action_horizon: int,
-    execute_horizon: int,
+    execution_policy: Dict,
 ) -> None:
+    assert_matching_execution_policy(annotation, execution_policy)
     episode_id = annotation_episode_id(annotation)
     existing = merged_annotations.get(episode_id)
     if existing == annotation:
@@ -1624,7 +1627,7 @@ def add_complete_annotation(
         annotation,
         image_format,
         action_horizon,
-        execute_horizon,
+        execution_policy,
     ):
         tqdm.write(
             f"[dagger] skipping incomplete annotation episode_id="
@@ -1646,7 +1649,7 @@ def merge_partial_outputs(
     existing_annotations: Dict[str, Dict],
     image_format: str,
     action_horizon: int,
-    execute_horizon: int,
+    execution_policy: Dict,
 ):
     merged_annotations: Dict[str, Dict] = dict(existing_annotations)
     for path in list_rank_annotation_paths(progress_dir):
@@ -1659,7 +1662,7 @@ def merge_partial_outputs(
                 source_path=path,
                 image_format=image_format,
                 action_horizon=action_horizon,
-                execute_horizon=execute_horizon,
+                execution_policy=execution_policy,
             )
     write_jsonl_index(annotation_path(output_root, dagger_dataset_name), merged_annotations)
 
@@ -1683,7 +1686,7 @@ def process_source_dataset(
     goal_radius,
     alpha,
     action_horizon,
-    execute_horizon,
+    execution_policy,
     max_steps_per_episode,
     seed,
     attn_implementation,
@@ -1802,7 +1805,7 @@ def process_source_dataset(
                 goal_radius,
                 alpha,
                 action_horizon,
-                execute_horizon,
+                execution_policy,
                 max_steps_per_episode,
                 seed,
                 attn_implementation,
@@ -1977,11 +1980,7 @@ def validate_args(args) -> None:
             f"action_horizon must be {DEFAULT_ACTION_HORIZON} for the current "
             f"DAgger pipeline, got {args.action_horizon}"
         )
-    if args.execute_horizon != DEFAULT_EXECUTE_HORIZON:
-        raise ValueError(
-            f"execute_horizon must be {DEFAULT_EXECUTE_HORIZON} for the current "
-            f"DAgger pipeline, got {args.execute_horizon}"
-        )
+    validate_dagger_execution_policy(execution_policy_from_args(args))
     if args.max_steps_per_episode <= 0:
         raise ValueError(
             f"max_steps_per_episode must be positive, got {args.max_steps_per_episode}"
@@ -1995,6 +1994,15 @@ def validate_args(args) -> None:
     if not math.isfinite(args.alpha):
         raise ValueError(f"alpha must be finite, got {args.alpha}")
     dynamic_oracle_probability(0, 1, args.alpha)
+
+
+def execution_policy_from_args(args) -> Dict:
+    return {
+        "actions_per_replan": "uncertainty",
+        "uncertainty_budget": args.uncertainty_budget,
+        "replan_action_range": list(args.replan_action_range),
+        "stop_oracle_max_actions": args.stop_oracle_max_actions,
+    }
 
 
 def parse_args():
@@ -2047,10 +2055,24 @@ def parse_args():
         help="Oracle-label and model-prediction length (fixed to 18).",
     )
     parser.add_argument(
-        "--execute_horizon",
+        "--uncertainty_budget",
+        type=float,
+        default=DEFAULT_UNCERTAINTY_BUDGET,
+        help="Uncertainty budget for the execution length shared by both actors.",
+    )
+    parser.add_argument(
+        "--replan_action_range",
         type=int,
-        default=DEFAULT_EXECUTE_HORIZON,
-        help="Executed prefix before observing and replanning (fixed to 6).",
+        nargs=2,
+        metavar=("MIN", "MAX"),
+        default=list(DEFAULT_REPLAN_ACTION_RANGE),
+        help="Inclusive bounds for the ordinary uncertainty execution length.",
+    )
+    parser.add_argument(
+        "--stop_oracle_max_actions",
+        type=int,
+        default=DEFAULT_STOP_ORACLE_MAX_ACTIONS,
+        help="A model STOP in the first N actions selects oracle; N must cover MAX.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -2109,6 +2131,7 @@ def parse_args():
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    execution_policy = execution_policy_from_args(args)
     configure_worker_thread_environment(args.cpu_threads_per_worker)
     configure_worker_torch_threads()
     seed_all(args.seed)
@@ -2149,7 +2172,7 @@ def main() -> None:
             dagger_dataset_name=args.dagger_dataset_name,
             image_format=args.image_format,
             action_horizon=args.action_horizon,
-            execute_horizon=args.execute_horizon,
+            execution_policy=execution_policy,
             progress_dir=progress_dir,
         )
     else:
@@ -2178,7 +2201,7 @@ def main() -> None:
         f"cpu_threads_per_worker={args.cpu_threads_per_worker}, "
         f"midgoal_radius={args.midgoal_radius}, goal_radius={args.goal_radius}, "
         f"action_horizon={args.action_horizon}, "
-        f"execute_horizon={args.execute_horizon}, "
+        f"execution_policy={execution_policy}, "
         f"progress_dir={progress_dir}, lock={lock_path}"
     )
 
@@ -2204,7 +2227,7 @@ def main() -> None:
                 goal_radius=args.goal_radius,
                 alpha=args.alpha,
                 action_horizon=args.action_horizon,
-                execute_horizon=args.execute_horizon,
+                execution_policy=execution_policy,
                 max_steps_per_episode=args.max_steps_per_episode,
                 seed=args.seed,
                 attn_implementation=args.attn_implementation,
@@ -2224,7 +2247,7 @@ def main() -> None:
             existing_annotations=existing_annotations,
             image_format=args.image_format,
             action_horizon=args.action_horizon,
-            execute_horizon=args.execute_horizon,
+            execution_policy=execution_policy,
         )
         success = True
     finally:

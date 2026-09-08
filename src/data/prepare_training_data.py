@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Generate stride-6 H18 training JSONL from R2R/RxR and DAgger data."""
+"""Generate H18 training JSONL from stride-6 R2R/RxR and DAgger decisions."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -130,6 +131,35 @@ def validate_actions(actions: Sequence[int], context: str) -> None:
     )
 
 
+def validate_dagger_execution_policy(policy: dict) -> None:
+    """Validate the variable-horizon collector's persisted configuration."""
+    if not isinstance(policy, dict) or policy.get("actions_per_replan") != "uncertainty":
+        raise ValueError("DAgger execution_policy must use uncertainty")
+    budget = policy.get("uncertainty_budget")
+    if (
+        isinstance(budget, bool)
+        or not isinstance(budget, (int, float))
+        or not math.isfinite(budget)
+        or budget <= 0
+    ):
+        raise ValueError("DAgger uncertainty_budget must be finite and positive")
+    action_range = policy.get("replan_action_range")
+    if (
+        not isinstance(action_range, (list, tuple))
+        or len(action_range) != 2
+        or any(isinstance(k, bool) or not isinstance(k, int) for k in action_range)
+        or not 1 <= action_range[0] <= action_range[1] <= ACTION_HORIZON
+    ):
+        raise ValueError("DAgger replan_action_range must satisfy 1 <= MIN <= MAX <= 18")
+    stop_window = policy.get("stop_oracle_max_actions")
+    if (
+        isinstance(stop_window, bool)
+        or not isinstance(stop_window, int)
+        or not action_range[1] <= stop_window <= ACTION_HORIZON
+    ):
+        raise ValueError("DAgger stop_oracle_max_actions must be between MAX and 18")
+
+
 def parse_dagger_oracle_chunks(
     row: dict,
     actions: Sequence[int],
@@ -144,7 +174,10 @@ def parse_dagger_oracle_chunks(
             f"{context}: DAgger action_horizon must be {ACTION_HORIZON}, "
             f"got {row.get('action_horizon')!r}"
         )
-    if (
+    variable_horizon = "execution_policy" in row
+    if variable_horizon:
+        validate_dagger_execution_policy(row["execution_policy"])
+    elif (
         isinstance(row.get("execute_horizon"), bool)
         or not isinstance(row.get("execute_horizon"), int)
         or row.get("execute_horizon") != EXECUTION_HORIZON
@@ -160,6 +193,7 @@ def parse_dagger_oracle_chunks(
 
     chunks: list[OracleChunk] = []
     previous_step = -1
+    previous_chunk = None
     non_stop_action_count = len(actions) - 1
     for chunk_index, raw_chunk in enumerate(raw_chunks):
         if not isinstance(raw_chunk, dict):
@@ -205,7 +239,8 @@ def parse_dagger_oracle_chunks(
                     f"step {step_index}"
                 )
             if (
-                chunk_index < len(raw_chunks) - 1
+                not variable_horizon
+                and chunk_index < len(raw_chunks) - 1
                 and first_stop < EXECUTION_HORIZON
             ):
                 raise ValueError(
@@ -213,7 +248,47 @@ def parse_dagger_oracle_chunks(
                     f"its executable prefix at step {step_index}"
                 )
 
-        if previous_step >= 0:
+        if variable_horizon:
+            minimum, maximum = row["execution_policy"]["replan_action_range"]
+            horizon = raw_chunk.get("execute_horizon")
+            count = raw_chunk.get("executed_count")
+            source = raw_chunk.get("executed_policy")
+            terminal = source == "terminal_oracle"
+            if source not in {
+                "model", "oracle", "model_stop_oracle", "model_fallback_oracle",
+                "terminal_oracle",
+            }:
+                raise ValueError(f"{context}: invalid executed_policy at step {step_index}")
+            if (
+                isinstance(horizon, bool)
+                or not isinstance(horizon, int)
+                or (horizon != 1 if terminal else not minimum <= horizon <= maximum)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or not 1 <= count <= horizon
+                or (terminal and oracle_actions != (STOP,) * ACTION_HORIZON)
+            ):
+                raise ValueError(f"{context}: invalid execution length at step {step_index}")
+            if previous_chunk is not None:
+                if step_index - previous_step != previous_chunk["executed_count"]:
+                    raise ValueError(f"{context}: executed_count does not match decision gap")
+                if (
+                    previous_chunk["executed_count"] < previous_chunk["execute_horizon"]
+                    and not terminal
+                ):
+                    raise ValueError(f"{context}: only terminal decisions may interrupt a prefix")
+            actual = tuple(actions[step_index:step_index + count])
+            if len(actual) != count:
+                raise ValueError(f"{context}: execution extends beyond trajectory")
+            if source == "model":
+                if STOP in actual:
+                    raise ValueError(f"{context}: a model decision must not execute STOP")
+            elif actual != oracle_actions[:count]:
+                raise ValueError(f"{context}: executed expert actions do not match oracle labels")
+            if chunk_index == len(raw_chunks) - 1 and step_index + count != len(actions):
+                raise ValueError(f"{context}: final execution does not cover trajectory")
+            previous_chunk = raw_chunk
+        elif previous_step >= 0:
             step_gap = step_index - previous_step
             if step_gap != EXECUTION_HORIZON:
                 is_early_terminal_decision = bool(

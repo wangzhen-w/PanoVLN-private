@@ -35,6 +35,16 @@ from src.data.habitat_shortest_path import (
     silence_external_output,
     validate_gpu_ids,
 )
+from src.data.dagger_replay import (
+    dagger_source,
+    render_frame_state,
+    validate_replay_environment,
+    validate_replay_metadata,
+)
+from src.data.prepare_training_data import (
+    parse_dagger_oracle_chunks,
+    validate_trajectory_actions,
+)
 
 SCAN_PROGRESS_REFRESH_INTERVAL_EPISODES = 256
 QUEUE_POLL_TIMEOUT_SECONDS = 5
@@ -68,6 +78,13 @@ def is_episode_complete(image_path, annotation, image_format):
     return (
         count_saved_frames(episode_image_path, image_format=image_format)
         == expected_frame_count(annotation)
+        and all(
+            os.path.isfile(path) and os.path.getsize(path) > 0
+            for path in (
+                os.path.join(episode_image_path, frame_image_filename(i, image_format))
+                for i in range(expected_frame_count(annotation))
+            )
+        )
     )
 
 
@@ -82,25 +99,24 @@ def replay_annotation_episode(
     jpeg_subsampling=2,
     png_compress_level=6,
 ):
+    actions = [int(action) for action in annotation["actions"]]
+    validate_trajectory_actions(actions, f"episode {annotation['episode_id']}")
+    has_poses = validate_replay_metadata(annotation)
+    if has_poses:
+        image_size = tuple(annotation["replay_config"]["image_size"])
     env.current_episode = episode
     observation = env.reset()
-    actions = [int(action) for action in annotation["actions"]]
-
-    if not actions:
-        raise RuntimeError(f"Episode {episode.episode_id} has empty action list")
-    if actions[-1] != STOP_ACTION:
-        raise RuntimeError(
-            f"Episode {episode.episode_id} action list must end with stop"
-        )
-
-    step_id = 0
     if episode_image_path is not None:
         reset_episode_output_dir(episode_image_path)
+
+    def save_observation(observation, step_id):
+        if episode_image_path is None:
+            return
         save_rgb_frame(
             observation["rgb"],
             os.path.join(
                 episode_image_path,
-                frame_image_filename(0, image_format=image_format),
+                frame_image_filename(step_id, image_format=image_format),
             ),
             image_size=image_size,
             jpeg_quality=jpeg_quality,
@@ -108,29 +124,18 @@ def replay_annotation_episode(
             png_compress_level=png_compress_level,
         )
 
-    for action_index, action in enumerate(actions):
-        if action == STOP_ACTION and action_index != len(actions) - 1:
-            raise RuntimeError(
-                f"Episode {episode.episode_id} contains stop before the final action"
-            )
-
-        observation = env.step(action)
-        if action == STOP_ACTION:
-            continue
-
-        step_id += 1
-        if episode_image_path is not None:
-            save_rgb_frame(
-                observation["rgb"],
-                os.path.join(
-                    episode_image_path,
-                    frame_image_filename(step_id, image_format=image_format),
-                ),
-                image_size=image_size,
-                jpeg_quality=jpeg_quality,
-                jpeg_subsampling=jpeg_subsampling,
-                png_compress_level=png_compress_level,
-            )
+    if has_poses:
+        # Teleport the recorded body/camera poses; never re-run collision dynamics.
+        for step_id, frame in enumerate(annotation["frame_states"]):
+            save_observation(render_frame_state(env.sim, frame), step_id)
+    else:
+        step_id = 0
+        save_observation(observation, step_id)
+        for action in actions:
+            observation = env.step(action)
+            if action != STOP_ACTION:
+                step_id += 1
+                save_observation(observation, step_id)
 
     return {
         "episode_id": int(episode.episode_id),
@@ -165,6 +170,11 @@ def extract_data(
         )
         with habitat.config.read_write(env_config):
             env_config.habitat.simulator.habitat_sim_v0.gpu_device_id = local_gpu_id
+            if annotations and "oracle_chunks" in annotations[0]:
+                env_config.habitat.task.measurements = {}
+                env_config.habitat.environment.max_episode_steps = max(
+                    len(annotation["actions"]) for annotation in annotations
+                )
 
         selected_episode_ids = {int(episode_id) for episode_id in episode_ids}
         dataset.episodes = [
@@ -195,6 +205,8 @@ def extract_data(
             annotation_by_episode_id[int(episode.episode_id)]
             for episode in dataset.episodes
         ]
+        for annotation, episode in zip(ordered_annotations, dataset.episodes):
+            validate_replay_environment(annotation, env_config, episode)
 
         with silence_external_output():
             env = habitat.Env(config=env_config.habitat, dataset=dataset)
@@ -247,7 +259,7 @@ def extract_data(
                         f"{expected_frame_count(annotation)}"
                     )
                 output_dict["time_per_episode"] = time.time() - episode_start_time
-                output_dict["episode_id"] = int(episode.episode_id)
+                output_dict["episode_id"] = annotation_image_id(annotation)
                 result_queue.put(output_dict)
 
             env.close()
@@ -283,16 +295,23 @@ def process_single_dataset(
     jpeg_quality,
     jpeg_subsampling,
     png_compress_level,
+    annotations_override=None,
+    image_path_override=None,
 ):
     ANNOT_PATH, IMAGE_PATH = resolve_dataset_paths(
         dataset_name,
         output_root,
     )
-    annotations = []
-    with open(ANNOT_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            item = json.loads(line)
-            annotations.append(item)
+    if image_path_override is not None:
+        IMAGE_PATH = image_path_override
+    if annotations_override is None:
+        annotations = []
+        with open(ANNOT_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    annotations.append(json.loads(line))
+    else:
+        annotations = list(annotations_override)
     annotations = sorted(annotations, key=lambda x: x["episode_id"])
     if episode_ids is not None:
         selected_episode_id_set = {int(episode_id) for episode_id in episode_ids}
@@ -323,6 +342,11 @@ def process_single_dataset(
     selected_episode_ids = {
         annotation["episode_id"] for annotation in annotations
     }
+    missing_in_dataset = selected_episode_ids - {
+        int(episode.episode_id) for episode in dataset.episodes
+    }
+    if missing_in_dataset:
+        raise ValueError(f"Missing Habitat episodes for {dataset_name}: {sorted(missing_in_dataset)}")
     dataset.episodes = [
         episode
         for episode in dataset.episodes
@@ -536,6 +560,54 @@ def process_single_dataset(
         for worker_bar in worker_bars.values():
             worker_bar.close()
 
+def process_dagger_dataset(output_root, episode_ids=None, max_episodes=None, **kwargs):
+    annotation_path = os.path.join(output_root, "sub_dataset", "dagger.jsonl")
+    image_path = os.path.join(output_root, "images", "dagger")
+    with open(annotation_path, "r", encoding="utf-8") as handle:
+        annotations = [json.loads(line) for line in handle if line.strip()]
+    annotations.sort(key=lambda row: row["episode_id"])
+    annotation_ids = [row["episode_id"] for row in annotations]
+    if len(set(annotation_ids)) != len(annotation_ids):
+        raise ValueError("Duplicate DAgger episode IDs")
+    if episode_ids is not None:
+        selected = set(episode_ids)
+        missing = selected - set(annotation_ids)
+        if missing:
+            raise ValueError(f"Missing DAgger IDs (use r2r_N/rxr_N): {sorted(missing)}")
+        annotations = [row for row in annotations if row["episode_id"] in selected]
+    if max_episodes is not None:
+        annotations = annotations[:max_episodes]
+
+    grouped = {"r2r": [], "rxr": []}
+    legacy_count = 0
+    for annotation in annotations:
+        source, source_id = dagger_source(annotation)
+        if annotation_image_id(annotation) != annotation["episode_id"]:
+            raise ValueError("DAgger episode_id and trajectory_id must match")
+        validate_trajectory_actions(annotation["actions"], annotation["episode_id"])
+        parse_dagger_oracle_chunks(annotation, annotation["actions"], annotation["episode_id"])
+        if not validate_replay_metadata(annotation):
+            legacy_count += 1
+        # Adapt only the in-memory lookup ID, preserving the original output directory.
+        grouped[source].append(dict(
+            annotation, episode_id=source_id,
+            trajectory_id=annotation["episode_id"],
+        ))
+    tqdm.write(
+        f"[dagger] episodes={len(annotations)}, pose_replay={len(annotations) - legacy_count}, "
+        f"legacy_action_replay={legacy_count}"
+    )
+    if legacy_count:
+        tqdm.write("[dagger] Legacy action replay requires matching Habitat versions and simulator settings.")
+    for source, rows in grouped.items():
+        if rows:
+            process_single_dataset(
+                dataset_name=source, output_root=output_root,
+                episode_ids=None, max_episodes=None,
+                annotations_override=rows, image_path_override=image_path, **kwargs,
+            )
+
+
 def main(
     dataset2process,
     output_root,
@@ -553,6 +625,17 @@ def main(
     png_compress_level,
 ):
     for dataset_name in dataset2process:
+        if dataset_name == "dagger":
+            process_dagger_dataset(
+                output_root=output_root, episode_ids=episode_ids, max_episodes=max_episodes,
+                save_image=save_image, num_thread=num_thread,
+                requested_gpu_ids=requested_gpu_ids, visible_gpu_ids=visible_gpu_ids,
+                num_processes_per_gpu=num_processes_per_gpu,
+                skip_existing_episodes=skip_existing_episodes, image_format=image_format,
+                jpeg_quality=jpeg_quality, jpeg_subsampling=jpeg_subsampling,
+                png_compress_level=png_compress_level,
+            )
+            continue
         process_single_dataset(
             dataset_name=dataset_name,
             output_root=output_root,
@@ -563,7 +646,7 @@ def main(
             num_processes_per_gpu=num_processes_per_gpu,
             skip_existing_episodes=skip_existing_episodes,
             max_episodes=max_episodes,
-            episode_ids=episode_ids,
+            episode_ids=parse_episode_ids(episode_ids),
             image_format=image_format,
             jpeg_quality=jpeg_quality,
             jpeg_subsampling=jpeg_subsampling,
@@ -577,6 +660,7 @@ if __name__ == "__main__":
         "--dataset_name",
         nargs="+",
         default=["r2r",],
+        choices=[*CONFIG, "dagger"],
     )
     parser.add_argument(
         "--save_image",
@@ -618,7 +702,7 @@ if __name__ == "__main__":
         "--episode_ids",
         nargs="*",
         default=None,
-        help="Optional episode ids to render, e.g. --episode_ids 7142 9001",
+        help="Episode IDs to render; DAgger uses prefixed IDs, e.g. r2r_7142 rxr_9001.",
     )
     parser.add_argument(
         "--image_format",
@@ -649,7 +733,10 @@ if __name__ == "__main__":
             f"--jpeg_quality must be in [1, 100], got {args.jpeg_quality}"
         )
     requested_gpu_ids = parse_gpu_ids(args.gpu_ids)
-    selected_episode_ids = parse_episode_ids(args.episode_ids)
+    selected_episode_ids = (
+        [part for token in args.episode_ids for part in token.replace(",", " ").split()]
+        if args.episode_ids is not None else None
+    )
     visible_gpu_ids = None
     if requested_gpu_ids is not None:
         visible_gpu_ids = remap_gpu_ids_to_visible_devices(requested_gpu_ids)

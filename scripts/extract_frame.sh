@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 PYTHON_BIN="python"
 OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
-DATASET_NAMES=(r2r rxr)
+DATASET_NAMES=(dagger)  # r2r/rxr and other original datasets are also supported.
 GPU_IDS="0,1,2,3,4,5,6,7"
 PROCESSES_PER_GPU="6"
 SAVE_IMAGE="true"  # Complete episodes in the selected format are skipped.
@@ -23,10 +23,10 @@ EPISODE_IDS=""
 
 # png/jpeg are supported. PNG is always pixel-lossless; level 0 disables its
 # lossless DEFLATE compression. JPEG settings are ignored when IMAGE_FORMAT=png.
-IMAGE_FORMAT="png"
+IMAGE_FORMAT="jpeg"
 PNG_COMPRESS_LEVEL="6"
 JPEG_QUALITY="95"
-JPEG_SUBSAMPLING="0"
+JPEG_SUBSAMPLING="1"
 
 mkdir -p "${OUTPUT_ROOT}"
 

@@ -13,7 +13,7 @@ export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
 
 PYTHON_BIN="python"
-MODEL_PATH="/workspace/data2/model/18-action/panovggt_base_18action"
+MODEL_PATH="/workspace/data2/model/18-action/panovggt_post_merger_grouping_alpha020_no_output_norm"
 OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 REFERENCE_INPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 SOURCE_DATASET_NAMES=(r2r rxr)
@@ -29,7 +29,11 @@ MIDGOAL_RADIUS="1.8"
 GOAL_RADIUS="0.3"
 ALPHA="0.5"
 ACTION_HORIZON="18"
-EXECUTE_HORIZON="6"
+# Shared uncertainty execution length for model and oracle.
+UNCERTAINTY_BUDGET=1.2
+REPLAN_ACTION_RANGE=(4 8)
+# A model STOP in the first N actions selects oracle for this round.
+STOP_ORACLE_MAX_ACTIONS=12
 SEED="42"
 ATTN_IMPLEMENTATION="sdpa"
 SKIP_EXISTING_EPISODES="true"
@@ -52,7 +56,9 @@ echo "MIDGOAL_RADIUS: ${MIDGOAL_RADIUS}"
 echo "GOAL_RADIUS: ${GOAL_RADIUS}"
 echo "ALPHA: ${ALPHA}"
 echo "ACTION_HORIZON: ${ACTION_HORIZON}"
-echo "EXECUTE_HORIZON: ${EXECUTE_HORIZON}"
+echo "UNCERTAINTY_BUDGET: ${UNCERTAINTY_BUDGET}"
+echo "REPLAN_ACTION_RANGE: ${REPLAN_ACTION_RANGE[*]}"
+echo "STOP_ORACLE_MAX_ACTIONS: ${STOP_ORACLE_MAX_ACTIONS}"
 echo "IMAGE_FORMAT: ${IMAGE_FORMAT}"
 if [[ "${IMAGE_FORMAT,,}" == "png" ]]; then
     echo "PNG_COMPRESS_LEVEL: ${PNG_COMPRESS_LEVEL}"
@@ -85,7 +91,9 @@ CMD=(
     --goal_radius "${GOAL_RADIUS}"
     --alpha "${ALPHA}"
     --action_horizon "${ACTION_HORIZON}"
-    --execute_horizon "${EXECUTE_HORIZON}"
+    --uncertainty_budget "${UNCERTAINTY_BUDGET}"
+    --replan_action_range "${REPLAN_ACTION_RANGE[@]}"
+    --stop_oracle_max_actions "${STOP_ORACLE_MAX_ACTIONS}"
     --seed "${SEED}"
     --attn_implementation "${ATTN_IMPLEMENTATION}"
     --skip_existing_episodes "${SKIP_EXISTING_EPISODES}"

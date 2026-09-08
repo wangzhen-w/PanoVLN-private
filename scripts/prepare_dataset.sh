@@ -38,7 +38,7 @@ echo "ACTION_HORIZON: 18"
 echo "EXECUTION_HORIZON: 6"
 echo "BODY_STRIDE: 6"
 echo "STATIC_RULE: stride6 + multi-turn-onset + long-forward + stop[1-6]dense + stop[7-18]pair"
-echo "DAGGER_RULE: keep-all-h18-oracle-decisions-executed-history-stride6"
+echo "DAGGER_RULE: keep-all-h18-oracle-decisions-with-executed-history"
 printf 'Running:'
 printf ' %q' "${PREPARE_CMD[@]}"
 printf '\n'
