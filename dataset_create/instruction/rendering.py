@@ -268,7 +268,7 @@ class EpisodeRenderer:
             directory.mkdir(parents=True, exist_ok=True)
             return {"decision_id": decision_id, "state_index": index,
                     "position": states[index]["position"], "rotation_xyzw": states[index]["rotation_xyzw"],
-                    "anchor_state_index": span["anchor_index"], "review_start_state_index": span["start"],
+                    "anchor_state_index": span["anchor_index"],
                     "clean_compass": save_image(compass_image(clean), directory / f"{decision_id}_clean.jpg"),
                     "marked_compass": save_image(compass_image(marked), directory / f"{decision_id}_route.jpg"),
                     "route_pixels": stats["total"], "route_pixels_per_view": stats["per_view"]}
@@ -301,7 +301,7 @@ class EpisodeRenderer:
             sampling.update(frame_distance_m=self.settings["frame_distance_m"]*.7,
                             frame_turn_degrees=self.settings["frame_turn_degrees"]*.7,
                             max_video_frames=self.settings["max_video_frames"]+16)
-        required = [i for d in decisions for i in (d["state_index"], d["review_start_state_index"])]
+        required = [d["state_index"] for d in decisions]
         indices = sample_frames(segment, states, sampling, required=required)
         clean_paths, marked_paths, cameras, pixel_counts = [], [], [], []
         for j, i in enumerate(indices):
@@ -321,18 +321,6 @@ class EpisodeRenderer:
         # Context remains available for audits, but never masquerades as motion
         # owned by this segment. Both native video and frames mode see only core.
         context = {"frame_state_indices": indices, "clean_frames": clean_paths}
-        for decision in decisions:
-            # Start at the decision's approach, excluding unrelated earlier turns.
-            # Keep the natural segment end: an abstract region boundary can come
-            # before the actual entrance maneuver has finished.
-            review = [j for j, i in enumerate(indices)
-                      if decision["review_start_state_index"] <= i <= segment.end]
-            decision["review_frames"] = [clean_paths[j] for j in review]
-            decision["review_end_state_index"] = segment.end
-            decision["review_cameras"] = [cameras[j] for j in review]
-            decision["review_state_indices"] = [indices[j] for j in review]
-            decision["review_video"] = video_from_frames(
-                decision["review_frames"], directory / f"{decision['decision_id']}_review.mp4", self.settings["video_fps"])
         core = [j for j, i in enumerate(indices) if segment.start <= i <= segment.end]
         indices = [indices[j] for j in core]
         clean_paths = [clean_paths[j] for j in core]

@@ -70,7 +70,7 @@ def run_lock(path):
 def _media_available(evidence):
     paths = [evidence["marked_video"], evidence["clean_video"], *evidence["clean_frames"], *evidence["marked_frames"]]
     for decision in evidence["decisions"]:
-        paths.extend([decision["marked_compass"], decision["clean_compass"], decision["review_video"], *decision["review_frames"]])
+        paths.extend([decision["marked_compass"], decision["clean_compass"]])
     if evidence["stop"]:
         paths.append(evidence["stop"]["actual"]["image"])
     if evidence.get("clean_storyboard"):
@@ -130,6 +130,7 @@ def process_episode(renderer, client, episode, index, manifest, settings, mode, 
         return {"status": "prepared", "resumed": True, "trajectory_id": episode["trajectory_id"]}
     started = time.monotonic()
     record.update({"schema_version": SCHEMA_VERSION, "fingerprint": signature,
+                   "generation_fingerprint": manifest["behavior_fingerprint"],
                    "trajectory_id": episode["trajectory_id"], "episode_index": index,
                    "source_trajectory": episode, "status": "working"})
     record.setdefault("history", [])

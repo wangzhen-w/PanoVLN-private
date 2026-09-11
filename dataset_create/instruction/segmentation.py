@@ -33,6 +33,22 @@ def yaw_degrees(xyzw) -> float:
     return float(np.degrees(np.arctan2(direction[0], -direction[2])))
 
 
+def camera_motion(cameras):
+    """Measured changes between video frames, without interpreting scene landmarks."""
+    headings = np.degrees(np.unwrap(np.radians([yaw_degrees(c["rotation_xyzw"]) for c in cameras])))
+    positions = np.asarray([c["position"] for c in cameras])
+    result = []
+    for i in range(1, len(cameras)):
+        turn = round(float(headings[i] - headings[i-1]), 1)
+        result.append({"frames": [i-1, i],
+                       "turn": "right" if turn > 0 else "left" if turn < 0 else "none",
+                       "degrees": abs(turn),
+                       "travel_m": round(float(np.linalg.norm(positions[i] - positions[i-1])), 2),
+                       "rise_m": round(float(positions[i, 1] - positions[i-1, 1]), 2),
+                       "height_from_start_m": round(float(positions[i, 1] - positions[0, 1]), 2)})
+    return result
+
+
 def angle_difference(a, b):
     return (a - b + 180.) % 360. - 180.
 

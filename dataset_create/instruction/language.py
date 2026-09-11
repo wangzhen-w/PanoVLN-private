@@ -8,6 +8,7 @@ import re
 
 from dataset_create.instruction.client import media_item, text_item, video_items
 from dataset_create.instruction.prompts import AUTHOR_SYSTEM, POLISH_SYSTEM
+from dataset_create.instruction.segmentation import camera_motion
 
 
 MARKER_LANGUAGE = re.compile(
@@ -87,6 +88,7 @@ def author_content(segment, evidence, previous, feedback, media_mode):
     info = {"segment_id": segment.segment_id, "kinds": segment.kinds,
             "assigned_decision_ids": segment.decision_ids, "terminal": segment.terminal,
             "core_video_frame_range_inclusive": [min(core), max(core)],
+            "measured_camera_motion": camera_motion(evidence["cameras"]),
             "previous_segment_text_for_naming_only": previous,
             "local_repair_feedback": feedback or None}
     content = [text_item(json.dumps(info, ensure_ascii=False))]

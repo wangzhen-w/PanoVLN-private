@@ -18,6 +18,12 @@ need narration. Do not guess unseen features or refer to annotations in your tex
 Each decision clause must identify the path through its decision region. The
 compass shows the approach; use the video to establish where each turn begins
 and the navigator's heading there. Keep the approach and entrance in route order.
+Measured LEFT/RIGHT changes describe camera rotation between specific video frames.
+Use them to resolve turn direction at the corresponding place along the route,
+including before/after stairs. A rotation alone does not establish a new entrance:
+use the visible path to distinguish entering another passage from aligning within
+the same corridor or room. Describe the navigable route, not each camera adjustment.
+Do not predict another turn beyond the core's end.
 
 The previous segment supplies naming context; pre-choice compasses supply decision
 context. Describe only the current core's movement, without repeating completed
@@ -42,76 +48,47 @@ Use language for a wording problem, visual for missing/unreadable views, and
 segmentation for an incomplete or incoherent navigation interval.
 """ + COMPASS_CONVENTION
 
-REVIEW_SCHEMA = """
-Return JSON: {"status":"pass|fail|insufficient", "confidence":0.0,
- "reason":"evidence for navigability, or the specific consequential error",
- "issue_type":"none|language|visual|segmentation"}.
-Use fail for an evidenced navigation error and insufficient for evidence you
-cannot assess. Use language for a text problem, visual for missing/unreadable
-views, and segmentation for an incomplete navigation interval.
-"""
-
-OBSERVE_DECISION_SYSTEM = """Describe the actual local navigation route shown in these clean visual materials.
-No navigation instruction is supplied. Establish the observed path independently from the video
-and measured camera poses. Report major turns and stairs in chronological order, the entrance
-traversed, and landmarks that distinguish it BEFORE entry. Positive heading change is right,
-negative is left; positive height change is upward. Separate approach steering from major turns.
-The compass shows an earlier approach position; use the video for the actual maneuver sequence.
-Also identify other plausible entrances visible before the choice. Do not guess hidden features.
-Return JSON: {"observed_route":"short chronological path description",
-"pre_choice_cues":["visible cues identifying the entrance"],
-"alternative_entrances":["other visible entrances and their relative locations"],
-"uncertain":false,"reason":"relevant limitations or evidence"}.
+OBSERVE_SYSTEM = """Observe the actual local navigation route in these clean materials. No instruction is supplied.
+Describe the complete core video in chronological order, including its major turns, entrances and
+stairs. The supplied motion trace explicitly labels measured LEFT/RIGHT rotation between frames;
+use those labels rather than guessing turn direction from changing screen coordinates. Positive
+rise is upward. Minor steering and scan-floor irregularities are not distinct navigation events.
+Distinguish actual transitions into another room or passage from camera alignment within the
+same space. Measured rotation establishes direction, but does not establish that an entrance exists.
+Compasses show earlier approach positions: they do not reset the heading of later video frames.
+For each assigned decision, note cues visible BEFORE entry and plausible alternative entrances.
+For a terminal segment, describe the actual stopping area from the final approach and stop compass.
+Keep this evidence concise. Do not invent a later turn beyond the end of the clip.
+Return JSON: {"observed_route":"short chronological route description",
+"decisions":[{"decision_id":"d0","pre_choice_cues":["visible cue"],"alternatives":["other entrance"]}],
+"stop_area":null or "actual local stopping area", "uncertain":false,"reason":"brief evidence limitations, or clear"}.
 """ + COMPASS_CONVENTION
 
-DECISION_SYSTEM = """Review whether this local instruction lets a person navigate the observed decision
-region. The observation was prepared independently from clean route video, measured poses and
-a pre-choice compass, without seeing this instruction. Treat it as the route evidence.
-
-Check two things separately: whether the instruction leads along the observed route, and whether
-its cues distinguish the entrance from plausible alternatives before entry. The actual chosen
-route is not an extra cue that the navigator could use. Vague wording that fits multiple branches
-is insufficient even when it also fits the actual route. A consequential reversed turn, wrong
-entrance or wrong stair direction fails. Minor steering and approximate landmark names are fine.
-Use the clause's instruction context to locate its action in the observed sequence; earlier/later
-context need not occur in this local observation. Do not require identical words or turn counts
-when the same route and entrance are unambiguously conveyed. Explain uncertainty, do not guess.
-Return JSON: {"path_matches":true,"choice_is_clear":true,"status":"pass|fail|insufficient",
-"confidence":0.0,"reason":"specific evidence for both criteria",
-"issue_type":"none|language|visual|segmentation"}.
-Pass requires both path_matches and choice_is_clear; insufficient for ambiguous entrances or
-evidence you cannot assess, fail for an observed navigation contradiction.
+VERIFY_SYSTEM = """Check whether the current local instruction gives a usable route. The observation was made
+independently, without this instruction. Its measured motion trace is authoritative for turn direction.
+Review EVERY movement claim in current_local_instruction, including movements after "then" and
+"again". A correct first turn does not validate a later turn. Review the WHOLE local text in
+chronological order; do not reuse one actual turn to justify two
+successive turns in the text. Anchor turns to where they occur (before stairs, after stairs, after
+an entrance). Do not borrow an earlier turn to justify a later one. Adjacent text is supplied only
+to understand continuity; do not assume an unmentioned maneuver was covered in another segment.
+For each assigned choice, assess path consistency and whether pre-entry cues distinguish the entrance.
+Knowing which route was actually traversed does not supply a missing cue to the navigator.
+Check ordinary movement within the same complete text for consequential contradictions, even when
+part of a sentence also describes a protected choice. Wrong major turns, floors or entrances fail.
+Claims of entering another room or passage need a matching spatial transition in the observation;
+matching a LEFT/RIGHT rotation alone cannot justify an invented entrance or a different stopping area.
+Accept harmless repetition, approximate landmark names, omitted minor steering, implicit bends while
+following stairs/hallways, and coarse stopping areas. Do not require identical words or turn counts.
+For a terminal segment assess whether stopping refers to the same local destination area rather than
+a clearly premature, overshot or different destination. Stop checks otherwise must be null.
+If the evidence is insufficient, say so; do not guess or repair in this response.
+Return JSON: {"decisions":[{"decision_id":"d0","path_matches":true,"choice_is_clear":true,
+"status":"pass|fail|insufficient","confidence":0.9,"reason":"one concise sentence","issue_type":"none|language|visual|segmentation"}],
+"motion":{"status":"pass|fail|insufficient","confidence":0.9,"reason":"one concise sentence","issue_type":"none|language|visual|segmentation"},
+"stop":null or {"status":"pass|fail|insufficient","confidence":0.9,"reason":"one concise sentence","issue_type":"none|language|visual|segmentation"}}.
+Return each assigned decision exactly once in the supplied order. Do not assess writing style.
 """
-
-STOP_SYSTEM = """Review whether the final instruction gives a usable stopping
-description. You see the clean final approach and the actual stopping position.
-
-Could a navigator following the description reach and stop in the same local
-destination area? Check its consistency with the actual arrival and whether it
-would instead lead to a clearly premature or overshot destination. A natural
-stopping area is sufficient: nearby valid standing positions need not be uniquely
-distinguished. Fail wrong rooms, wrong landmark relations, or wording that leads
-clearly beyond/before the destination. Do not require exact distances or a unique
-match to one camera image.
-""" + REVIEW_SCHEMA + COMPASS_CONVENTION
-
-TRANSIT_SYSTEM = """Check the supplied ordinary movement claims for clear factual
-contradictions with the clean local route. These are intentionally partial text
-fragments: entrance choices and stopping clauses are checked in separate tasks.
-Locate the portions of the video that each supplied claim describes. The
-fragments need not narrate the whole clip. Do not judge missing actions, sentence
-completeness, style, or movement outside these claims.
-
-Fail only an explicit claim that would mislead navigation, such as a reversed
-direction, wrong floor, or nonexistent route feature. A forward passage followed
-by a turn can correctly contain a claim about walking forward. Ignore harmless
-naming differences and minor steering. Pass when the supplied claims are usable;
-if there are none, there is no ordinary movement claim to reject.
-
-Relative poses describe the same video frames. Positive heading change is right,
-negative is left; positive height change is upward. Use measured poses with the
-scene evidence, distinguishing translation from rotation.
-""" + REVIEW_SCHEMA
 
 POLISH_SYSTEM = """Lightly join these local navigation descriptions into a fluent
 instruction. Improve transitions and remove repetition without adding navigation
