@@ -12,16 +12,15 @@ import numpy as np
 
 def discover_scenes(
     scene_root: str | Path,
-    split: str,
     scene_ids: Sequence[str] | None = None,
 ) -> list[dict[str, str]]:
     root = Path(scene_root).resolve()
-    split_root = root / split
-    if not split_root.is_dir():
-        raise FileNotFoundError(f"HM3D split does not exist: {split_root}")
+    if not root.is_dir():
+        raise FileNotFoundError(f"HM3D root does not exist: {root}")
     requested = set(scene_ids or [])
     records: list[dict[str, str]] = []
-    for folder in sorted(path for path in split_root.iterdir() if path.is_dir()):
+    # Source asset folders remain part of scene_id, but do not divide the output.
+    for folder in sorted({path.parent for path in root.glob("*/*/*.basis.glb")}):
         short_id = folder.name.split("-", 1)[-1]
         if requested and folder.name not in requested and short_id not in requested:
             continue
@@ -34,7 +33,6 @@ def discover_scenes(
             {
                 "scene_key": folder.name,
                 "scene_id": f"hm3d/{relative}",
-                "split": split,
                 "glb_path": str(glbs[0].resolve()),
                 "navmesh_path": str(navmeshes[0].resolve()),
                 "glb_relative_path": relative,
@@ -48,6 +46,10 @@ def discover_scenes(
         missing = requested - found
         if missing:
             raise FileNotFoundError(f"Unknown or incomplete HM3D scenes: {sorted(missing)}")
+    if not records:
+        raise FileNotFoundError(f"No complete HM3D scenes found under {root}")
+    if len({record["scene_key"] for record in records}) != len(records):
+        raise ValueError("HM3D scene folder names must be unique across asset directories")
     return records
 
 

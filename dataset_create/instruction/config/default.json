@@ -1,0 +1,64 @@
+{
+  "segmentation": {
+    "decision_approach_m": 1.5,
+    "decision_exit_m": 0.65,
+    "arrival_approach_m": 1.75,
+    "turn_threshold_degrees": 45.0,
+    "turn_cluster_m": 0.65,
+    "turn_approach_m": 0.6,
+    "turn_exit_m": 0.5,
+    "minimum_transit_m": 1.5,
+    "context_overlap_m": 0.5,
+    "max_anchor_route_distance_m": 1.8
+  },
+  "render": {
+    "width": 448,
+    "height": 448,
+    "hfov_degrees": 90.0,
+    "camera_pitch_degrees": -30.0,
+    "near_m": 0.05,
+    "far_m": 20.0,
+    "frame_distance_m": 0.45,
+    "frame_turn_degrees": 30.0,
+    "max_video_frames": 64,
+    "video_fps": 3,
+    "stop_hold_frames": 3,
+    "route_sample_m": 0.04,
+    "route_width_m": 0.065,
+    "arrow_spacing_m": 0.75,
+    "arrow_length_m": 0.27,
+    "arrow_width_m": 0.22,
+    "surface_height_tolerance_m": 0.08,
+    "floor_normal_min_y": 0.65,
+    "ground_ray_above_m": 0.45,
+    "ground_ray_below_m": 0.65,
+    "max_ground_error_m": 0.4,
+    "compass_backtrack_m": 1.5,
+    "min_route_pixels": 25,
+    "jpeg_quality": 92
+  },
+  "erp": {
+    "width": 1600,
+    "height": 800,
+    "jpeg_quality": 95,
+    "jpeg_subsampling": 1
+  },
+  "model": {
+    "base_url": "http://127.0.0.1:10420/v1",
+    "name": "Qwen3.8-27B",
+    "api_key_env": "QWEN_API_KEY",
+    "media_mode": "video",
+    "temperature": 0.15,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": 2200,
+    "timeout_seconds": 240,
+    "retries": 3,
+    "enable_thinking": false
+  },
+  "validation": {
+    "max_local_repairs": 2,
+    "max_upstream_repairs": 1,
+    "minimum_confidence": 0.7
+  }
+}

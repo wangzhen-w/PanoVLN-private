@@ -30,6 +30,7 @@ from dataset_create.trajectory.hm3d import (
     discover_scenes,
     make_simulator,
     package_versions,
+    resolve_scene_path,
     shortest_path,
 )
 from dataset_create.trajectory.io_utils import (
@@ -48,13 +49,6 @@ from dataset_create.trajectory.visualize import render_scene_visualizations
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config" / "default.json"
-REPRESENTATIVE_FIVE = (
-    "00826-BFRyYbPCCPE",  # compact, mostly single-floor
-    "00800-TEEsavR23oF",  # medium, stairs and two levels
-    "00807-rsggHU7g7dh",  # large, predominantly one level
-    "00831-yr17PDCnDDW",  # largest validation navigation area
-    "00862-LT9Jq6dN3Ea",  # large, four-level structure
-)
 
 
 def _default_run_root(config: dict[str, Any]) -> Path:
@@ -272,7 +266,6 @@ def process_scene(
                 "scene": {
                     "scene_key": record["scene_key"],
                     "scene_id": record["scene_id"],
-                    "split": record["split"],
                 },
                 "config_id": current_config_id,
                 "action_mapping": {
@@ -402,7 +395,7 @@ def aggregate_shards(
     metadata = {
         "kind": "hm3d_decision_rich_trajectories",
         "dataset_name": dataset_name,
-        "split": records[0]["split"] if records else None,
+        "purpose": "training",
         "scene_count": len(scene_stats),
         "habitat_sim_version": versions["habitat-sim"],
         "action_mapping": {
@@ -626,13 +619,10 @@ def replay_validate_dataset(
         dynamic_ncols=True,
     )
     for scene_id, episodes in ordered_scenes:
-        parts = scene_id.split("/")
-        record = discover_scenes(
-            config["paths"]["scene_root"], parts[1], [parts[2]]
-        )[0]
+        scene_path = resolve_scene_path(config["paths"]["scene_root"], scene_id)
         with _silence_native_worker_output():
             simulator = make_simulator(
-                record["glb_path"], config, with_sensors=False
+                scene_path, config, with_sensors=False
             )
         try:
             for episode in episodes:
@@ -713,7 +703,7 @@ def replay_validate_dataset(
         finally:
             simulator.close()
         validation_progress.set_postfix(
-            scene=parts[2],
+            scene=scene_path.parent.name,
             trajectories=checked,
             refresh=False,
         )
@@ -740,13 +730,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    collect = subparsers.add_parser("collect", help="collect one split or scene subset")
+    collect = subparsers.add_parser("collect", help="collect all available scenes as training data")
     collect.add_argument("--scene-root", required=True)
     collect.add_argument("--output-root", required=True)
-    collect.add_argument("--split", default="train")
     collect.add_argument("--scene-ids", default=None)
-    collect.add_argument("--representative-five", action="store_true")
-    collect.add_argument("--dataset-name", default=None)
+    collect.add_argument("--dataset-name", default="trajectories")
+    collect.add_argument("--work-dir", default=None)
+    collect.add_argument("--inspect", action="store_true", help="show scene selection without collecting")
     collect.add_argument("--gpu-device-ids", default="0")
     collect.add_argument("--processes-per-gpu", type=int, default=1)
     collect.add_argument("--visualize", action="store_true")
@@ -774,14 +764,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             "scene_root": str(Path(args.scene_root).resolve()),
             "output_root": str(Path(args.output_root).resolve()),
         }
-        scene_ids = list(REPRESENTATIVE_FIVE) if args.representative_five else _parse_scene_ids(args.scene_ids)
-        split = "val" if args.representative_five else args.split
-        records = discover_scenes(config["paths"]["scene_root"], split, scene_ids)
+        records = discover_scenes(config["paths"]["scene_root"], _parse_scene_ids(args.scene_ids))
         output_root = _default_run_root(config)
-        dataset_name = args.dataset_name or (
-            "val_representative_five" if args.representative_five else split
-        )
-        work_root = output_root / ".work" / dataset_name
+        dataset_name = args.dataset_name
+        work_root = Path(args.work_dir).resolve() if args.work_dir else output_root.parent / ".work" / "trajectory"
+        if args.inspect:
+            print(json.dumps({"scenes": len(records), "purpose": "training",
+                              "dataset": str(output_root / f"{dataset_name}.json.gz"),
+                              "work_dir": str(work_root)}, indent=2))
+            return 0
+        dataset_path = output_root / f"{dataset_name}.json.gz"
+        if dataset_path.is_file() and not args.overwrite:
+            existing = load_json_gz(dataset_path)
+            validate_dataset(existing)
+            stats_path = output_root / f"{dataset_name}_stats.json"
+            stats = load_json(stats_path)
+            if ({s["scene_id"] for s in stats["scenes"]} != {r["scene_id"] for r in records}
+                    or stats["trajectories"] != len(existing["episodes"])):
+                raise ValueError("Existing collection belongs to another selection; use a new output or --overwrite")
+            print(json.dumps({"status": "already_collected", "dataset": str(dataset_path),
+                              "trajectories": len(existing["episodes"]),
+                              "note": "Existing trajectories are retained; --overwrite explicitly recollects them."}))
+            return 0
         visualization_root = (
             output_root / "visualizations" / dataset_name
             if args.visualize
@@ -908,7 +912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         if args.cleanup_work_dir:
             work_dir = Path(args.cleanup_work_dir).resolve()
-            expected_parent = (Path(args.dataset).resolve().parent / ".work").resolve()
+            expected_parent = (Path(args.dataset).resolve().parent.parent / ".work").resolve()
             if work_dir.parent != expected_parent or not work_dir.name:
                 raise ValueError(f"Refusing to clean unexpected work directory: {work_dir}")
             if work_dir.is_dir():
