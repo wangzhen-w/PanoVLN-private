@@ -16,8 +16,9 @@
 | `OUTPUT_ROOT`、`NAME` | R2R 输出目录和文件名 |
 | `ERP_ROOT` | 训练图片目录，默认 `${OUTPUT_ROOT}/image` |
 | `WORK_DIR` | 中断续跑检查点，默认 `${OUTPUT_ROOT}/.work/instruction`；完成后自动清理 |
-| `NUM_PROCESSES` | 工作进程数，默认 48；同时也是客户端 API 请求并发上限 |
-| `GPU_DEVICE_IDS=(0 1 2 3 4 5 6 7)` | Habitat 使用的 GPU 列表，默认每张卡六个进程 |
+| `NUM_PROCESSES` | Habitat 工作进程数，默认 16；每个进程只持有一个模拟器 |
+| `EPISODES_PER_PROCESS` | 每个进程并发处理的轨迹数，默认 9；API 并发上限为 `NUM_PROCESSES × EPISODES_PER_PROCESS`，默认 144 |
+| `GPU_DEVICE_IDS=(0 1 2 3 4 5 6 7)` | Habitat 使用的 GPU 列表，默认每张卡两个模拟器 |
 | `CPU_THREADS_PER_PROCESS` | 每个进程的数值库线程数，默认 1，控制 OpenMP/BLAS 线程开销 |
 | `LIMIT` | 处理条数上限；默认 `0` 处理所有筛选后的轨迹，`24` 表示最多处理 24 条 |
 | `SELECTION` | `first` 按输入顺序；`diverse` 优先覆盖不同场景及较多决策 |
@@ -27,7 +28,7 @@
 | `MEDIA_MODE` | 默认 `video`；`frames` 使用逐帧兼容输入 |
 | `KEEP_WORK` | 默认 `false`；调试时设为 `true` 保留中间材料 |
 
-脚本默认使用 GPU 0–7、48 个进程处理统一训练轨迹，已设置 `LIMIT=0`、`NAME="train"`。不再按源场景目录划分数据集。当前输入为：
+脚本默认使用 GPU 0–7、16 个渲染进程、最多 144 条并发工作流处理统一训练轨迹，已设置 `LIMIT=0`、`NAME="train"`。不再按源场景目录划分数据集。当前输入为：
 
 ```text
 /workspace/data2/dataset/general_VLN_data/PanoVLN/trajectory/trajectories.json.gz
@@ -49,15 +50,19 @@ cd /workspace/code/VLN
 
 也可追加 CLI 选项，例如 `--trajectory-ids trajectory_...` 或 `--scene-ids 00800-TEEsavR23oF`。CLI 参数覆盖脚本赋值；通过 CLI 改输出位置时应同时指定 `--erp-root` 和 `--work-dir`。日常运行直接修改脚本顶部即可，不需要环境变量覆盖。
 
-每个工作进程持有一个 Habitat 模拟器，按场景复用，依次完成渲染、生成、验证和 ERP 导出。同一进程每次最多发出一个 API 请求，因此 48 个进程的客户端请求并发上限是 48；正在渲染或导出的进程不占 API 请求并发，实际并发通常较低。各进程等待 API 时仍保留场景，每卡六个进程需要容纳六个模拟器的显存。
+每个工作进程持有一个 Habitat 模拟器，同一场景内最多并发处理 `EPISODES_PER_PROCESS` 条轨迹。各轨迹使用独立的 HTTP 客户端和检查点，在等待 API 时允许其他轨迹推进。回放、路线投影和 ERP 导出统一交给该进程的主线程依次执行，Habitat 的 OpenGL 上下文不会在线程之间共享。
 
-制作时由主进程显示一条总 `tqdm` 进度条，按已处理轨迹数更新，包含总数、百分比、耗时、速度、预计剩余时间，以及 `accepted`（通过）、`quarantined`（隔离）、`error`（待续跑）和 `resumed`（复用检查点）数量。复用的轨迹也计入总进度；进度达到 100% 表示本轮选中的轨迹均已处理，不代表全部入库，最终仍需汇总和导出。工作进程不逐条刷屏，程序错误通过进度条上方的日志显示，详细结果保存在检查点及最终汇总中。`render` 模式同样显示总进度，并增加 `prepared` 数量。
+启动时先检查全部已完成记录，只将未完成轨迹按场景组成小批次，优先处理剩余轨迹较多的场景。每批最多包含四轮并发任务；工作进程完成当前批次后从共享队列领取下一批。同一大场景可由多个进程共同处理，避免固定分片在收尾阶段只剩少数进程工作。同一批内不切换场景，相邻批次场景相同时继续复用模拟器。
+
+因此 API 并发可以增加到 144，而本地最多保留 16 个模拟器，每张卡两个。若某些场景仍使显存吃紧，可降低 `NUM_PROCESSES`，同时提高 `EPISODES_PER_PROCESS` 来维持 API 并发上限。实际 API 并发取决于渲染准备、场景剩余任务数和服务吞吐；`render` 模式每个进程只处理一条轨迹。并发参数不参与数据内容指纹，可以在中断后调整。
+
+制作时由主进程显示一条总 `tqdm` 进度条，按已处理轨迹数更新，包含总数、百分比、耗时、速度、预计剩余时间，以及 `accepted`（通过）、`quarantined`（隔离）、`error`（待续跑）和 `resumed`（复用检查点）数量。完成启动检查后，进度条直接从全部可复用记录的总数开始，速度按本次新增完成量计算。进度达到 100% 表示本轮选中的轨迹均已处理，不代表全部入库，最终仍需汇总和导出。工作进程不逐条刷屏，程序错误通过进度条上方的日志显示，详细结果保存在检查点及最终汇总中。`render` 模式同样显示总进度，并增加 `prepared` 数量。
 
 场景初始化和关闭时的 Habitat 原生日志临时捕获，操作失败会输出捕获的诊断并保留异常。当前只使用 RGB、深度、场景几何和 NavMesh，不需要语义传感器或物体类别标注；可选 semantic 描述缺失不影响这些输入。
 
 Instruction 阶段直接使用 Habitat-Sim，没有运行 Habitat-Lab 的任务 measures，也不重复重建场景的导航区域分区。每段审核共享一次 clean 视频观察和一次完整文字比较，同段的多个决策、普通运动与停止不再分别调用模型看视频。文字修复复用同一份观察；发现首个失败片段后先修复，再检查后续片段。入库仍要求全部决策、运动和停止检查通过；实际吞吐还取决于片段数量、修复次数和模型服务负载。
 
-`GPU_DEVICE_IDS` 仅指定 Habitat 的 GPU，不改变已有 vLLM 服务的 GPU 分配。Qwen 默认地址为 `http://127.0.0.1:10420/v1`，模型为 `Qwen3.8-27B`；模型服务的实际处理并发由其部署配置和吞吐决定。密钥不写入请求记录或运行清单。
+`GPU_DEVICE_IDS` 仅指定 Habitat 的 GPU，不改变已有 vLLM 服务的 GPU 分配。脚本使用聚合入口 `http://127.0.0.1:10430/v1`，模型为 `Qwen3.8-27B`；模型服务的实际处理并发由其部署配置和吞吐决定。密钥不写入请求记录或运行清单。客户端访问本机聚合器时自动绕过代理；远端 API 所需的代理必须配置在聚合器进程中，并让 localhost 绕过代理。
 
 ## 最终产物
 
@@ -66,7 +71,7 @@ Instruction 阶段直接使用 Habitat-Sim，没有运行 Habitat-Lab 的任务 
 ├── train.json
 ├── train.json.gz
 └── image/
-    └── trajectory_.../
+    └── 0/                         # R2R episode_id
         ├── frame_0.jpg
         ├── frame_1.jpg
         └── ...
@@ -74,7 +79,7 @@ Instruction 阶段直接使用 Habitat-Sim，没有运行 Habitat-Lab 的任务 
 
 两个 R2R 文件解压后内容相同，只包含自动验证通过的轨迹。训练图片使用 Habitat 原生 equirectangular 相机，处于真实 agent pose，保持水平，采用轨迹元数据中的传感器高度。训练相机与制作 instruction 的俯视透视相机分开。
 
-**`frame_i.jpg` 对应执行 `action_ids[i]` 前的观察帧。** 每个动作都保留图片，包括原地旋转及最终 STOP；不保存 STOP 执行后的重复帧。因此每条轨迹的图片数等于源轨迹的动作数。图片目录使用原始 `trajectory_id`，可与源轨迹动作直接关联。ERP 没有路线、候选标签或其他叠加。
+**`frame_i.jpg` 对应执行 `action_ids[i]` 前的观察帧。** 每个动作都保留图片，包括原地旋转及最终 STOP；不保存 STOP 执行后的重复帧。因此每条轨迹的图片数等于源轨迹的动作数。图片和检查点目录均使用最终 R2R 的数字 `episode_id`，即轨迹在完整输入文件中的索引，从 0 开始；筛选或隔离后可能有空号，不重新编号。原始 `trajectory_id` 保留在 JSON 中用于关联源动作。ERP 没有路线、候选标签或其他叠加。
 
 图片只在轨迹通过验证后导出，全部完成后才发布该轨迹的目录。强制中断时留下的半成品目录会在该轨迹续跑时重建，不会当成完整训练图片。失败轨迹不生成正式训练图片。`ERP_ROOT` 可以单独指定，以匹配训练任务的图片目录配置；改变相机分辨率时使用新的图片目录。
 
@@ -93,7 +98,7 @@ WORK_DIR/
 ├── manifest.json
 ├── summary.json
 ├── last_run.json
-└── episodes/<hash>/
+└── episodes/<episode_id>/
     ├── record.json                 # pose、segment、clause 来源、验证与修复历史
     ├── ground_route.npz
     ├── requests/<hash>.json

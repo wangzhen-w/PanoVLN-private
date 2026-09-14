@@ -18,14 +18,15 @@ def training_states(episode, states):
     return states[:-1]
 
 
-def erp_directory(root, trajectory_id):
-    if not trajectory_id or Path(trajectory_id).name != trajectory_id or trajectory_id in {".", ".."}:
-        raise ValueError("trajectory_id must be a single directory component")
-    return Path(root) / trajectory_id
+def erp_directory(root, episode_id):
+    name = str(episode_id)
+    if not name.isdecimal():
+        raise ValueError("episode_id must be a nonnegative integer")
+    return Path(root) / name
 
 
-def validate_erp(root, trajectory_id, count, settings, inspect_images=False):
-    directory = erp_directory(root, trajectory_id)
+def validate_erp(root, episode_id, count, settings, inspect_images=False):
+    directory = erp_directory(root, episode_id)
     expected = {f"frame_{i}.jpg" for i in range(count)}
     if not directory.is_dir() or {p.name for p in directory.iterdir()} != expected:
         raise ValueError(f"Incomplete clean ERP sequence: {directory}")
@@ -41,17 +42,17 @@ def validate_erp(root, trajectory_id, count, settings, inspect_images=False):
     return directory
 
 
-def export_clean_erp(renderer, episode, states, root, settings):
+def export_clean_erp(renderer, episode, episode_id, states, root, settings):
     frames = training_states(episode, states)
     root = Path(root)
-    directory = erp_directory(root, episode["trajectory_id"])
-    temporary = root / f".{episode['trajectory_id']}.partial"
+    directory = erp_directory(root, episode_id)
+    temporary = root / f".{episode_id}.partial"
     # A terminated worker may leave an unfinished sequence. It is never reused
     # as training data; the next attempt rebuilds it before atomic publication.
     if temporary.exists():
         shutil.rmtree(temporary)
     if directory.exists():
-        validate_erp(root, episode["trajectory_id"], len(frames), settings, inspect_images=True)
+        validate_erp(root, episode_id, len(frames), settings, inspect_images=True)
         return {"directory": str(directory), "frames": len(frames)}
     root.mkdir(parents=True, exist_ok=True)
     temporary.mkdir()
@@ -64,5 +65,5 @@ def export_clean_erp(renderer, episode, states, root, settings):
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-    validate_erp(root, episode["trajectory_id"], len(frames), settings)
+    validate_erp(root, episode_id, len(frames), settings)
     return {"directory": str(directory), "frames": len(frames)}

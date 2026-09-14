@@ -39,7 +39,7 @@ cd /workspace/code/VLN
 
 ## Instruction 与图片制作
 
-[create_instructions.sh](create_instructions.sh) 默认读取统一轨迹文件，GPU 0–7、48 个进程，`LIMIT=0` 处理全部轨迹。每个进程依次处理渲染、生成和验证，API 并发上限为工作进程数。
+[create_instructions.sh](create_instructions.sh) 默认读取统一轨迹文件，GPU 0–7、16 个 Habitat 进程，每个进程并发处理 9 条轨迹，API 并发上限为 144；`LIMIT=0` 处理全部轨迹。只将未完成任务按场景分批，空闲进程从共享队列领取下一批。API 等待可以重叠，渲染仍在每个进程的主线程依次执行，每张卡只常驻两个模拟器。
 
 ```bash
 ./dataset_create/create_instructions.sh inspect

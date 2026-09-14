@@ -12,7 +12,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 import shutil
 import tempfile
 import time
@@ -23,12 +23,13 @@ from tqdm.auto import tqdm
 from dataset_create.instruction import SCHEMA_VERSION
 from dataset_create.instruction.client import QwenClient, digest
 from dataset_create.instruction.export import make_r2r_episode, validate_r2r, write_r2r
+from dataset_create.instruction.execution import run_scene_tasks
 from dataset_create.instruction.language import LanguageContractError, generate_local, polish_and_assemble
 from dataset_create.instruction.rendering import EpisodeRenderer
 from dataset_create.instruction.segmentation import EvidenceError, Segment, merge_for_repair, segment_episode
 from dataset_create.instruction.verification import repair_feedback, verify_segment
-from dataset_create.instruction.training import export_clean_erp, validate_erp
-from dataset_create.trajectory.hm3d import resolve_scene_path, shortest_path
+from dataset_create.instruction.training import validate_erp
+from dataset_create.trajectory.hm3d import resolve_scene_path
 from dataset_create.trajectory.io_utils import atomic_json_dump, load_json, load_json_gz
 from dataset_create.trajectory.schema import validate_dataset
 
@@ -40,11 +41,6 @@ def implementation_digest():
     root = Path(__file__).resolve().parents[1]
     paths = sorted(list((root / "instruction").glob("*.py")) + list((root / "trajectory").glob("*.py")))
     return digest([(str(p.relative_to(root)), hashlib.sha256(p.read_bytes()).hexdigest()) for p in paths])
-
-
-def episode_key(episode):
-    # No user-controlled trajectory id can escape its workspace directory.
-    return hashlib.sha256(episode["trajectory_id"].encode()).hexdigest()[:24]
 
 
 def episode_signature(episode, manifest):
@@ -78,6 +74,15 @@ def _media_available(evidence):
     return all(Path(p).is_file() for p in paths)
 
 
+def completed_status(record, mode, retry_quarantined):
+    status = record.get("status")
+    if status == "accepted" or (status == "quarantined" and not retry_quarantined):
+        return status
+    if mode == "render" and status == "prepared" and all(_media_available(e) for e in record["evidence"].values()):
+        return status
+    return None
+
+
 def validate_acceptance(record):
     checks = record.get("verification", [])
     if not checks or not all(r["passed"] for r in checks):
@@ -108,15 +113,16 @@ def validate_acceptance(record):
 
 
 def process_episode(renderer, client, episode, index, manifest, settings, mode, retry_quarantined=False):
-    root = Path(manifest["work_dir"]) / "episodes" / episode_key(episode)
+    root = Path(manifest["work_dir"]) / "episodes" / str(index)
     root.mkdir(parents=True, exist_ok=True)
     record_path = root / "record.json"
     signature = episode_signature(episode, manifest)
     record = load_json(record_path) if record_path.is_file() else {}
     if record and record.get("fingerprint") != signature:
         raise RuntimeError(f"Stale episode cache {record_path}; use a new --name or --work-dir")
-    if record.get("status") == "accepted" or (record.get("status") == "quarantined" and not retry_quarantined):
-        return {"status": record["status"], "resumed": True, "trajectory_id": episode["trajectory_id"]}
+    status = completed_status(record, mode, retry_quarantined)
+    if status is not None:
+        return {"status": status, "resumed": True, "trajectory_id": episode["trajectory_id"]}
     if record.get("status") == "quarantined" and retry_quarantined:
         record["retry_epoch"] = record.get("retry_epoch", 0) + 1
         sid = record.get("failure", {}).get("segment_id")
@@ -126,8 +132,6 @@ def process_episode(renderer, client, episode, index, manifest, settings, mode, 
             record["locals"] = {}
         record["local_repairs"] = {}
         record["upstream_repairs"] = {}
-    if mode == "render" and record.get("status") == "prepared" and all(_media_available(e) for e in record["evidence"].values()):
-        return {"status": "prepared", "resumed": True, "trajectory_id": episode["trajectory_id"]}
     started = time.monotonic()
     record.update({"schema_version": SCHEMA_VERSION, "fingerprint": signature,
                    "generation_fingerprint": manifest["behavior_fingerprint"],
@@ -208,13 +212,12 @@ def process_episode(renderer, client, episode, index, manifest, settings, mode, 
                         break
                 failures = [r for r in checks if not r["passed"]]
                 if not failures:
-                    final_path = shortest_path(renderer.sim.pathfinder, states[0]["position"], states[-1]["position"])
-                    if final_path is None:
-                        raise EvidenceError("no_geodesic_path_to_real_stop")
+                    distance, training_erp = renderer.export_training(
+                        episode, index, states, manifest["erp_root"], settings["erp"])
                     record["r2r_episode"] = make_r2r_episode(
-                        episode, index, states, final["instruction_text"], final_path["distance"],
+                        episode, index, states, final["instruction_text"], distance,
                         resolve_scene_path(manifest["scene_root"], episode["scene_id"]), manifest["scene_root"])
-                    record["training_erp"] = export_clean_erp(renderer, episode, states, manifest["erp_root"], settings["erp"])
+                    record["training_erp"] = training_erp
                     record["status"] = "accepted"
                     record["acceptance"] = {"all_decisions_verified": True, "real_stop_verified": True,
                                              "motion_verified": True, "final_instruction_hash": digest(final["instruction_text"])}
@@ -303,43 +306,92 @@ def check_completed_output(output, name, items, manifest):
         source = selected.get(episode["trajectory_id"])
         if source is None:
             raise ValueError("Output belongs to another selection; use a new output name")
-        validate_erp(manifest["erp_root"], episode["trajectory_id"], len(source["action_ids"]), manifest["settings"]["erp"])
+        validate_erp(manifest["erp_root"], episode["episode_id"], len(source["action_ids"]), manifest["settings"]["erp"])
     return {"status": "already_exported", "accepted": len(existing["episodes"]),
             "dataset_path": str(output / f"{name}.json.gz"),
             "note": "Use a new output name for another selection or configuration."}
 
 
-def run_worker(items, gpu, manifest, settings, mode, retry_quarantined, keep_work, report_progress):
+def run_worker(work_queue, gpu, manifest, settings, mode, retry_quarantined, keep_work, report_progress,
+               episodes_per_process=1):
     renderer = EpisodeRenderer(manifest["scene_root"], manifest["trajectory_metadata"], settings["render"], gpu, settings["erp"])
-    client = None
     results = []
-    try:
-        for index, episode in items:
-            root = Path(manifest["work_dir"]) / "episodes" / episode_key(episode)
-            if mode == "generate":
-                if client is None:
-                    client = QwenClient(settings["model"], root / "requests")
-                else:
-                    client.cache_dir = root / "requests"
-                    client.cache_dir.mkdir(parents=True, exist_ok=True)
-            result = process_episode(renderer, client, episode, index, manifest, settings, mode, retry_quarantined)
-            results.append(result)
+    totals, usage = Counter(), Counter()
+
+    def process(item, proxy):
+        index, episode = item
+        root = Path(manifest["work_dir"]) / "episodes" / str(index)
+        client = QwenClient(settings["model"], root / "requests") if mode == "generate" else None
+        try:
+            result = process_episode(proxy, client, episode, index, manifest, settings, mode, retry_quarantined)
             if not keep_work and result["status"] in {"accepted", "quarantined"}:
                 clear_episode_materials(root)
-            report_progress(result)
+            return result, client.calls if client else 0, client.cache_hits if client else 0, client.usage if client else {}
+        finally:
+            if client is not None:
+                client.session.close()
+
+    def report(completed):
+        result, calls, hits, tokens = completed
+        results.append(result)
+        totals.update(api_calls=calls, cache_hits=hits)
+        usage.update(tokens)
+        report_progress(result)
+
+    try:
+        for batch in iter(work_queue.get, None):
+            run_scene_tasks(batch, renderer, episodes_per_process if mode == "generate" else 1, process, report)
     finally:
         renderer.close()
-    return {"pid": os.getpid(), "gpu_device_id": gpu, "results": results, "api_calls": client.calls if client else 0,
-            "cache_hits": client.cache_hits if client else 0, "usage": client.usage if client else {}}
+    return {"pid": os.getpid(), "gpu_device_id": gpu, "results": results,
+            "episodes_per_process": episodes_per_process if mode == "generate" else 1,
+            "api_calls": totals["api_calls"], "cache_hits": totals["cache_hits"], "usage": dict(usage)}
 
 
-def run_workers(shards, worker_gpus, manifest, settings, mode, retry_quarantined, keep_work):
+def run_workers(items, worker_gpus, manifest, settings, mode, retry_quarantined, keep_work, episodes_per_process=1):
     counts = Counter()
+    groups = defaultdict(list)
+    # Completed records contribute to the global progress immediately. Schedule
+    # only unfinished work, so a resumed run balances the work that remains.
+    with tqdm(items, desc="Checking checkpoints", unit="traj", dynamic_ncols=True,
+              mininterval=1., leave=False) as scan:
+        for index, episode in scan:
+            root = Path(manifest["work_dir"]) / "episodes" / str(index)
+            path = root / "record.json"
+            status = None
+            if path.is_file():
+                record = load_json(path)
+                if record.get("fingerprint") != episode_signature(episode, manifest):
+                    raise RuntimeError(f"Stale episode cache {path}; use a new --name or --work-dir")
+                status = completed_status(record, mode, retry_quarantined)
+            if status is None:
+                groups[episode["scene_id"]].append((index, episode))
+            else:
+                counts[status] += 1
+                counts["resumed"] += 1
+                if not keep_work and status in {"accepted", "quarantined"}:
+                    clear_episode_materials(root)
+
+    # Several waves of concurrent episodes amortize scene setup, while bounded
+    # batches let idle workers help with large scenes and the end of a run.
+    batch_size = 4 * (episodes_per_process if mode == "generate" else 1)
+    batches = [group[start:start + batch_size]
+               for group in sorted(groups.values(), key=len, reverse=True)
+               for start in range(0, len(group), batch_size)]
+    worker_gpus = worker_gpus[:len(batches)]
+
+    def fill_queue(queue):
+        for batch in batches:
+            queue.put(batch)
+        for _ in worker_gpus:
+            queue.put(None)
+
     fields = ["accepted", "quarantined", "error", "resumed"]
     if mode == "render":
         fields.insert(0, "prepared")
-    with tqdm(total=sum(map(len, shards)), desc="Instructions" if mode == "generate" else "Rendering",
-              unit="traj", dynamic_ncols=True, mininterval=1., postfix={key: 0 for key in fields}) as progress:
+    with tqdm(total=len(items), initial=counts["resumed"],
+              desc="Instructions" if mode == "generate" else "Rendering",
+              unit="traj", dynamic_ncols=True, mininterval=1., postfix={key: counts[key] for key in fields}) as progress:
         def report(result):
             counts[result["status"]] += 1
             counts["resumed"] += bool(result.get("resumed"))
@@ -348,17 +400,23 @@ def run_workers(shards, worker_gpus, manifest, settings, mode, retry_quarantined
             if result["status"] == "error":
                 progress.write(f"{result['trajectory_id']}: {str(result.get('failure', {}))[:800]}")
 
-        if len(shards) == 1:
-            return [run_worker(shards[0], worker_gpus[0], manifest, settings, mode,
-                               retry_quarantined, keep_work, report)]
+        if not batches:
+            return [], counts
+        if len(worker_gpus) == 1:
+            work_queue = Queue()
+            fill_queue(work_queue)
+            return [run_worker(work_queue, worker_gpus[0], manifest, settings, mode,
+                               retry_quarantined, keep_work, report, episodes_per_process)], counts
         context = multiprocessing.get_context("spawn")
         results = []
         with context.Manager() as manager:
             updates = manager.Queue()
-            with ProcessPoolExecutor(max_workers=len(shards), mp_context=context) as pool:
-                pending = {pool.submit(run_worker, shard, gpu, manifest, settings, mode,
-                                       retry_quarantined, keep_work, updates.put)
-                           for gpu, shard in zip(worker_gpus, shards) if shard}
+            work_queue = manager.Queue()
+            fill_queue(work_queue)
+            with ProcessPoolExecutor(max_workers=len(worker_gpus), mp_context=context) as pool:
+                pending = {pool.submit(run_worker, work_queue, gpu, manifest, settings, mode,
+                                       retry_quarantined, keep_work, updates.put, episodes_per_process)
+                           for gpu in worker_gpus}
                 while pending:
                     try:
                         report(updates.get(timeout=.2))
@@ -374,7 +432,7 @@ def run_workers(shards, worker_gpus, manifest, settings, mode, retry_quarantined
                         report(updates.get_nowait())
                     except Empty:
                         break
-        return results
+        return results, counts
 
 
 def select_episodes(dataset, args):
@@ -412,7 +470,7 @@ def aggregate(items, manifest, output, name, allow_incomplete=False):
     first_pass = 0
     erp_frames = 0
     for index, episode in items:
-        path = Path(manifest["work_dir"]) / "episodes" / episode_key(episode) / "record.json"
+        path = Path(manifest["work_dir"]) / "episodes" / str(index) / "record.json"
         if not path.is_file():
             missing.append(episode["trajectory_id"])
             continue
@@ -423,7 +481,7 @@ def aggregate(items, manifest, output, name, allow_incomplete=False):
         if record["status"] == "accepted":
             validate_acceptance(record)
             count = len(record["source_trajectory"]["action_ids"])
-            validate_erp(manifest["erp_root"], episode["trajectory_id"], count, manifest["settings"]["erp"])
+            validate_erp(manifest["erp_root"], index, count, manifest["settings"]["erp"])
             accepted.append(record["r2r_episode"])
             erp_frames += count
             first_pass += not any(record.get("local_repairs", {}).values()) and not any(record.get("upstream_repairs", {}).values())
@@ -443,6 +501,7 @@ def aggregate(items, manifest, output, name, allow_incomplete=False):
     if run_path.is_file():
         workers = load_json(run_path)
         summary["last_run"] = {"processes": len(workers),
+                               "api_concurrency_limit": sum(w.get("episodes_per_process", 1) for w in workers),
                                "api_calls": sum(w["api_calls"] for w in workers),
                                "cache_hits": sum(w["cache_hits"] for w in workers),
                                "usage": dict(sum((Counter(w["usage"]) for w in workers), Counter()))}
@@ -472,7 +531,9 @@ def parser():
     common.add_argument("--scene-ids", nargs="+", default=[])
     common.add_argument("--trajectory-ids", nargs="+", default=[])
     common.add_argument("--gpu-device-ids", nargs="+", type=int, default=[0])
-    common.add_argument("--processes", type=int, default=1, help="Worker processes, assigned round-robin to the listed GPUs")
+    common.add_argument("--processes", type=int, default=1, help="Habitat processes, assigned round-robin to the listed GPUs")
+    common.add_argument("--episodes-per-process", type=int, default=1,
+                        help="Concurrent episode/API workflows sharing each process's single Habitat simulator")
     common.add_argument("--base-url")
     common.add_argument("--model")
     common.add_argument("--media-mode", choices=["video", "frames"])
@@ -494,8 +555,8 @@ def main(argv=None):
         validate_r2r(dataset, args.scene_root)
         print(json.dumps({"valid": True, "episodes": len(dataset["episodes"]), "dataset": str(args.dataset)}))
         return 0
-    if args.limit < 0 or args.processes < 1 or len(set(args.gpu_device_ids)) != len(args.gpu_device_ids):
-        raise ValueError("limit must be nonnegative; processes positive; GPU IDs unique")
+    if args.limit < 0 or args.processes < 1 or args.episodes_per_process < 1 or len(set(args.gpu_device_ids)) != len(args.gpu_device_ids):
+        raise ValueError("limit must be nonnegative; processes and episodes-per-process positive; GPU IDs unique")
     if Path(args.name).name != args.name or args.name in {".", ".."}:
         raise ValueError("name must be a single filename component")
     dataset = load_json_gz(args.trajectories) if args.trajectories.suffix == ".gz" else load_json(args.trajectories)
@@ -518,6 +579,8 @@ def main(argv=None):
                           "scenes": len({e["scene_id"] for _, e in items}),
                           "decision_counts": dict(Counter(len(e["decision_events"]) for _, e in items)),
                           "processes": args.processes, "gpu_device_ids": args.gpu_device_ids,
+                          "episodes_per_process": args.episodes_per_process,
+                          "api_concurrency_limit": args.processes * args.episodes_per_process,
                           "metadata": dataset["metadata"], "settings": settings}, indent=2))
         return 0
     output = args.output_root.resolve()
@@ -563,18 +626,11 @@ def main(argv=None):
         else:
             if args.mode == "generate":
                 QwenClient(settings["model"], work / "requests").healthcheck()
-            groups = defaultdict(list)
-            for item in items:
-                groups[item[1]["scene_id"]].append(item)
             worker_gpus = [args.gpu_device_ids[i % len(args.gpu_device_ids)] for i in range(args.processes)]
-            shards = [[] for _ in worker_gpus]
-            for group in sorted(groups.values(), key=len, reverse=True):
-                min(shards, key=len).extend(group)
-            worker_results = run_workers(shards, worker_gpus, manifest, settings, args.mode,
-                                         args.retry_quarantined, args.keep_work)
+            worker_results, counts = run_workers(items, worker_gpus, manifest, settings, args.mode,
+                                                args.retry_quarantined, args.keep_work, args.episodes_per_process)
             atomic_json_dump(worker_results, work / "last_run.json")
             if args.mode == "render":
-                counts = Counter(r["status"] for w in worker_results for r in w["results"])
                 print(json.dumps({"mode": "render", "statuses": dict(counts), "work_dir": str(work)}))
                 return 1 if counts["error"] else 0
             summary = aggregate(items, manifest, output, args.name, args.allow_incomplete)

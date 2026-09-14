@@ -248,6 +248,15 @@ class EpisodeRenderer:
         self.sim.get_agent(1).set_state(pose, reset_sensors=True)
         return self.sim.get_sensor_observations(agent_ids=1)["training_erp"][..., :3].copy()
 
+    def export_training(self, episode, episode_id, states, root, settings):
+        """Finish geometry and ERP work together on the simulator's thread."""
+        from dataset_create.instruction.training import export_clean_erp
+
+        path = shortest_path(self.sim.pathfinder, states[0]["position"], states[-1]["position"])
+        if path is None:
+            raise EvidenceError("no_geodesic_path_to_real_stop")
+        return path["distance"], export_clean_erp(self, episode, episode_id, states, root, settings)
+
     def decision_compass(self, episode, states, segment, decision_id, route, directory, revision=0):
         event = episode["decision_events"][int(decision_id[1:])]
         arc = cumulative_distance(states)

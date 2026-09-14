@@ -11,8 +11,9 @@ NAME="train"
 ERP_ROOT="${OUTPUT_ROOT}/image"
 WORK_DIR="${OUTPUT_ROOT}/.work/instruction"
 
-NUM_PROCESSES=48
-GPU_DEVICE_IDS=(0 1 2 3 4 5 6 7)         # Six Habitat processes per GPU; Qwen is a separate service.
+NUM_PROCESSES=16                        # One Habitat simulator per process.
+EPISODES_PER_PROCESS=9                  # Concurrent API workflows; total limit = 16 * 9 = 144.
+GPU_DEVICE_IDS=(0 1 2 3 4 5 6 7)         # Two Habitat simulators per GPU; Qwen is a separate service.
 CPU_THREADS_PER_PROCESS=1               # Keep numerical libraries from oversubscribing CPU cores.
 LIMIT=0                                 # 0 processes all input trajectories; a positive value caps the count.
 SELECTION="first"                       # first | diverse; selection strategy matters only when LIMIT > 0.
@@ -21,7 +22,7 @@ ERP_HEIGHT=800
 JPEG_QUALITY=95
 KEEP_WORK=false                         # Debug only. Final output is ERP + R2R JSON/gzip.
 
-BASE_URL="http://127.0.0.1:10420/v1"
+BASE_URL="http://127.0.0.1:10430/v1"
 MODEL_NAME="Qwen3.8-27B"
 API_KEY="test"
 MEDIA_MODE="video"
@@ -57,6 +58,7 @@ CMD=(
     --work-dir "${WORK_DIR}" --config "${CONFIG_PATH}"
     --limit "${LIMIT}" --selection "${SELECTION}"
     --processes "${NUM_PROCESSES}" --gpu-device-ids "${GPU_DEVICE_IDS[@]}"
+    --episodes-per-process "${EPISODES_PER_PROCESS}"
     --erp-width "${ERP_WIDTH}" --erp-height "${ERP_HEIGHT}" --jpeg-quality "${JPEG_QUALITY}"
     --base-url "${BASE_URL}" --model "${MODEL_NAME}" --media-mode "${MEDIA_MODE}"
 )
