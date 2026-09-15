@@ -55,13 +55,13 @@ CONFIG = {
     "panovln": {
         "config_path": "./config/vln_panovln.yaml",
         "image_dir": "panovln",
-        "image_size": (1600, 800),
+        "image_size": (1280, 640),
         "annotation_name": "panovln.jsonl",
         "episode_path": (
             "/workspace/data2/dataset/general_VLN_data/PanoVLN/train.json.gz"
         ),
-        "precomputed_gt_path": (
-            "/workspace/data2/dataset/general_VLN_data/PanoVLN/train_gt.json.gz"
+        "trajectory_path": (
+            "/workspace/data2/dataset/general_VLN_data/PanoVLN/trajectory/trajectories.json.gz"
         ),
         "scene_root": "/workspace/data2/dataset/general_VLN_data/HM3D",
     },

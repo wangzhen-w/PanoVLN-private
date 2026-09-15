@@ -1,17 +1,13 @@
-"""Build training annotations from an existing VLN-CE episode/GT pair."""
+"""Join final instructions with the original trajectory actions, without replay."""
 
 import gzip
 import json
 import os
 import tempfile
 from contextlib import contextmanager
-from itertools import zip_longest
-from typing import Dict, Iterator, Optional, Sequence, Tuple
+from typing import Dict, Iterator, Optional, Sequence
 
 from tqdm import tqdm
-
-
-_MISSING = object()
 
 
 @contextmanager
@@ -132,36 +128,6 @@ def iter_array_field(path: str, field_name: str) -> Iterator[Dict]:
         raise ValueError(f"Missing top-level {field_name!r} array in {path}")
 
 
-def iter_object_items(path: str) -> Iterator[Tuple[str, Dict]]:
-    """Yield key/value pairs from a top-level JSON object."""
-
-    with open_json_text(path) as handle:
-        reader = StreamingJSONReader(handle)
-        reader.expect("{")
-        if reader.peek() == "}":
-            reader.expect("}")
-            return
-
-        while True:
-            key = reader.read_value()
-            if not isinstance(key, str):
-                raise ValueError(f"Expected object key in {path}, got {key!r}")
-            reader.expect(":")
-            value = reader.read_value()
-            if not isinstance(value, dict):
-                raise ValueError(f"GT entry {key!r} must be an object in {path}")
-            yield key, value
-
-            separator = reader.peek()
-            if separator == ",":
-                reader.expect(",")
-                continue
-            if separator == "}":
-                reader.expect("}")
-                return
-            raise ValueError(f"Expected ',' or '}}' in top-level object in {path}")
-
-
 def extract_instruction_text(episode: Dict) -> str:
     instruction = episode.get("instruction")
     if isinstance(instruction, dict):
@@ -195,33 +161,30 @@ def validate_actions(episode_id: int, raw_actions) -> list:
     return actions
 
 
-def build_annotation(episode: Dict, gt_key: str, gt_item: Dict) -> Dict:
+def build_annotation(episode: Dict, trajectory: Dict) -> Dict:
     episode_id = int(episode["episode_id"])
-    if int(gt_key) != episode_id:
-        raise ValueError(
-            f"Episode/GT order mismatch: episode_id={episode_id}, gt_key={gt_key}"
-        )
-
     trajectory_id = episode.get("trajectory_id")
     if trajectory_id is None or isinstance(trajectory_id, bool):
         raise ValueError(f"Episode {episode_id} has no usable trajectory_id")
+    if trajectory_id != trajectory.get("trajectory_id"):
+        raise ValueError(f"Episode {episode_id} does not match its source trajectory")
 
+    # Images use the numeric episode_id; the source trajectory hash is not an image ID.
     return {
         "episode_id": episode_id,
-        "trajectory_id": trajectory_id,
         "instruction": extract_instruction_text(episode),
-        "actions": validate_actions(episode_id, gt_item.get("actions")),
+        "actions": validate_actions(episode_id, trajectory.get("action_ids")),
     }
 
 
 def write_precomputed_annotations(
     episode_path: str,
-    gt_path: str,
+    trajectory_path: str,
     output_path: str,
     episode_ids: Optional[Sequence[int]] = None,
     max_episodes: Optional[int] = None,
 ) -> Dict[str, int]:
-    """Merge episode instructions with GT actions without starting Habitat."""
+    """Match accepted episode IDs to indices in the complete trajectory file."""
 
     if max_episodes is not None and max_episodes < 0:
         raise ValueError("max_episodes must be non-negative")
@@ -247,24 +210,29 @@ def write_precomputed_annotations(
 
     try:
         episode_iter = iter_array_field(episode_path, "episodes")
-        gt_iter = iter_object_items(gt_path)
+        trajectory_iter = enumerate(iter_array_field(trajectory_path, "episodes"))
+        trajectory_index = -1
+        previous_episode_id = -1
         with os.fdopen(descriptor, "w", encoding="utf-8") as output_handle:
-            paired = zip_longest(episode_iter, gt_iter, fillvalue=_MISSING)
-            for episode, gt_entry in tqdm(
-                paired,
-                desc="import precomputed GT",
+            for episode in tqdm(
+                episode_iter,
+                desc="import trajectory actions",
                 unit="episode",
                 dynamic_ncols=True,
             ):
-                if episode is _MISSING or gt_entry is _MISSING:
-                    raise ValueError(
-                        "Episode and GT files contain different numbers of entries"
-                    )
+                episode_id = int(episode["episode_id"])
+                if episode_id <= previous_episode_id:
+                    raise ValueError("Episode IDs must be non-negative and strictly increasing")
+                previous_episode_id = episode_id
+                while trajectory_index < episode_id:
+                    try:
+                        trajectory_index, trajectory = next(trajectory_iter)
+                    except StopIteration as error:
+                        raise ValueError(f"Missing source trajectory for episode {episode_id}") from error
 
-                gt_key, gt_item = gt_entry
-                annotation = build_annotation(episode, gt_key, gt_item)
+                annotation = build_annotation(episode, trajectory)
                 episode_id = annotation["episode_id"]
-                trajectory_key = str(annotation["trajectory_id"])
+                trajectory_key = str(episode["trajectory_id"])
                 if episode_id in seen_episode_ids:
                     raise ValueError(f"Duplicate episode_id: {episode_id}")
                 if trajectory_key in seen_trajectory_ids:

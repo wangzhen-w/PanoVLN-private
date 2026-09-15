@@ -457,8 +457,8 @@ def process_dataset(
     progress_dir = progress_dir_path(output_path, temp_root=temp_root)
     dataset_config = CONFIG[dataset_name]
 
-    precomputed_gt_path = dataset_config.get("precomputed_gt_path")
-    if precomputed_gt_path is not None:
+    trajectory_path = dataset_config.get("trajectory_path")
+    if trajectory_path is not None:
         episode_path = dataset_config["episode_path"]
         if (
             skip_existing_episodes
@@ -480,7 +480,7 @@ def process_dataset(
         )
         stats = write_precomputed_annotations(
             episode_path=episode_path,
-            gt_path=precomputed_gt_path,
+            trajectory_path=trajectory_path,
             output_path=output_path,
             episode_ids=episode_ids,
             max_episodes=max_episodes,

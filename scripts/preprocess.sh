@@ -11,10 +11,10 @@ export MAGNUM_LOG="quiet"
 export GLOG_minloglevel="3"
 export HABITAT_LAB_LOG="50"
 export PYTHONWARNINGS="ignore"
-PYTHON_BIN="python"
-OUTPUT_ROOT="/workspace/data2/dataset/PanoVLN"
+PYTHON_BIN="/opt/conda/envs/vln/bin/python"
+OUTPUT_ROOT="/workspace/code/a_property/dataset/PanoVLN"
 DATASET_NAMES=(panovln)
-# panovln directly imports train_gt.json.gz, so it does not need Habitat/GPU replay.
+# panovln joins final instructions with the original trajectory actions; no GPU replay.
 GOAL_RADIUS="0.3"  # Only used by datasets that still require Habitat replay.
 GPU_IDS=""         # Set e.g. "0,1,2,3" when replaying another dataset.
 PROCESSES_PER_GPU="1"

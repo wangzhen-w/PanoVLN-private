@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate H18 training JSONL from stride-6 R2R/RxR and DAgger decisions."""
+"""Generate H18 training JSONL from static VLN trajectories and DAgger decisions."""
 
 from __future__ import annotations
 
@@ -19,9 +19,14 @@ from tqdm import tqdm
 
 
 ACTION_HORIZON = 18
-BODY_STRIDE = 6
 EXECUTION_HORIZON = 6
 DEFAULT_SEED = 42
+SAMPLING_RULES = {
+    "r2r": {"stride": 6, "motion_anchors": True, "random_offset": False},
+    "rxr": {"stride": 6, "motion_anchors": True, "random_offset": False},
+    "panovln": {"stride": 12, "motion_anchors": False, "random_offset": True},
+}
+STOP_SAMPLING_RULES = ((1, 12, 0.8), (13, ACTION_HORIZON, 0.4))
 STOP, FORWARD, LEFT, RIGHT = 0, 1, 2, 3
 TURN_ACTIONS = frozenset({LEFT, RIGHT})
 ACTION_NAMES = {
@@ -31,7 +36,7 @@ ACTION_NAMES = {
     RIGHT: "right",
 }
 STATIC_DATASETS = ("r2r", "rxr")
-DATASET_ORDER = STATIC_DATASETS + ("dagger",)
+DATASET_ORDER = STATIC_DATASETS + ("panovln", "dagger")
 FRAME_PATTERN = re.compile(r"frame_(\d+)\.(?:png|jpe?g)", re.IGNORECASE)
 
 EXPECTED_SOURCES = {
@@ -43,11 +48,6 @@ EXPECTED_SOURCES = {
         "episodes": 18_063,
         "starts": 1_898_944,
     },
-}
-EXPECTED_ROWS = {
-    ("r2r",): 240_806,
-    ("rxr",): 570_528,
-    ("r2r", "rxr"): 811_334,
 }
 
 
@@ -87,6 +87,13 @@ def stable_choice(options: Sequence[int], *parts: object) -> int:
     payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
     value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
     return ordered[value % len(ordered)]
+
+
+def stable_keep(probability: float, *parts: object) -> bool:
+    """Make a reproducible Bernoulli draw independent of processing order."""
+    payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
+    value = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    return value < int(probability * (1 << 64))
 
 
 def maximal_blocks(
@@ -364,59 +371,59 @@ def select_starts(
     actions: Sequence[int],
     seed: int,
 ) -> tuple[dict[int, set[str]], Counter]:
-    """Apply the H18 strategy with body stride 6."""
+    """Sample non-STOP windows by route rules and STOP windows by probability."""
 
     validate_actions(actions, f"{dataset}:{episode_id}")
     selected: dict[int, set[str]] = {}
     audit = Counter()
+    nonterminal_limit = len(actions) - ACTION_HORIZON
 
-    for start in range(0, len(actions), BODY_STRIDE):
-        add_reason(selected, actions, start, "stride6")
-        audit["stride6"] += 1
-
-    for block in maximal_blocks(actions, TURN_ACTIONS):
-        audit["turn_blocks"] += 1
-        if block.length >= 2:
-            add_reason(selected, actions, block.start, "multi_turn_onset")
-            audit["multi_turn_onset"] += 1
-
-    for block in maximal_blocks(actions, frozenset({FORWARD})):
-        options = centered_forward_options(block)
-        if not options:
-            continue
-        center = stable_choice(
-            options,
-            seed,
-            dataset,
-            episode_id,
-            block.start,
-            block.end - 1,
-            "forward_center_ge18",
+    rule = SAMPLING_RULES[dataset]
+    offset = 0
+    if rule["random_offset"]:
+        # Stable per episode, independent of processing order or worker count.
+        offset = stable_choice(
+            range(rule["stride"]), seed, dataset, episode_id, "stride_offset"
         )
-        add_reason(selected, actions, center, "forward_center")
-        audit["forward_center"] += 1
+        add_reason(selected, actions, 0, "episode_start")
+        audit["episode_start"] += 1
 
-    for position in range(1, EXECUTION_HORIZON + 1):
-        start = len(actions) - position
-        add_reason(selected, actions, start, "terminal_executed_dense")
-        audit["terminal_executed_dense"] += 1
+    stride_reason = f"stride{rule['stride']}"
+    for start in range(offset, nonterminal_limit, rule["stride"]):
+        add_reason(selected, actions, start, stride_reason)
+        audit[stride_reason] += 1
 
-    for first_position in range(
-        EXECUTION_HORIZON + 1,
-        ACTION_HORIZON + 1,
-        2,
-    ):
-        position = stable_choice(
-            (first_position, first_position + 1),
-            seed,
-            dataset,
-            episode_id,
-            "stop_future_pair",
-            first_position,
-        )
-        start = len(actions) - position
-        add_reason(selected, actions, start, "terminal_future_pair")
-        audit["terminal_future_pair"] += 1
+    if rule["motion_anchors"]:
+        for block in maximal_blocks(actions, TURN_ACTIONS):
+            audit["turn_blocks"] += 1
+            if block.length >= 2 and block.start < nonterminal_limit:
+                add_reason(selected, actions, block.start, "multi_turn_onset")
+                audit["multi_turn_onset"] += 1
+
+        for block in maximal_blocks(actions, frozenset({FORWARD})):
+            options = centered_forward_options(block)
+            if not options:
+                continue
+            center = stable_choice(
+                options,
+                seed,
+                dataset,
+                episode_id,
+                block.start,
+                block.end - 1,
+                "forward_center_ge18",
+            )
+            add_reason(selected, actions, center, "forward_center")
+            audit["forward_center"] += 1
+
+    # STOP position is one-based within the H18 target. These draws exclusively
+    # determine terminal windows, so route anchors cannot bypass a rejection.
+    for first_position, last_position, probability in STOP_SAMPLING_RULES:
+        reason = f"terminal_stop_{first_position}_{last_position}"
+        for position in range(first_position, last_position + 1):
+            if stable_keep(probability, seed, dataset, episode_id, "stop_keep", position):
+                add_reason(selected, actions, len(actions) - position, reason)
+                audit[reason] += 1
 
     return dict(sorted(selected.items())), audit
 
@@ -512,6 +519,8 @@ def load_image_paths(input_root: Path, episode: Episode) -> list[str]:
         raise ValueError(f"Missing image directory: {directory}")
     indexed: dict[int, str] = {}
     for name in os.listdir(directory):
+        if name.startswith("."):
+            continue
         match = FRAME_PATTERN.fullmatch(name)
         if match is None:
             raise ValueError(f"Unexpected frame filename in {directory}: {name}")
@@ -623,20 +632,6 @@ def build_training_jsonl(
             os.fsync(output.fileno())
         os.chmod(temporary, 0o644)
 
-        static_names = tuple(
-            dataset for dataset in normalized_names if dataset in STATIC_DATASETS
-        )
-        if static_names:
-            expected_static_rows = EXPECTED_ROWS[static_names]
-            actual_static_rows = sum(
-                dataset_counts[dataset] for dataset in static_names
-            )
-            if actual_static_rows != expected_static_rows:
-                raise AssertionError(
-                    f"Static row mismatch: {actual_static_rows} != "
-                    f"{expected_static_rows}"
-                )
-
         os.replace(temporary, output_path)
         result = {
             "output_path": str(output_path),
@@ -654,8 +649,10 @@ def build_training_jsonl(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate H18 training JSONL: stride-6 sampling for R2R/RxR "
-            "and complete oracle-decision preservation for DAgger."
+            "Generate H18 training JSONL: stride 6 with motion anchors for R2R/RxR, "
+            "stride 12 with a stable random offset and retained episode start for "
+            "PanoVLN, STOP retention of 80% at positions 1-12 and 40% at 13-18, "
+            "and all DAgger oracle decisions."
         )
     )
     parser.add_argument(
@@ -668,14 +665,14 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=DATASET_ORDER,
         default=list(STATIC_DATASETS),
-        help="Dataset subsets to include (default: r2r rxr; dagger is optional).",
+        help="Dataset subsets to include (default: r2r rxr; panovln and dagger are optional).",
     )
     parser.add_argument(
         "--output_path",
         type=Path,
         default=Path(
             "/workspace/data2/dataset/ablation/18-action/"
-            "train_r2r_rxr_h18_stop_1-6_stride1_7-18_stride2_seed42.jsonl"
+            "train_r2r_rxr_h18.jsonl"
         ),
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
