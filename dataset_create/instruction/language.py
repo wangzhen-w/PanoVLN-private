@@ -123,6 +123,7 @@ def generate_local(client, segment, evidence, previous="", feedback=None, attemp
             validate_local(local, segment)
             return {**local, "request_keys": keys, "attempt": attempt}
         except (ValueError, TypeError, KeyError, AttributeError) as error:
+            client.discard_response(key)
             if schema_attempt == 2:
                 raise LanguageContractError(f"Invalid author response after schema repairs: {error}") from error
             content += [text_item("Your previous JSON failed this contract check: " + str(error) +

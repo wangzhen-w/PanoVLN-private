@@ -20,6 +20,10 @@ class ModelError(RuntimeError):
     pass
 
 
+class ModelOutputError(ModelError):
+    """The model failed to return a complete, usable JSON object."""
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                     separators=(",", ":")).encode()).hexdigest()
@@ -66,6 +70,12 @@ class QwenClient:
         if self.settings["name"] not in names:
             raise ModelError(f"Model {self.settings['name']} unavailable; served: {names}")
         return response.json()
+
+    def discard_response(self, key):
+        """Preserve a rejected reply for inspection without reusing it."""
+        cache = self.cache_dir / f"{key}.json"
+        if cache.is_file():
+            cache.replace(self.cache_dir / f"{key}.invalid.json")
 
     def complete(self, stage, system, content, *, temperature=None, attempt=0):
         audit_content = []
@@ -123,13 +133,16 @@ class QwenClient:
                 if choice.get("finish_reason") != "stop":
                     atomic_json_dump({"request": audit, "response": raw, "retry": retry},
                                      self.cache_dir / f"{key}.incomplete.json")
-                    raise ValueError(f"Incomplete model response: {choice.get('finish_reason')}")
+                    raise ModelOutputError(f"Incomplete model response: {choice.get('finish_reason')}")
                 value = choice["message"].get("content") or ""
-                if value.strip().startswith("```"):
-                    value = value.strip().split("\n", 1)[1].rsplit("```", 1)[0]
-                parsed = json.loads(value)
+                try:
+                    if value.strip().startswith("```"):
+                        value = value.strip().split("\n", 1)[1].rsplit("```", 1)[0]
+                    parsed = json.loads(value)
+                except (json.JSONDecodeError, IndexError) as exc:
+                    raise ModelOutputError(f"Invalid model JSON: {exc}") from exc
                 if not isinstance(parsed, dict):
-                    raise ValueError("Model JSON must be an object")
+                    raise ModelOutputError("Model JSON must be an object")
                 usage = raw.get("usage") or {}
                 self.calls += 1
                 for name in self.usage:
@@ -137,10 +150,11 @@ class QwenClient:
                 atomic_json_dump({"request": audit, "response": raw, "parsed": parsed,
                                   "elapsed_seconds": time.monotonic()-started}, cache)
                 return parsed, key
-            except (requests.RequestException, ValueError, KeyError, IndexError) as exc:
+            except (requests.RequestException, ValueError, KeyError, IndexError, ModelOutputError) as exc:
                 error = exc
                 atomic_json_dump({"request": audit, "error": str(exc), "retry": retry},
                                  self.cache_dir / f"{key}.error.json")
                 if retry + 1 < self.settings["retries"]:
                     time.sleep(min(2**retry, 8))
-        raise ModelError(f"{stage} failed after retries: {error}")
+        failure = ModelOutputError if isinstance(error, ModelOutputError) else ModelError
+        raise failure(f"{stage} failed after retries: {error}")

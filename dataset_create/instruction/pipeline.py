@@ -21,7 +21,7 @@ import traceback
 from tqdm.auto import tqdm
 
 from dataset_create.instruction import SCHEMA_VERSION
-from dataset_create.instruction.client import QwenClient, digest
+from dataset_create.instruction.client import ModelOutputError, QwenClient, digest
 from dataset_create.instruction.export import make_r2r_episode, validate_r2r, write_r2r
 from dataset_create.instruction.execution import run_scene_tasks
 from dataset_create.instruction.language import LanguageContractError, generate_local, polish_and_assemble
@@ -264,7 +264,7 @@ def process_episode(renderer, client, episode, index, manifest, settings, mode, 
             record["locals"].pop(sid, None)
             checkpoint()
         raise EvidenceError("repair_iteration_budget_exhausted")
-    except (EvidenceError, LanguageContractError) as error:
+    except (EvidenceError, LanguageContractError, ModelOutputError) as error:
         record["status"] = "quarantined"
         record["failure"] = {"kind": "upstream_evidence" if isinstance(error, EvidenceError) else "model_contract", "reason": str(error)}
     except Exception as error:
@@ -284,15 +284,19 @@ def clear_episode_materials(root):
 def clear_completed_work(work):
     """Keep the completion receipt until the last deletion, including on resume."""
     work = Path(work)
+    started = time.monotonic()
+    print(f"Dataset files are ready. Cleaning intermediate files in {work}; many small files can take several minutes.", flush=True)
     for path in work.iterdir():
         if path.name == "manifest.json":
             continue
+        print(f"Removing {path.name}...", flush=True)
         if path.is_dir():
             shutil.rmtree(path)
         else:
             path.unlink()
     (work / "manifest.json").unlink()
     work.rmdir()
+    print(f"Cleanup complete in {time.monotonic() - started:.1f}s.", flush=True)
 
 
 def check_completed_output(output, name, items, manifest):
@@ -469,7 +473,7 @@ def aggregate(items, manifest, output, name, allow_incomplete=False):
     accepted, counts, missing, reasons = [], Counter(), [], Counter()
     first_pass = 0
     erp_frames = 0
-    for index, episode in items:
+    for index, episode in tqdm(items, desc="Checking records/ERP", unit="traj", dynamic_ncols=True, mininterval=1.):
         path = Path(manifest["work_dir"]) / "episodes" / str(index) / "record.json"
         if not path.is_file():
             missing.append(episode["trajectory_id"])
@@ -508,7 +512,10 @@ def aggregate(items, manifest, output, name, allow_incomplete=False):
     atomic_json_dump(summary, Path(manifest["work_dir"]) / "summary.json")
     if incomplete and not allow_incomplete:
         raise RuntimeError(f"{incomplete} episodes incomplete; resume first, or explicitly export with --allow-incomplete")
+    started = time.monotonic()
+    print(f"Writing {name}.json and {name}.json.gz for {len(accepted):,} accepted episodes (including compression)...", flush=True)
     write_r2r(accepted, output / f"{name}.json.gz", manifest["scene_root"])
+    print(f"R2R files exported in {time.monotonic() - started:.1f}s.", flush=True)
     return summary
 
 

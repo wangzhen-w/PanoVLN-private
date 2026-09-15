@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from dataset_create.instruction.client import media_item, text_item, video_items
-from dataset_create.instruction.language import relevant_text
+from dataset_create.instruction.language import LanguageContractError, relevant_text
 from dataset_create.instruction.prompts import OBSERVE_SYSTEM, VERIFY_SYSTEM
 from dataset_create.instruction.segmentation import camera_motion
 
@@ -108,8 +108,9 @@ def _checked_response(client, stage, system, content, check):
             passed = check(response)
             return response, key, passed
         except (ValueError, TypeError, KeyError, AttributeError) as error:
+            client.discard_response(key)
             if attempt == 2:
-                raise ValueError(f"Invalid {stage} schema after retries: {error}") from error
+                raise LanguageContractError(f"Invalid {stage} schema after retries: {error}") from error
             content = content + [text_item("Return a valid JSON object. Contract error: " + str(error))]
     raise AssertionError("Unreachable")
 
