@@ -175,8 +175,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--panovggt-checkpoint", default=None)
     parser.add_argument("--attn-implementation", default="flash_attention_2")
-    parser.add_argument("--max-memory-images", type=int, default=10)
-    parser.add_argument("--memory-pool-window-frames", type=int, default=100)
     parser.add_argument("--reload", action="store_true")
     return parser.parse_args()
 
@@ -187,8 +185,6 @@ def main() -> None:
         model_path=args.model_path,
         panovggt_checkpoint_path=args.panovggt_checkpoint,
         attn_implementation=args.attn_implementation,
-        max_memory_images=args.max_memory_images,
-        memory_pool_window_frames=args.memory_pool_window_frames,
     )
     _log_stage(f"server_settings={asdict(settings)}")
     start = time.perf_counter()

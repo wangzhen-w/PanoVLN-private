@@ -12,8 +12,6 @@ MODEL_PATH="/workspace/data1/model/ablation_new/panovggt_pre_merger/panovggt_0.3
 GPU_IDS="4"
 PANOVGGT_CHECKPOINT=""
 ATTN_IMPLEMENTATION="flash_attention_2"
-MAX_MEMORY_IMAGES="10"
-MEMORY_POOL_WINDOW_FRAMES="100"
 
 if [ ! -d "$MODEL_PATH" ]; then
     echo "Model path does not exist: $MODEL_PATH" >&2
@@ -31,8 +29,6 @@ echo "MODEL_PATH=$MODEL_PATH"
 echo "GPU_IDS=$GPU_IDS"
 echo "PANOVGGT_CHECKPOINT=$PANOVGGT_CHECKPOINT"
 echo "ATTN_IMPLEMENTATION=$ATTN_IMPLEMENTATION"
-echo "MAX_MEMORY_IMAGES=$MAX_MEMORY_IMAGES"
-echo "MEMORY_POOL_WINDOW_FRAMES=$MEMORY_POOL_WINDOW_FRAMES"
 
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/src:${PYTHONPATH:-}"
@@ -43,8 +39,6 @@ CMD=(
     --port "$PORT"
     --model-path "$MODEL_PATH"
     --attn-implementation "$ATTN_IMPLEMENTATION"
-    --max-memory-images "$MAX_MEMORY_IMAGES"
-    --memory-pool-window-frames "$MEMORY_POOL_WINDOW_FRAMES"
 )
 
 if [[ -n "$PANOVGGT_CHECKPOINT" ]]; then

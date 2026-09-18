@@ -36,11 +36,8 @@ from src.train.data.data import (
     DEFAULT_ERP_BOTTOM_CROP_DEGREES,
     DEFAULT_ERP_TOP_CROP_DEGREES,
     DEFAULT_VLN_ACTION_SEQUENCE_LENGTH,
-    DEFAULT_VLN_MAX_MEMORY_IMAGES,
-    DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES,
     DEFAULT_VLN_VIEW_MODE,
     build_vln_image_geometry_batch,
-    build_vln_image_selection,
     build_vln_system_prompt,
     build_vln_user_content,
     normalize_vln_view_mode,
@@ -90,8 +87,6 @@ class InferenceConfig:
     model_path: str = DEFAULT_MODEL_PATH
     panovggt_checkpoint_path: Optional[str] = None
     attn_implementation: Optional[str] = "flash_attention_2"
-    max_memory_images: int = DEFAULT_VLN_MAX_MEMORY_IMAGES
-    memory_pool_window_frames: int = DEFAULT_VLN_MEMORY_POOL_WINDOW_FRAMES
 
 
 @dataclass
@@ -120,25 +115,6 @@ def _load_image(image: Image.Image | bytes | bytearray | str | os.PathLike[str])
     if isinstance(image, (bytes, bytearray)):
         return Image.open(io.BytesIO(image)).convert("RGB")
     return Image.open(image).convert("RGB")
-
-
-def _select_images(
-    images: Sequence[Image.Image],
-    *,
-    max_memory_images: int,
-    memory_pool_window_frames: int,
-) -> list[Image.Image]:
-    if not images:
-        raise ValueError("At least one image is required")
-    if max_memory_images <= 0:
-        return [images[-1]]
-    selected_indices = build_vln_image_selection(
-        current_step=len(images) - 1,
-        last_frame_index=len(images) - 1,
-        max_memory_images=max_memory_images,
-        memory_pool_window_frames=memory_pool_window_frames,
-    )
-    return [images[index] for index in selected_indices]
 
 
 def parse_action_sequence(text: str, max_actions: int = ACTION_SEQUENCE_LENGTH) -> list[str]:
@@ -480,6 +456,8 @@ class PanoVLNPredictor:
         instruction = instruction.strip()
         if not instruction:
             raise ValueError("instruction must be non-empty")
+        if not images:
+            raise ValueError("At least one image is required")
         action_token_lookup = None
         if include_uncertainty:
             uncertainty_max_actions = validate_action_sequence_length(uncertainty_max_actions)
@@ -487,14 +465,10 @@ class PanoVLNPredictor:
         start = time.perf_counter()
         _log_stage(f"predict started raw_images={len(images)} instruction_chars={len(instruction)}")
 
+        # The client selects history and puts the current observation last.
+        # Preserve every supplied image and its order; keep no navigation memory.
         loaded_images = [_load_image(image) for image in images]
-        selected_images = _select_images(
-            loaded_images,
-            max_memory_images=self.config.max_memory_images,
-            memory_pool_window_frames=self.config.memory_pool_window_frames,
-        )
-        _log_stage(f"selected {len(selected_images)} image(s) from {len(loaded_images)} input image(s)")
-        processed_images, panovggt_pixel_values = self._prepare_images(selected_images)
+        processed_images, panovggt_pixel_values = self._prepare_images(loaded_images)
         _log_stage(
             "images preprocessed "
             f"prompt_images={len(processed_images)} "
