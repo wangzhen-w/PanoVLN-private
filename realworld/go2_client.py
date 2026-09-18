@@ -11,16 +11,29 @@ import threading
 import time
 import subprocess
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
-import requests
-
+from realworld.client_config import config_arguments
+from src.eval.action_policy import (
+    ATOMIC_ACTION_NAMES,
+    select_stop_commit_horizon,
+    select_uncertainty_horizon,
+    DEFAULT_REPLAN_ACTION_RANGE,
+    DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+    DEFAULT_UNCERTAINTY_BUDGET,
+    validate_replan_action_range,
+    validate_stop_commit_max_actions,
+    validate_uncertainty_budget,
+)
 
 DEFAULT_SERVER_BASE_URL = "http://10.14.114.132:8000"
 DEFAULT_PREDICT_PATH = "/predict"
 DEFAULT_READY_PATH = "/ready"
+DEFAULT_MAX_MEMORY_IMAGES = 10
+DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 100
+DEFAULT_HISTORY_LIMIT = DEFAULT_MEMORY_POOL_WINDOW_FRAMES + DEFAULT_MAX_MEMORY_IMAGES + 10
 ACTION_WORDS = {"stop", "forward", "left", "right"}
 SAVE_CONTENT_WORDS = {"images", "video", "json"}
 DEFAULT_REQUEST_TIMEOUT_S = 180.0
@@ -33,18 +46,16 @@ DEFAULT_VIDEO_FPS = 10.0
 DEFAULT_VIDEO_CODEC = "libx264"
 DEFAULT_VIDEO_WRITER = "ffmpeg"
 DEFAULT_SAVE_CONTENTS = "none"
-DEFAULT_MAX_MEMORY_IMAGES = 10
-DEFAULT_MEMORY_POOL_WINDOW_FRAMES = 100
-DEFAULT_HISTORY_LIMIT = DEFAULT_MEMORY_POOL_WINDOW_FRAMES + DEFAULT_MAX_MEMORY_IMAGES + 10
 DEFAULT_UPLOAD_IMAGE_MODE = "resize"
 DEFAULT_UPLOAD_IMAGE_SIZE = (1280, 640)
 # Zero means follow the action-sequence length advertised by the server.  This
 # keeps real-world execution aligned with length-ablation checkpoints.
 DEFAULT_ACTIONS_PER_REPLAN = 0
 DEFAULT_PREFETCH_AFTER_ACTIONS = 0
+DEFAULT_EXECUTION_MODE = "continuous"
 DEFAULT_COMMAND_PERIOD_S = 0.05
-DEFAULT_SETTLE_TIME_S = 0.25
-DEFAULT_POST_CAPTURE_SETTLE_TIME_S = 0.25
+DEFAULT_SETTLE_TIME_S = 0.1
+DEFAULT_POST_CAPTURE_SETTLE_TIME_S = 0.1
 MAX_FORWARD_DISTANCE_M = 0.50
 MAX_FORWARD_SPEED_MPS = 0.50
 MAX_TURN_DEGREES = 45.0
@@ -69,8 +80,8 @@ class MotionConfig:
     turn_degrees: float = 15.0
     yaw_speed_radps: float = 0.80
     command_period_s: float = 0.05
-    settle_time_s: float = 0.25
-    post_capture_settle_time_s: float = 0.25
+    settle_time_s: float = DEFAULT_SETTLE_TIME_S
+    post_capture_settle_time_s: float = DEFAULT_POST_CAPTURE_SETTLE_TIME_S
     odom_control: bool = True
     odom_timeout_s: float = 1.0
     forward_tolerance_m: float = 0.04
@@ -81,6 +92,7 @@ class MotionConfig:
     turn_kd: float = 0.0
     min_forward_speed_mps: float = 0.15
     min_yaw_speed_radps: float = 0.35
+    max_duration_s: float = MAX_ACTION_DURATION_S
 
 
 @dataclass
@@ -92,6 +104,20 @@ class PredictionResult:
     upload_mb: float
     round_trip_s: float
     server_latency_s: object
+    uncertainty_actions: Optional[list[str]] = None
+    action_uncertainties: Optional[list[float]] = None
+
+
+def parse_actions_per_replan(value: str) -> int | str:
+    if value == "uncertainty":
+        return value
+    try:
+        count = int(value)
+        if count >= 0:
+            return count
+    except (TypeError, ValueError):
+        pass
+    raise argparse.ArgumentTypeError("actions-per-replan must be a nonnegative integer or 'uncertainty'")
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -621,7 +647,10 @@ class RobotBackend:
     def move(self, vx: float, vy: float, vyaw: float) -> None:
         raise NotImplementedError
 
-    def execute_motion_action(self, action: str, motion: MotionConfig) -> Optional[bool]:
+    def execute_motion_action(
+        self, action: str, motion: MotionConfig, *, on_progress: Optional[Callable[[float], None]] = None,
+    ) -> Optional[bool]:
+        """Report forward metres or degrees turned in the requested direction."""
         return None
 
     def stop(self) -> None:
@@ -784,16 +813,22 @@ class Ros2SportBackend(RobotBackend):
             return value
         return math.copysign(abs(minimum), value)
 
-    def _run_closed_loop_turn(self, direction: float, motion: MotionConfig) -> bool:
+    def _run_closed_loop_turn(
+        self, direction: float, motion: MotionConfig, *, on_progress: Optional[Callable[[float], None]] = None,
+    ) -> bool:
         start = self._latest_odom(timeout_s=motion.odom_timeout_s)
         if start is None:
             print({"warning": "no_sportmodestate_for_closed_loop_turn; using open_loop"}, flush=True)
             return False
 
-        target_yaw = wrap_angle_rad(start.yaw + float(direction) * math.radians(motion.turn_degrees))
+        # Accumulate yaw changes so merged turns can exceed 180 degrees (or a
+        # full revolution) without taking the shorter path in the wrong direction.
+        target_rotation = float(direction) * math.radians(motion.turn_degrees)
+        rotation = 0.0
+        previous_yaw = start.yaw
         tolerance = math.radians(motion.turn_tolerance_degrees)
-        deadline = time.monotonic() + MAX_ACTION_DURATION_S
-        last_error = signed_angle_error_rad(target_yaw, start.yaw)
+        deadline = time.monotonic() + motion.max_duration_s
+        last_error = target_rotation
         last_odom_stamp = start.stamp_s
         samples = 0
 
@@ -805,9 +840,13 @@ class Ros2SportBackend(RobotBackend):
             if odom is None:
                 break
             last_odom_stamp = odom.stamp_s
-            error = signed_angle_error_rad(target_yaw, odom.yaw)
+            rotation += signed_angle_error_rad(odom.yaw, previous_yaw)
+            previous_yaw = odom.yaw
+            error = target_rotation - rotation
             last_error = error
             samples += 1
+            if on_progress is not None:
+                on_progress(float(direction) * math.degrees(rotation))
             if abs(error) <= tolerance:
                 break
             yaw_command = motion.turn_kp * error - motion.turn_kd * odom.yaw_speed
@@ -831,14 +870,16 @@ class Ros2SportBackend(RobotBackend):
         )
         return True
 
-    def _run_closed_loop_forward(self, motion: MotionConfig) -> bool:
+    def _run_closed_loop_forward(
+        self, motion: MotionConfig, *, on_progress: Optional[Callable[[float], None]] = None,
+    ) -> bool:
         start = self._latest_odom(timeout_s=motion.odom_timeout_s)
         if start is None:
             print({"warning": "no_sportmodestate_for_closed_loop_forward; using open_loop"}, flush=True)
             return False
 
         target_distance = motion.forward_distance_m
-        deadline = time.monotonic() + MAX_ACTION_DURATION_S
+        deadline = time.monotonic() + motion.max_duration_s
         last_error = target_distance
         last_odom_stamp = start.stamp_s
         samples = 0
@@ -857,6 +898,8 @@ class Ros2SportBackend(RobotBackend):
             error = target_distance - progress
             last_error = error
             samples += 1
+            if on_progress is not None:
+                on_progress(progress)
             if error <= motion.forward_tolerance_m:
                 break
             forward_command = motion.forward_kp * error - motion.forward_kd * odom.forward_speed
@@ -904,19 +947,21 @@ class Ros2SportBackend(RobotBackend):
         self.publisher.publish(request)
         self.rclpy.spin_once(self.node, timeout_sec=0.0)
 
-    def execute_motion_action(self, action: str, motion: MotionConfig) -> Optional[bool]:
+    def execute_motion_action(
+        self, action: str, motion: MotionConfig, *, on_progress: Optional[Callable[[float], None]] = None,
+    ) -> Optional[bool]:
         if not motion.odom_control or self.odom_subscription is None:
             return None
         if action == "forward":
-            if self._run_closed_loop_forward(motion):
+            if self._run_closed_loop_forward(motion, on_progress=on_progress):
                 return False
             return None
         if action == "left":
-            if self._run_closed_loop_turn(1.0, motion):
+            if self._run_closed_loop_turn(1.0, motion, on_progress=on_progress):
                 return False
             return None
         if action == "right":
-            if self._run_closed_loop_turn(-1.0, motion):
+            if self._run_closed_loop_turn(-1.0, motion, on_progress=on_progress):
                 return False
             return None
         return None
@@ -928,7 +973,11 @@ class Ros2SportBackend(RobotBackend):
 
 
 class VLNHttpClient:
-    def __init__(self, server_base_url: str, timeout_s: float, predict_path: str = DEFAULT_PREDICT_PATH):
+    def __init__(self, server_base_url: str, timeout_s: float, predict_path: str = DEFAULT_PREDICT_PATH, *,
+                 uncertainty_max_actions: Optional[int] = None):
+        import requests
+
+        self.uncertainty_max_actions = uncertainty_max_actions
         self.server_base_url = server_base_url.rstrip("/")
         self.predict_url = self._join_url(server_base_url, predict_path)
         self.timeout_s = float(timeout_s)
@@ -956,6 +1005,8 @@ class VLNHttpClient:
             for index, image in enumerate(images)
         ]
         data = {"instruction": instruction}
+        if self.uncertainty_max_actions is not None:
+            data.update(include_uncertainty="true", uncertainty_max_actions=str(self.uncertainty_max_actions))
         response = self.session.post(
             self.predict_url,
             data=data,
@@ -1014,6 +1065,8 @@ def request_prediction(
         upload_mb=round(request_bytes / (1024 * 1024), 3),
         round_trip_s=time.perf_counter() - started,
         server_latency_s=result.get("latency_s"),
+        uncertainty_actions=result.get("uncertainty_actions"),
+        action_uncertainties=result.get("action_uncertainties"),
     )
 
 
@@ -1050,28 +1103,117 @@ class PendingPrediction:
         return self._result
 
 
-def run_velocity(backend: RobotBackend, vx: float, vy: float, vyaw: float, duration_s: float, period_s: float) -> None:
-    deadline = time.monotonic() + max(0.0, float(duration_s))
-    while time.monotonic() < deadline:
-        backend.move(vx, vy, vyaw)
-        time.sleep(max(0.01, float(period_s)))
-    backend.stop()
+def select_prediction_horizon(
+    prediction: PredictionResult, *, uncertainty_budget: float,
+    replan_action_range: tuple[int, int], stop_commit_max_actions: int,
+) -> tuple[int, bool]:
+    """Choose the atom count locally using the server's action uncertainties."""
+    actions = prediction.actions
+    ids = [ATOMIC_ACTION_NAMES.index(action) for action in actions]
+    horizon = select_stop_commit_horizon(ids, stop_commit_max_actions)
+    if horizon is not None:
+        return horizon, True
+    prefix = actions[:replan_action_range[1]]
+    if "stop" in prefix:
+        prefix = prefix[:prefix.index("stop") + 1]
+    if prediction.uncertainty_actions != prefix:
+        raise ValueError("Parsed actions do not match uncertainty logits")
+    if prediction.action_uncertainties is None or len(prediction.action_uncertainties) != len(prefix):
+        raise ValueError("Missing action uncertainties")
+    return select_uncertainty_horizon(
+        prediction.action_uncertainties, uncertainty_budget, replan_action_range,
+    ), False
+
+
+def run_velocity(
+    backend: RobotBackend, vx: float, vy: float, vyaw: float, duration_s: float, period_s: float,
+    *, on_elapsed: Optional[Callable[[float], None]] = None,
+) -> None:
+    duration_s = max(0.0, float(duration_s))
+    started = time.monotonic()
+    try:
+        while True:
+            elapsed = min(time.monotonic() - started, duration_s)
+            if on_elapsed is not None:
+                on_elapsed(elapsed)
+            # Image capture takes time while the previous velocity command is
+            # still active; do not add another command/sleep after the deadline.
+            remaining = duration_s - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            backend.move(vx, vy, vyaw)
+            time.sleep(min(max(0.01, float(period_s)), remaining))
+    finally:
+        backend.stop()
+
+
+def merge_consecutive_actions(actions: Sequence[str], max_actions: int) -> list[tuple[str, int]]:
+    """Merge the executable prefix, counting the limit in original model actions."""
+    merged: list[tuple[str, int]] = []
+    for action in actions[:max_actions]:
+        if merged and merged[-1][0] == action:
+            merged[-1] = (action, merged[-1][1] + 1)
+        else:
+            merged.append((action, 1))
+        if action == "stop":
+            break
+    return merged
 
 
 def execute_action(
     backend: RobotBackend,
     action: str,
     motion: MotionConfig,
+    repeat_count: int = 1,
+    on_atom_complete: Optional[Callable[[int], None]] = None,
 ) -> bool:
+    """Capture intermediate atom boundaries in motion; the caller captures the final stopped frame."""
+    if repeat_count < 1:
+        raise ValueError("repeat_count must be positive")
     if action == "stop":
         backend.stop()
         return True
-    backend_result = backend.execute_motion_action(action, motion)
+    atom_size = motion.forward_distance_m if action == "forward" else motion.turn_degrees
+    next_atom = 1
+
+    def report_progress(progress: float) -> None:
+        nonlocal next_atom
+        if on_atom_complete is None:
+            return
+        while next_atom < repeat_count and progress + 1e-9 >= atom_size * next_atom:
+            on_atom_complete(next_atom)
+            next_atom += 1
+
+    progress_callback = report_progress if on_atom_complete is not None and repeat_count > 1 else None
+
+    def check_memory_boundaries() -> None:
+        if progress_callback is not None and next_atom < repeat_count:
+            # A timed-out motion must not silently shift the history/action alignment.
+            raise RuntimeError(f"{action} ended before reaching all intermediate atom boundaries")
+
+    # Validate primitive sizes at startup; merged targets are intentionally larger.
+    # Retain the original per-action time budget for the whole continuous motion.
+    motion = replace(
+        motion,
+        forward_distance_m=(
+            motion.forward_distance_m * repeat_count if action == "forward" else motion.forward_distance_m
+        ),
+        turn_degrees=(
+            motion.turn_degrees * repeat_count if action in {"left", "right"} else motion.turn_degrees
+        ),
+        max_duration_s=motion.max_duration_s * repeat_count,
+    )
+    try:
+        backend_result = backend.execute_motion_action(action, motion, on_progress=progress_callback)
+    except BaseException:
+        backend.stop()
+        raise
     if backend_result is not None:
+        check_memory_boundaries()
         return backend_result
     if action == "forward":
         duration = motion.forward_distance_m / max(motion.forward_speed_mps, 1e-6)
-        duration = min(duration, MAX_ACTION_DURATION_S)
+        duration = min(duration, motion.max_duration_s)
         run_velocity(
             backend,
             motion.forward_speed_mps,
@@ -1079,14 +1221,22 @@ def execute_action(
             0.0,
             duration,
             motion.command_period_s,
+            on_elapsed=(lambda elapsed: report_progress(elapsed * motion.forward_speed_mps))
+            if progress_callback is not None else None,
         )
+        check_memory_boundaries()
         return False
     if action in {"left", "right"}:
         yaw = abs(motion.yaw_speed_radps)
         yaw = yaw if action == "left" else -yaw
         duration = math.radians(motion.turn_degrees) / max(abs(motion.yaw_speed_radps), 1e-6)
-        duration = min(duration, MAX_ACTION_DURATION_S)
-        run_velocity(backend, 0.0, 0.0, yaw, duration, motion.command_period_s)
+        duration = min(duration, motion.max_duration_s)
+        run_velocity(
+            backend, 0.0, 0.0, yaw, duration, motion.command_period_s,
+            on_elapsed=(lambda elapsed: report_progress(math.degrees(elapsed * abs(yaw))))
+            if progress_callback is not None else None,
+        )
+        check_memory_boundaries()
         return False
     return False
 
@@ -1107,8 +1257,10 @@ def build_backend(args: argparse.Namespace) -> RobotBackend:
     raise ValueError(f"Unsupported backend: {args.control_backend}")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run PanoVLN on a Unitree Go2.")
+    parser.add_argument("--config", help="Grouped YAML configuration; explicit CLI options override it.")
+    parser.add_argument("--print-config", action="store_true", help="Print resolved configuration and exit without opening hardware.")
     parser.add_argument("--server-base-url", default=DEFAULT_SERVER_BASE_URL)
     parser.add_argument("--instruction", default=None)
     parser.add_argument("--instruction-file", default=None)
@@ -1123,7 +1275,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-fourcc", default=DEFAULT_CAMERA_FOURCC)
     parser.add_argument("--camera-warmup-frames", type=int, default=DEFAULT_CAMERA_WARMUP_FRAMES)
     parser.add_argument("--capture-flush-frames", type=int, default=DEFAULT_CAPTURE_FLUSH_FRAMES)
-    parser.add_argument("--history-limit", type=int, default=DEFAULT_HISTORY_LIMIT)
     parser.add_argument(
         "--save-output-dir",
         default="",
@@ -1142,20 +1293,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upload-image-mode", choices=("resize", "raw"), default=DEFAULT_UPLOAD_IMAGE_MODE)
     parser.add_argument("--upload-width", type=int, default=DEFAULT_UPLOAD_IMAGE_SIZE[0])
     parser.add_argument("--upload-height", type=int, default=DEFAULT_UPLOAD_IMAGE_SIZE[1])
+    parser.add_argument("--history-limit", type=int, default=DEFAULT_HISTORY_LIMIT)
     parser.add_argument("--upload-max-memory-images", type=int, default=DEFAULT_MAX_MEMORY_IMAGES)
     parser.add_argument("--upload-memory-pool-window-frames", type=int, default=DEFAULT_MEMORY_POOL_WINDOW_FRAMES)
     parser.add_argument("--max-replans", type=int, default=50, help="0 means unlimited.")
     parser.add_argument(
+        "--execution-mode", choices=("atomic", "continuous"), default=DEFAULT_EXECUTION_MODE,
+        help="atomic: stop and settle after every action; continuous: merge repeats and capture each atom boundary while moving.",
+    )
+    parser.add_argument(
         "--actions-per-replan",
-        type=int,
+        type=parse_actions_per_replan,
         default=DEFAULT_ACTIONS_PER_REPLAN,
-        help="Maximum actions to execute per plan; 0 uses the server model's action_sequence_length.",
+        help="Original actions per plan: positive integer, 0 for model sequence length, or uncertainty for adaptive execution.",
+    )
+    parser.add_argument(
+        "--replan-action-range", type=int, nargs=2, metavar=("MIN", "MAX"), default=DEFAULT_REPLAN_ACTION_RANGE,
+        help="Inclusive atom-action count range for uncertainty mode (default: 4 8).",
+    )
+    parser.add_argument("--uncertainty-budget", type=float, default=DEFAULT_UNCERTAINTY_BUDGET)
+    parser.add_argument(
+        "--stop-commit-max-actions", type=int, default=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+        help="In uncertainty mode, commit through STOP within this many actions, overriding budget/range; 0 disables.",
     )
     parser.add_argument(
         "--prefetch-after-actions",
         type=int,
         default=DEFAULT_PREFETCH_AFTER_ACTIONS,
-        help="Start the next server prediction after this many non-stop actions; 0 disables prefetch.",
+        help="Start the next prediction after this many atoms, at a group boundary; 0 disables prefetch.",
     )
     parser.add_argument("--forward-distance", type=float, default=0.25)
     parser.add_argument("--forward-speed", type=float, default=0.35)
@@ -1173,6 +1338,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable /sportmodestate closed-loop control and use timed open-loop primitives.",
     )
+    parser.add_argument(
+        "--enable-odom-control", dest="disable_odom_control", action="store_false", default=argparse.SUPPRESS,
+        help="Enable odometry control, overriding disable_odom_control in YAML.",
+    )
     parser.add_argument("--odom-timeout", type=float, default=1.0)
     parser.add_argument("--forward-tolerance", type=float, default=0.04)
     parser.add_argument("--turn-tolerance-degrees", type=float, default=3.0)
@@ -1182,7 +1351,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-kd", type=float, default=0.0)
     parser.add_argument("--min-forward-speed", type=float, default=0.15)
     parser.add_argument("--min-yaw-speed", type=float, default=0.35)
-    return parser.parse_args()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    config_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    config_parser.add_argument("--config")
+    config_path = config_parser.parse_known_args(argv)[0].config
+    # Help must remain available even if a configuration file is missing/broken.
+    if config_path and not any(arg in {"-h", "--help"} for arg in argv):
+        try:
+            defaults = config_arguments(parser, config_path)
+        except ValueError as exc:
+            parser.error(str(exc))
+        argv = defaults + argv
+    return parser.parse_args(argv)
 
 
 def parse_camera_source(raw: str) -> str | int:
@@ -1211,15 +1391,21 @@ def save_navigation_frame(
 
 def main() -> None:
     args = parse_args()
+    if args.print_config:
+        print(json.dumps(vars(args), ensure_ascii=False, indent=2))
+        return
     instruction = read_instruction(args)
     if not instruction:
         raise ValueError("Instruction is empty")
     if args.control_backend != "dry-run" and args.real_robot_ack != "yes":
-        raise ValueError("Set REAL_ROBOT_ACK=\"yes\" in run_go2_client.sh before using ros2")
-    if args.actions_per_replan < 0:
-        raise ValueError(f"actions_per_replan must be >= 0, got {args.actions_per_replan}")
+        raise ValueError('Set robot.real_robot_ack: "yes" in the YAML (or --real-robot-ack yes) before using ros2')
+    args.uncertainty_budget = validate_uncertainty_budget(args.uncertainty_budget)
+    args.replan_action_range = validate_replan_action_range(args.replan_action_range)
+    args.stop_commit_max_actions = validate_stop_commit_max_actions(args.stop_commit_max_actions)
     if args.prefetch_after_actions < 0:
-        raise ValueError(f"prefetch_after_actions must be >= 0, got {args.prefetch_after_actions}")
+        raise ValueError("prefetch-after-actions must be nonnegative")
+    if args.history_limit <= 0 or args.upload_memory_pool_window_frames <= 0 or args.upload_max_memory_images < 0:
+        raise ValueError("History/window sizes must be positive and max memory images nonnegative")
     requested_save_contents = parse_save_contents(args.save_contents)
     save_output_dir = Path(args.save_output_dir).expanduser() if args.save_output_dir else None
     if requested_save_contents and save_output_dir is None:
@@ -1269,8 +1455,11 @@ def main() -> None:
         warmup_frames=args.camera_warmup_frames,
     )
     backend = build_backend(args)
-    client = VLNHttpClient(args.server_base_url, timeout_s=args.request_timeout)
-    history: deque[bytes] = deque(maxlen=max(1, args.history_limit))
+    client = VLNHttpClient(
+        args.server_base_url, timeout_s=args.request_timeout,
+        uncertainty_max_actions=args.replan_action_range[1] if args.actions_per_replan == "uncertainty" else None,
+    )
+    history: deque[bytes] = deque(maxlen=args.history_limit)
     video_recorder = (
         NavigationVideoRecorder(
             camera,
@@ -1317,9 +1506,14 @@ def main() -> None:
             "memory_pool_window_frames": args.upload_memory_pool_window_frames,
         },
         "configured_actions_per_replan": args.actions_per_replan,
+        "execution_mode": args.execution_mode,
+        "uncertainty_budget": args.uncertainty_budget,
+        "replan_action_range": args.replan_action_range,
+        "stop_commit_max_actions": args.stop_commit_max_actions,
         "effective_actions_per_replan": None,
         "prefetch_after_actions": args.prefetch_after_actions,
         "server_ready": None,
+        "history_limit": args.history_limit,
         "predictions": [],
         "executed_actions": [],
         "saved_frames": [],
@@ -1328,6 +1522,20 @@ def main() -> None:
     frame_index = 0
 
     try:
+        ready = client.ready()
+        run_log["server_ready"] = ready
+        print({"server_ready": ready}, flush=True)
+        if args.actions_per_replan == "uncertainty":
+            if ready.get("supports_action_uncertainty") is not True:
+                raise ValueError("Model server lacks action uncertainty support; update and restart realworld.server")
+            fixed_actions_per_replan = None
+        elif args.actions_per_replan > 0:
+            fixed_actions_per_replan = args.actions_per_replan
+        else:
+            fixed_actions_per_replan = ready.get("action_sequence_length")
+            if (isinstance(fixed_actions_per_replan, bool)
+                    or not isinstance(fixed_actions_per_replan, int) or fixed_actions_per_replan <= 0):
+                raise ValueError("Server /ready must return a positive integer action_sequence_length when --actions-per-replan=0")
         if video_recorder is not None:
             video_recorder.start()
         first_frame = camera.read_jpeg(flush_frames=args.capture_flush_frames)
@@ -1348,28 +1556,7 @@ def main() -> None:
                 }
             )
         frame_index += 1
-        ready = client.ready()
-        print({"server_ready": ready}, flush=True)
-        run_log["server_ready"] = ready
-        if args.actions_per_replan > 0:
-            effective_actions_per_replan = args.actions_per_replan
-        else:
-            server_action_sequence_length = ready.get("action_sequence_length")
-            if (
-                isinstance(server_action_sequence_length, bool)
-                or not isinstance(server_action_sequence_length, int)
-                or server_action_sequence_length <= 0
-            ):
-                raise ValueError(
-                    "Server /ready must return a positive integer "
-                    "action_sequence_length when --actions-per-replan=0"
-                )
-            effective_actions_per_replan = server_action_sequence_length
-        run_log["effective_actions_per_replan"] = effective_actions_per_replan
-        print(
-            {"effective_actions_per_replan": effective_actions_per_replan},
-            flush=True,
-        )
+        del first_frame
         backend.stand()
         replans = 0
         pending_prediction: Optional[PendingPrediction] = None
@@ -1396,54 +1583,73 @@ def main() -> None:
             replans += 1
 
             actions = prediction.actions
-            print(
-                {
-                    "replan": replans,
-                    "actions": actions,
-                    "raw_text": prediction.raw_text,
-                    "prediction_source": prediction_source,
-                    "prefetch_wait_s": prefetch_wait_s,
-                    "request_images": prediction.request_images,
-                    "upload_image_mode": prediction.upload_image_mode,
-                    "upload_mb": prediction.upload_mb,
-                    "round_trip_s": prediction.round_trip_s,
-                    "server_latency_s": prediction.server_latency_s,
-                },
-                flush=True,
-            )
-            run_log["predictions"].append(
-                {
-                    "replan": replans,
-                    "actions": actions,
-                    "raw_text": prediction.raw_text,
-                    "prediction_source": prediction_source,
-                    "prefetch_wait_s": prefetch_wait_s,
-                    "request_images": prediction.request_images,
-                    "upload_image_mode": prediction.upload_image_mode,
-                    "upload_mb": prediction.upload_mb,
-                    "round_trip_s": prediction.round_trip_s,
-                    "server_latency_s": prediction.server_latency_s,
-                }
-            )
+            effective_actions_per_replan = fixed_actions_per_replan
+            stop_committed = False
+            if args.actions_per_replan == "uncertainty":
+                effective_actions_per_replan, stop_committed = select_prediction_horizon(
+                    prediction, uncertainty_budget=args.uncertainty_budget,
+                    replan_action_range=args.replan_action_range,
+                    stop_commit_max_actions=args.stop_commit_max_actions,
+                )
+            run_log["effective_actions_per_replan"] = effective_actions_per_replan
+            plan_log = {
+                **asdict(prediction), "replan": replans,
+                "effective_actions_per_replan": effective_actions_per_replan,
+                "stop_committed": stop_committed,
+                "prediction_source": prediction_source, "prefetch_wait_s": prefetch_wait_s,
+            }
+            print(plan_log, flush=True)
+            run_log["predictions"].append(plan_log)
 
             should_stop = False
-            for action_index, action in enumerate(actions):
-                if action_index >= effective_actions_per_replan:
-                    break
+            completed_actions = 0
+            action_groups = (
+                merge_consecutive_actions(actions, effective_actions_per_replan)
+                if args.execution_mode == "continuous"
+                else [(action, 1) for action in actions[:effective_actions_per_replan]]
+            )
+            for action, repeat_count in action_groups:
+                action_index = completed_actions
+                completed_actions += repeat_count
+
+                def capture_atom_frame(atom_index: int) -> None:
+                    nonlocal frame_index
+                    # Called at each intermediate odometry boundary without stopping
+                    # or settling, then once more after the group's final stop/settle.
+                    captured_frame = camera.read_jpeg(flush_frames=args.capture_flush_frames)
+                    history.append(captured_frame)
+                    label = f"after_replan_{replans:03d}_action_{action_index + atom_index:02d}_{action}"
+                    saved_path = save_navigation_frame(
+                        save_image_dir, captured_frame, frame_index=frame_index, label=label,
+                    )
+                    if saved_path is not None:
+                        print({"saved_frame": str(saved_path), "frame_index": frame_index}, flush=True)
+                        run_log["saved_frames"].append(
+                            {"frame_index": frame_index, "path": str(saved_path), "label": label}
+                        )
+                    frame_index += 1
+
                 print(
                     {
                         "execute_action": action,
+                        "execution_mode": args.execution_mode,
                         "replan": replans,
                         "action_index": action_index + 1,
+                        "action_count": repeat_count,
+                        "action_end_index": completed_actions,
                     },
                     flush=True,
                 )
                 action_started_s = time.perf_counter()
-                should_stop = execute_action(backend, action, motion)
+                should_stop = execute_action(
+                    backend, action, motion, repeat_count=repeat_count, on_atom_complete=capture_atom_frame,
+                )
                 run_log["executed_actions"].append(
                     {
                         "replan": replans,
                         "action_index": action_index + 1,
+                        "action_count": repeat_count,
+                        "action_end_index": completed_actions,
                         "action": action,
                         "duration_s": time.perf_counter() - action_started_s,
                         "stopped": should_stop,
@@ -1452,29 +1658,11 @@ def main() -> None:
                 if should_stop:
                     break
                 time.sleep(max(0.0, motion.settle_time_s))
-                captured_frame = camera.read_jpeg(flush_frames=args.capture_flush_frames)
-                history.append(captured_frame)
-                saved_path = save_navigation_frame(
-                    save_image_dir,
-                    captured_frame,
-                    frame_index=frame_index,
-                    label=f"after_replan_{replans:03d}_action_{action_index + 1:02d}_{action}",
-                )
-                if saved_path is not None:
-                    print({"saved_frame": str(saved_path), "frame_index": frame_index}, flush=True)
-                    run_log["saved_frames"].append(
-                        {
-                            "frame_index": frame_index,
-                            "path": str(saved_path),
-                            "label": f"after_replan_{replans:03d}_action_{action_index + 1:02d}_{action}",
-                        }
-                    )
-                frame_index += 1
-                completed_actions = action_index + 1
+                capture_atom_frame(repeat_count)
                 can_prefetch_next_replan = args.max_replans <= 0 or replans < args.max_replans
                 if (
                     args.prefetch_after_actions > 0
-                    and completed_actions == args.prefetch_after_actions
+                    and completed_actions >= args.prefetch_after_actions
                     and pending_prediction is None
                     and can_prefetch_next_replan
                 ):

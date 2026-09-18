@@ -1,6 +1,5 @@
 import json
 import logging
-import math
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
@@ -45,6 +44,20 @@ from habitat.config.default_structured_configs import (
 )
 from PIL import Image
 from peft import PeftModel
+from src.eval.action_policy import (
+    ATOMIC_ACTION_NAMES,
+    STOP_ACTION_ID,
+    DEFAULT_REPLAN_ACTION_RANGE,
+    DEFAULT_STOP_COMMIT_MAX_ACTIONS,
+    DEFAULT_UNCERTAINTY_BUDGET,
+    build_action_token_lookup,
+    extract_action_uncertainties,
+    select_stop_commit_horizon,
+    select_uncertainty_horizon,
+    validate_replan_action_range,
+    validate_stop_commit_max_actions,
+    validate_uncertainty_budget,
+)
 from src.eval.collision_recovery import (
     DEFAULT_COLLISION_RECOVERY_STEPS,
     CollisionRecovery,
@@ -93,11 +106,7 @@ def configure_eval_torch_threads() -> None:
 logging.getLogger("imageio_ffmpeg").setLevel(logging.ERROR)
 logging.getLogger("imageio.plugins.ffmpeg").setLevel(logging.ERROR)
 
-ATOMIC_ACTION_NAMES = ("stop", "forward", "left", "right")
 ATOMIC_ACTION_TO_ID = {action_name: action_id for action_id, action_name in enumerate(ATOMIC_ACTION_NAMES)}
-STOP_ACTION_ID = ATOMIC_ACTION_TO_ID["stop"]
-DEFAULT_REPLAN_ACTION_RANGE = (4, 8)
-DEFAULT_STOP_COMMIT_MAX_ACTIONS = 12
 ACTION_SEQUENCE_LENGTH = DEFAULT_VLN_ACTION_SEQUENCE_LENGTH
 ATOMIC_ACTION_VARIANTS = {
     "stop": ("stop",),
@@ -158,104 +167,6 @@ def parse_actions_per_replan(value):
         raise argparse.ArgumentTypeError(
             "actions-per-replan must be a positive integer or 'uncertainty'"
         ) from exc
-
-
-def validate_uncertainty_budget(value):
-    budget = float(value)
-    if not math.isfinite(budget) or budget <= 0:
-        raise ValueError("uncertainty-budget must be finite and positive")
-    return budget
-
-
-def validate_replan_action_range(action_range):
-    if not isinstance(action_range, (tuple, list)) or len(action_range) != 2:
-        raise ValueError("replan-action-range requires two positive integers: MIN MAX")
-    minimum, maximum = map(validate_action_sequence_length, action_range)
-    if minimum > maximum:
-        raise ValueError("replan-action-range requires MIN <= MAX")
-    return minimum, maximum
-
-
-def validate_stop_commit_max_actions(value):
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError("stop-commit-max-actions must be a nonnegative integer (0 disables)")
-    return value
-
-
-def select_stop_commit_horizon(
-    action_ids: Sequence[int],
-    stop_commit_max_actions: int = DEFAULT_STOP_COMMIT_MAX_ACTIONS,
-) -> Optional[int]:
-    """Commit through the first STOP in the inclusive window, counting STOP itself."""
-    limit = validate_stop_commit_max_actions(stop_commit_max_actions)
-    for position, action_id in enumerate(action_ids[:limit], start=1):
-        if action_id == STOP_ACTION_ID:
-            return position
-    return None
-
-
-def select_uncertainty_horizon(
-    action_uncertainties, budget, action_range=DEFAULT_REPLAN_ACTION_RANGE,
-):
-    """Longest prefix within action_range with sum(-log p(action)) <= budget.
-
-    The lower bound is the minimum nominal K, even if it exceeds the budget.
-    STOP and short predictions are subsequently handled by the action queue.
-    This is model uncertainty, not a calibrated probability of execution error.
-    """
-    budget = validate_uncertainty_budget(budget)
-    minimum, maximum = validate_replan_action_range(action_range)
-    horizon, cumulative = minimum, 0.0
-    for position, uncertainty in enumerate(action_uncertainties[:maximum], start=1):
-        if not math.isfinite(uncertainty) or uncertainty < 0:
-            raise ValueError("Action uncertainty must be finite and nonnegative")
-        cumulative += uncertainty
-        if cumulative > budget:
-            break
-        horizon = max(minimum, position)
-    return horizon
-
-
-def build_action_token_lookup(tokenizer):
-    """Map both first-word and space-prefixed action tokens to four-way logits."""
-    lookup = {}
-    for prefix in ("", " "):
-        encoded = [tokenizer.encode(prefix + name, add_special_tokens=False)
-                   for name in ATOMIC_ACTION_NAMES]
-        if any(len(ids) != 1 for ids in encoded):
-            raise ValueError("Uncertainty mode requires one-token canonical actions")
-        token_ids = tuple(ids[0] for ids in encoded)
-        if len(set(token_ids)) != len(ATOMIC_ACTION_NAMES):
-            raise ValueError("Action token IDs must be distinct")
-        for action_id, token_id in enumerate(token_ids):
-            lookup[token_id] = (action_id, token_ids)
-    return lookup
-
-
-def extract_action_uncertainties(
-    generated_ids, logits, token_lookup, special_ids,
-    max_actions=DEFAULT_REPLAN_ACTION_RANGE[1],
-):
-    """Read raw, temperature-1 four-action log probabilities from this generation."""
-    max_actions = validate_action_sequence_length(max_actions)
-    if logits is None or len(generated_ids) != len(logits):
-        raise ValueError("Generated tokens and raw logits are not aligned")
-    actions, uncertainties = [], []
-    for token_id, raw_logits in zip(generated_ids, logits):
-        if token_id in special_ids:
-            continue
-        if token_id not in token_lookup:
-            raise ValueError(f"Uncertainty mode received a noncanonical action token: {token_id}")
-        action_id, token_ids = token_lookup[token_id]
-        action_logits = raw_logits[0, list(token_ids)].float()
-        uncertainty = -action_logits.log_softmax(dim=-1)[action_id].item()
-        if not math.isfinite(uncertainty):
-            raise ValueError("Non-finite action logits in uncertainty mode")
-        actions.append(action_id)
-        uncertainties.append(uncertainty)
-        if action_id == STOP_ACTION_ID or len(actions) == max_actions:
-            break
-    return actions, uncertainties
 
 
 def extract_first_turn_logits(generated_ids, logits, token_lookup, special_ids):
@@ -530,7 +441,7 @@ def evaluate_agent(
     attn_implementation,
     early_stop_max_steps,
     actions_per_replan,
-    uncertainty_budget=1.5,
+    uncertainty_budget=DEFAULT_UNCERTAINTY_BUDGET,
     seed=42,
     replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
     stop_commit_max_actions=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
@@ -635,7 +546,7 @@ class PanoVLN_Agent(Agent):
         save_topdown=False,
         attn_implementation="sdpa",
         actions_per_replan="uncertainty",
-        uncertainty_budget=1.5,
+        uncertainty_budget=DEFAULT_UNCERTAINTY_BUDGET,
         seed=42,
         replan_action_range=DEFAULT_REPLAN_ACTION_RANGE,
         stop_commit_max_actions=DEFAULT_STOP_COMMIT_MAX_ACTIONS,
@@ -1071,9 +982,9 @@ def main():
         help="inclusive K range for uncertainty (default: 4 8); STOP commitment may exceed this cap",
     )
     parser.add_argument(
-        "--uncertainty-budget", type=float, default=1.5,
+        "--uncertainty-budget", type=float, default=DEFAULT_UNCERTAINTY_BUDGET,
         help="maximum cumulative -log four-action probability in uncertainty mode; "
-             "set to an offline median six-action prefix score (default: 1.5)",
+             "set to an offline median six-action prefix score (default: 1.2)",
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for python, numpy, and torch")
     parser.add_argument(

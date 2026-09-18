@@ -8,9 +8,10 @@ from dataclasses import asdict
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .inference import DEFAULT_MODEL_PATH, InferenceConfig, PanoVLNPredictor
+from src.eval.action_policy import DEFAULT_REPLAN_ACTION_RANGE
 
 
 def _log_stage(message: str) -> None:
@@ -18,7 +19,12 @@ def _log_stage(message: str) -> None:
     print(f"{timestamp} [realworld.server] {message}", flush=True)
 
 
-class PredictJsonRequest(BaseModel):
+class PredictionOptions(BaseModel):
+    include_uncertainty: bool = False
+    uncertainty_max_actions: int = Field(default=DEFAULT_REPLAN_ACTION_RANGE[1], gt=0)
+
+
+class PredictJsonRequest(PredictionOptions):
     instruction: str
     images: list[str] = Field(
         ...,
@@ -40,6 +46,7 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
             "model_path": app.state.settings.model_path,
             "action_sequence_length": app.state.predictor.action_sequence_length,
             "view_mode": app.state.predictor.view_mode,
+            "supports_action_uncertainty": True,
         }
 
     @app.get("/ready")
@@ -51,23 +58,31 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
             "model_path": app.state.settings.model_path,
             "action_sequence_length": app.state.predictor.action_sequence_length,
             "view_mode": app.state.predictor.view_mode,
+            "supports_action_uncertainty": True,
         }
 
     @app.post("/predict")
     async def predict_multipart(request: Request):
         request_start = time.perf_counter()
-        form = await request.form()
-        instruction = str(form.get("instruction", "")).strip()
-        if not instruction:
-            raise HTTPException(status_code=400, detail="Missing form field: instruction")
+        async with request.form() as form:
+            try:
+                options = PredictionOptions(
+                    include_uncertainty=form.get("include_uncertainty", False),
+                    uncertainty_max_actions=form.get("uncertainty_max_actions", DEFAULT_REPLAN_ACTION_RANGE[1]),
+                )
+            except ValidationError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            instruction = str(form.get("instruction", "")).strip()
+            if not instruction:
+                raise HTTPException(status_code=400, detail="Missing form field: instruction")
 
-        uploads = []
-        for field_name in ("images", "image", "files", "file"):
-            uploads.extend(form.getlist(field_name))
-        image_bytes = []
-        for upload in uploads:
-            if hasattr(upload, "read"):
-                image_bytes.append(await upload.read())
+            uploads = []
+            for field_name in ("images", "image", "files", "file"):
+                uploads.extend(form.getlist(field_name))
+            image_bytes = []
+            for upload in uploads:
+                if hasattr(upload, "read"):
+                    image_bytes.append(await upload.read())
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Upload at least one image file")
         _log_stage(
@@ -80,6 +95,8 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
                 result = app.state.predictor.predict(
                     instruction=instruction,
                     images=image_bytes,
+                    include_uncertainty=options.include_uncertainty,
+                    uncertainty_max_actions=options.uncertainty_max_actions,
                 )
         except Exception as exc:
             _log_stage(
@@ -100,6 +117,8 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
             "raw_text": result.raw_text,
             "prompt_images": result.prompt_images,
             "latency_s": result.latency_s,
+            "uncertainty_actions": result.uncertainty_actions,
+            "action_uncertainties": result.action_uncertainties,
         }
 
     @app.post("/predict_json")
@@ -120,6 +139,8 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
                 result = app.state.predictor.predict(
                     instruction=payload.instruction,
                     images=image_bytes,
+                    include_uncertainty=payload.include_uncertainty,
+                    uncertainty_max_actions=payload.uncertainty_max_actions,
                 )
         except Exception as exc:
             _log_stage(
@@ -140,6 +161,8 @@ def create_app(settings: InferenceConfig, predictor: PanoVLNPredictor) -> FastAP
             "raw_text": result.raw_text,
             "prompt_images": result.prompt_images,
             "latency_s": result.latency_s,
+            "uncertainty_actions": result.uncertainty_actions,
+            "action_uncertainties": result.action_uncertainties,
         }
 
     return app

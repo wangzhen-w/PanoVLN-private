@@ -22,6 +22,12 @@ for _path in (str(REPO_ROOT), str(SRC_ROOT)):
         sys.path.insert(0, _path)
 
 from src.qwen_vl import Qwen3_5Config, Qwen3_5ForConditionalGenerationForPanoVLN
+from src.eval.action_policy import (
+    ATOMIC_ACTION_NAMES,
+    DEFAULT_REPLAN_ACTION_RANGE,
+    build_action_token_lookup,
+    extract_action_uncertainties,
+)
 from src.train.data.data import (
     DEFAULT_PERSPECTIVE_IMAGE_HEIGHT,
     DEFAULT_PERSPECTIVE_IMAGE_WIDTH,
@@ -95,6 +101,8 @@ class PredictionResult:
     raw_text: str
     prompt_images: int
     latency_s: float
+    uncertainty_actions: Optional[list[str]] = None
+    action_uncertainties: Optional[list[float]] = None
 
 
 def _log_stage(message: str) -> None:
@@ -465,10 +473,17 @@ class PanoVLNPredictor:
         self,
         instruction: str,
         images: Sequence[Image.Image | bytes | bytearray | str | os.PathLike[str]],
+        *,
+        include_uncertainty: bool = False,
+        uncertainty_max_actions: int = DEFAULT_REPLAN_ACTION_RANGE[1],
     ) -> PredictionResult:
         instruction = instruction.strip()
         if not instruction:
             raise ValueError("instruction must be non-empty")
+        action_token_lookup = None
+        if include_uncertainty:
+            uncertainty_max_actions = validate_action_sequence_length(uncertainty_max_actions)
+            action_token_lookup = build_action_token_lookup(self.tokenizer)
         start = time.perf_counter()
         _log_stage(f"predict started raw_images={len(images)} instruction_chars={len(instruction)}")
 
@@ -547,6 +562,11 @@ class PanoVLNPredictor:
             f"max_new_tokens={generation_kwargs['max_new_tokens']}"
         )
 
+        logits_kwargs = {}
+        if include_uncertainty:
+            if generation_kwargs["num_beams"] != 1:
+                raise ValueError("Uncertainty mode requires num_beams=1 for token/logit alignment")
+            logits_kwargs.update(output_logits=True, return_dict_in_generate=True)
         with torch.inference_mode():
             generated = self.model.generate(
                 **batch,
@@ -557,8 +577,19 @@ class PanoVLNPredictor:
                 top_p=generation_kwargs["top_p"],
                 num_beams=generation_kwargs["num_beams"],
                 max_new_tokens=generation_kwargs["max_new_tokens"],
+                **logits_kwargs,
             )
 
+        uncertainty_actions = None
+        action_uncertainties = None
+        if include_uncertainty:
+            uncertainty_ids, action_uncertainties = extract_action_uncertainties(
+                generated.sequences[0, input_len:].tolist(), generated.logits,
+                action_token_lookup, self.tokenizer.all_special_ids,
+                max_actions=uncertainty_max_actions,
+            )
+            uncertainty_actions = [ATOMIC_ACTION_NAMES[action_id] for action_id in uncertainty_ids]
+            generated = generated.sequences
         new_tokens = generated[:, input_len:]
         raw_text = self.processor.batch_decode(
             new_tokens,
@@ -587,4 +618,6 @@ class PanoVLNPredictor:
             raw_text=raw_text,
             prompt_images=image_count,
             latency_s=time.perf_counter() - start,
+            uncertainty_actions=uncertainty_actions,
+            action_uncertainties=action_uncertainties,
         )

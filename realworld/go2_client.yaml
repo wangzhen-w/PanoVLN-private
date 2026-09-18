@@ -1,0 +1,69 @@
+# 默认由 run_go2_client.sh 加载；命令行参数优先于这里的配置。
+# 查看最终配置：bash realworld/run_go2_client.sh --print-config
+# 切换配置文件：bash realworld/run_go2_client.sh --config /path/to/config.yaml
+
+server:
+  server_base_url: "http://10.14.114.132:30110"
+
+navigation:
+  instruction: "Walk straight to the glass wall, then turn right and stop in front of the large TV set."
+  instruction_file: null # 非空时优先从文件读取指令。
+  max_replans: 100
+  actions_per_replan: uncertainty # uncertainty / 0（模型序列长度）/ 正整数。
+  uncertainty_budget: 1.2
+  replan_action_range: [4, 8] # 按原始 atom 数量计数，再合并连续相同动作。
+  stop_commit_max_actions: 12 # uncertainty 模式下优先执行到窗口内的 STOP；0 关闭。
+  execution_mode: continuous # atomic：逐动作停车采图；continuous：连续执行、逐 atom 采图。
+  prefetch_after_actions: 0 # 0 关闭预取，本轮动作完成后再推理；正数在合并段结束时提前推理。
+  history_limit: 120 # client 内存最多保留的 atom 观测帧数，旧帧自动淘汰。
+
+robot:
+  control_backend: ros2 # dry-run 仅打印控制命令；ros2 控制真机。
+  real_robot_ack: "yes" # 必须带引号，避免 YAML 将 yes 解析成布尔值。
+
+motion:
+  forward_distance: 0.25 # 单个 atom 前进距离，米。
+  forward_speed: 0.35 # 米/秒。
+  turn_degrees: 15.0 # 单个 atom 转向角度。
+  yaw_speed: 0.80 # 弧度/秒。
+  command_period: 0.05 # 运动中的控制指令发送周期，秒。
+  settle_time: 0.1 # 停车后等待相机稳定，再采图。
+  post_capture_settle_time: 0.05 # 停车采图后到下一段运动的等待。
+  # atomic 模式每步等待；continuous 模式只在合并段末尾等待。
+
+odometry:
+  disable_odom_control: false # false 使用里程计闭环；true 使用定时开环。
+  odom_timeout: 1.0
+  forward_tolerance: 0.04
+  turn_tolerance_degrees: 3.0
+  forward_kp: 3.0
+  forward_kd: 0.0
+  turn_kp: 3.0
+  turn_kd: 0.0
+  min_forward_speed: 0.15
+  min_yaw_speed: 0.35
+
+camera:
+  camera: "/dev/video0"
+  frame_width: 2880
+  frame_height: 1440
+  camera_fps: 30
+  jpeg_quality: 90
+  capture_flush_frames: 2
+
+recording:
+  save_output_dir: "/workspace/tmp/vln_navigation_outputs"
+  save_contents: all # none / images / video / json / all，或逗号分隔。
+  video_fps: 10
+  video_width: 1280
+  video_height: 640
+  video_writer: ffmpeg
+  video_codec: libx264
+
+upload:
+  # 每轮推理从 client 历史窗口均匀选帧，连同当前帧一起上传。
+  upload_max_memory_images: 10 # 最多 10 张历史图 + 1 张当前图。
+  upload_memory_pool_window_frames: 100
+  upload_image_mode: resize # raw 不缩放上传图像。
+  upload_width: 1280
+  upload_height: 640
